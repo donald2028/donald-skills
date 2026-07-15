@@ -1,4 +1,0 @@
-interface:
-  display_name: "Manage Skill Repository"
-  short_description: "Maintain and validate multi-runtime skill collections"
-  default_prompt: "Use $manage-skill-repository to add and validate a skill in this repository."
