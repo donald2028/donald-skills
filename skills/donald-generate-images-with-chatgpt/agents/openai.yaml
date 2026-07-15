@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT Web Image Generation"
+  short_description: "Generate resumable image batches through ChatGPT Web"
+  default_prompt: "Use $donald-generate-images-with-chatgpt to generate image candidates through an external ChatGPT Web session."

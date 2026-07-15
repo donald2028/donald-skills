@@ -1,0 +1,4 @@
+interface:
+  display_name: "Collect WeChat Accounts"
+  short_description: "Collect WeChat article lists and public bodies"
+  default_prompt: "Use $donald-collect-wechat-accounts to collect a WeChat Official Account into a traceable local archive."

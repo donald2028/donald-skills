@@ -1,7 +1,7 @@
 # Skills
 
-This directory is the canonical source for Donald Skills. The initial repository contains only
-the collection-management skill; add each business workflow as a self-contained directory:
+This directory is the canonical source for Donald Skills. Keep each reusable workflow as a
+self-contained directory:
 
 ```text
 skills/

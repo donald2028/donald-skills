@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Chrome Over CDP"
+  short_description: "Bind each browser skill to a reusable Chrome Profile"
+  default_prompt: "Use $donald-configure-agent-browser-profile to choose a target skill, bind its Chrome Profile, reuse shared per-Profile login state, and verify agent-browser over CDP."

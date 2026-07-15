@@ -2,7 +2,19 @@
 
 Donald 常用 Agent Skills 的统一仓库，面向 Claude Code、Codex 和兼容 Agent Skills 规范的运行时。
 
-当前版本包含仓库架构和一个用于维护该集合的基础设施 skill，不包含生产业务 skill。下面的安装入口已经可以直接使用；日后新增的 `skills/<name>/SKILL.md` 会沿用同一套分发结构。
+当前版本包含仓库维护 skill、按工具独立绑定且按 Profile 共享登录状态的浏览器配置，以及微信公众号采集、X 内容采集和 ChatGPT Web 外部出图三个通用工具 skill。下面的安装入口可以直接发现并安装 `skills/<name>/SKILL.md` 中的内容。
+
+当前工具 skills：
+
+- `donald-configure-agent-browser-profile`：为每个工具单独选择 Chrome Profile；相同 Profile 复用同一份 CDP User Data 和 Cookie。
+- `donald-collect-wechat-accounts`：采集公众号文章列表和公开正文。
+- `donald-collect-x-posts`：采集 X 账号帖子、thread、Article 和媒体。
+- `donald-generate-images-with-chatgpt`：通过可恢复的 ChatGPT Web 浏览器任务外部出图。
+
+采集和出图结果默认保存在系统“文档”目录的 `Donald Skills/Data/` 下，不写入源码仓库或
+当前工作目录。可以用全局环境变量 `DONALD_SKILLS_OUTPUT_ROOT` 改写共享 Data 根目录，
+也可以在单次命令中传 `--output-root`；单次命令优先。Chrome Profile 绑定配置和 Cookie
+运行数据分别保存在系统原生应用配置、应用数据目录，不与用户内容混放。
 
 ## 安装
 

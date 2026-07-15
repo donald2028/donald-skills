@@ -1,0 +1,4 @@
+interface:
+  display_name: "Collect X Posts"
+  short_description: "Collect X posts, threads, articles, and media"
+  default_prompt: "Use $donald-collect-x-posts to collect an X account's original content into a local archive."
