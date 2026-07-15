@@ -1,0 +1,30 @@
+{
+  "name": "donald-skills",
+  "version": "0.1.0",
+  "description": "A reusable skill collection for Claude Code, Codex, and compatible agents.",
+  "author": {
+    "name": "donald2028",
+    "url": "https://github.com/donald2028"
+  },
+  "homepage": "https://github.com/donald2028/donald-skills",
+  "repository": "https://github.com/donald2028/donald-skills",
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "skills",
+    "claude-code",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Donald Skills",
+    "shortDescription": "Use Donald's reusable agent skills.",
+    "longDescription": "Install and use Donald's reusable agent skills in Codex.",
+    "developerName": "donald2028",
+    "category": "Productivity",
+    "capabilities": [
+      "Skill management"
+    ],
+    "defaultPrompt": "Help me use Donald Skills."
+  }
+}

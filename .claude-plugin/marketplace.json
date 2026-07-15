@@ -1,0 +1,23 @@
+{
+  "name": "donald-skills",
+  "owner": {
+    "name": "donald2028"
+  },
+  "metadata": {
+    "description": "A reusable skill collection for Claude Code, Codex, and compatible agents.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "donald-skills",
+      "description": "Donald's reusable agent skills collection.",
+      "source": "./",
+      "category": "productivity",
+      "tags": [
+        "agents",
+        "skills",
+        "productivity"
+      ]
+    }
+  ]
+}

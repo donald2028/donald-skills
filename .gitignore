@@ -1,0 +1,72 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+credentials.json
+secrets.yaml
+secrets.yml
+service-account.json
+firebase-*.json
+google-services.json
+config.local.*
+settings.local.*
+*.local.json
+
+# Dependencies and virtual environments
+node_modules/
+.venv/
+venv/
+env/
+.npm/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+*.tgz
+*.zip
+
+# Logs and temporary output
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+outputs/
+.release-artifacts/
+
+# Runtime-local state
+.claude/settings.local.json
+.codex-tmp/
+
+# Editors and operating systems
+.DS_Store
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Session-only agent planning artifacts
+plans/
+specs/
+PLAN.md
+SPEC.md
+*-plan.md
+*-spec.md
+*.plan.md
+*.spec.md

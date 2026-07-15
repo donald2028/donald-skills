@@ -1,0 +1,20 @@
+{
+  "name": "donald-skills",
+  "displayName": "Donald Skills",
+  "version": "0.1.0",
+  "description": "A reusable skill collection for Claude Code, Codex, and compatible agents.",
+  "author": {
+    "name": "donald2028",
+    "url": "https://github.com/donald2028"
+  },
+  "homepage": "https://github.com/donald2028/donald-skills",
+  "repository": "https://github.com/donald2028/donald-skills",
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "skills",
+    "claude-code",
+    "codex"
+  ],
+  "skills": "./skills/"
+}
