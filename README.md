@@ -47,7 +47,7 @@ donald-skills/
 ├── .codex-plugin/plugin.json       # Codex plugin manifest
 ├── .agents/plugins/marketplace.json# Codex marketplace
 ├── AGENTS.md                       # 跨运行时仓库协作约定
-└── CLAUDE.md                       # Claude Code 入口
+└── CLAUDE.md -> AGENTS.md          # Claude Code 共享同一份约定
 ```
 
 `skills/` 是唯一需要手工维护的 skill 源。`.claude/skills/` 和 `.agents/skills/` 由同步脚本生成，避免维护多份副本。plugin 安装则直接从根目录的 `skills/` 自动发现内容。
