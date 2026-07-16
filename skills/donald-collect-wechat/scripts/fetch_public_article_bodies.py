@@ -39,6 +39,7 @@ from profile_config import (
     create_background_page,
     frontmost_process_id,
     hide_browser_without_focus,
+    preflight_browser,
     restore_frontmost_process_if_browser_active,
     wait_for_background_page_url,
 )
@@ -623,7 +624,7 @@ def main() -> int:
     parser.add_argument("--title-contains", action="append", default=[], help="Select first article title containing text.")
     parser.add_argument("--url", action="append", default=[], help="Extra public URL, optionally '<title>|<url>'.")
     parser.add_argument("--account", default="", help="Account name for direct URLs.")
-    parser.add_argument("--cdp", default="", help="Chrome CDP port for正文抓取, normally 9222.")
+    parser.add_argument("--cdp", default="", help="Explicit CDP port override; otherwise use the configured Profile port.")
     parser.add_argument("--session", default="", help="Optional agent-browser session name.")
     parser.add_argument("--limit", type=int, default=12, help="Default recent article limit when no terms are supplied.")
     parser.add_argument("--delay", type=float, default=1.0, help="Delay between public fetches.")
@@ -639,8 +640,34 @@ def main() -> int:
         help="Diagnostic only. Direct HTTP does not satisfy the browser-evidence workflow.",
     )
     args = parser.parse_args()
-    if not args.cdp and not args.http_diagnostic:
-        raise SystemExit("Collection requires --cdp <PORT>. Use --http-diagnostic only for troubleshooting.")
+    if not args.http_diagnostic:
+        try:
+            browser_config = configured_browser()
+            port = int(args.cdp or browser_config["chrome"]["default_cdp_port"])
+            startup = preflight_browser(
+                browser_config,
+                port,
+                args.session or "donald-wechat-bodies",
+                "about:blank",
+                60,
+            )
+            startup_target_id = str(startup.get("background_target_id") or "")
+            if startup_target_id:
+                close_background_page(port, startup_target_id)
+            args.cdp = str(port)
+        except (OSError, ProfileConfigError, subprocess.SubprocessError) as error:
+            print(
+                json.dumps(
+                    {
+                        "status": "needs_ops",
+                        "reason": "browser_startup_failed",
+                        "hint": str(error),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
 
     account_root, items = load_index_entries(args.archive)
     output_dir = account_root / "articles"

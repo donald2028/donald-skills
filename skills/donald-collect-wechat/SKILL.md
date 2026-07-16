@@ -11,45 +11,32 @@ the captured network responses as evidence.
 
 ## Prerequisites
 
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before this workflow
+  (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). Configure the
+  `donald-collect-wechat` scope and continue only after its check and preflight report `ready`.
+  That skill owns environment setup, Profile selection, shared Cookie state, and one-off CDP proof;
+  do not reproduce those steps here. If the runtime has no native skill-invocation action, load the
+  installed dependency through its normal Agent Skills discovery/read fallback. If it is not
+  installed, report `needs_dependency` with aggregate Donald plugin installation guidance and stop
+  before running the collector.
 - Install `agent-browser` and Google Chrome.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
-- Check this skill's independent Profile binding before collecting:
-
-```bash
-python3 "$SKILL_DIR/scripts/profile_config.py" check
-```
-
-If it reports `needs_initialization`, `stale_profile`, or `incomplete_user_data_dir`, run
-`environment`, then `profiles`; present the choices and wait for the user to confirm one before
-running `set --profile <choice>`. This bundled script automatically uses the
-`donald-collect-wechat` config. If another skill selects the same Profile, both configs
-reuse the same CDP User Data, cookies, login state, and port.
-
-- Launch the selected headed Profile in the background with the CDP port used below:
-
-```bash
-python3 "$SKILL_DIR/scripts/profile_config.py" preflight \
-  --session <agent-browser-session> \
-  --url about:blank
-```
-
-Continue only when preflight reports `ready`; it proves both Chrome CDP and
-`agent-browser --cdp` attach before the article-picker workflow starts. Reuse the returned
-`cdp_port` in every collection command below.
+- The configuration preflight closes any Chrome it starts before returning. Each bundled collector
+  then starts the configured headed Chrome as part of its own runner flow; `--cdp` is only an
+  explicit legacy override.
 
 - Log in to the WeChat Official Account backend in that Profile.
 
 On macOS, keep the automatically launched headed Chrome hidden throughout normal collection; this
 is not headless mode and prevents delayed page work from promoting Chrome to the foreground. When
-login, verification, risk control, or anti-automation requires operator interaction, run
-`python3 "$SKILL_DIR/scripts/profile_config.py" activate`, explain the required action, and keep
-Chrome open until the user confirms completion. Public-body collection performs this activation
-automatically when it recognizes a WeChat login or verification page.
+login, verification, risk control, or anti-automation requires operator interaction, return
+`needs_ops`, explain the required action, and keep Chrome open until the user confirms completion.
+The bundled runners activate only the configured Chrome when they recognize such a page.
 
-After preflight proves `agent-browser --cdp` can attach, the bundled collectors create dedicated
-browser-level CDP targets with `background: true`, enable focus emulation, and use trusted CDP input.
-They never call focus-stealing `agent-browser tab new`, `tab`, `open`, or input commands on the
-normal path. Treat Chrome becoming frontmost as a collection failure.
+After their runner startup proves `agent-browser --cdp` can attach, the bundled collectors create
+dedicated browser-level CDP targets with `background: true`, enable focus emulation, and use trusted
+CDP input. They never call focus-stealing `agent-browser tab new`, `tab`, `open`, or input commands
+on the normal path. Treat Chrome becoming frontmost as a collection failure.
 
 Do not bypass login, captcha, risk prompts, or account permissions. Return `needs_ops` when human
 interaction is required.
@@ -74,7 +61,6 @@ The command creates a unique UTC run directory, merges prior runs by URL, writes
 ```bash
 python3 "$SKILL_DIR/scripts/collect_account_articles.py" \
   --session <agent-browser-session> \
-  --cdp <configured-cdp-port> \
   --account "<account name>" \
   --wechat-id "<optional exact WeChat ID>" \
   --pages 20
@@ -95,7 +81,6 @@ Fetch selected recent bodies through the same headed Chrome/CDP profile:
 ```bash
 python3 "$SKILL_DIR/scripts/fetch_public_article_bodies.py" \
   "<account-root>" \
-  --cdp <configured-cdp-port> \
   --session <agent-browser-session> \
   --limit 12
 ```

@@ -10,22 +10,19 @@ enough session evidence to resume or recover downloads without resubmitting the 
 
 ## Prerequisites
 
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before this workflow
+  (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). Configure the
+  `donald-chatgpt-imagegen` scope and continue only after its check and preflight report `ready`.
+  That skill owns environment setup, Profile confirmation, shared Cookie state, recommendation
+  rules, and one-off CDP proof; do not reproduce those steps here. If the runtime has no native
+  skill-invocation action, load the installed dependency through its normal Agent Skills
+  discovery/read fallback. If it is not installed, report `needs_dependency` with aggregate Donald
+  plugin installation guidance and stop before running the image workflow.
 - Install `agent-browser` and Python Pillow.
 - Use Google Chrome/Chromium on macOS or Linux.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
-- Check this skill's independent Profile binding before generating:
-
-```bash
-python3 "$SKILL_DIR/scripts/profile_config.py" check
-```
-
-If it reports `needs_initialization`, `stale_profile`, or `incomplete_user_data_dir`, run
-`environment`, then `profiles`; present the choices and wait for the user to confirm one before
-running `set --profile <choice>`. This bundled script automatically uses the
-`donald-chatgpt-imagegen` config. If another skill selects the same Profile, both
-configs reuse the same CDP User Data, cookies, login state, and port. Before submitting a job, run
-`preflight` without overriding its configured port and continue only when real Chrome CDP and
-`agent-browser --cdp` both report ready.
+- The configuration preflight closes any Chrome it starts before returning. The image runner then
+  starts and owns the generation browser lifecycle.
 
 - Log in to ChatGPT in the selected visible Profile.
 - Passing `--user-data-dir` or `CHATGPT_WEB_USER_DATA_DIR` selects an explicit CDP data directory;
@@ -41,7 +38,9 @@ not headless mode. Do not activate it during normal
 generation. When the runner detects login or anti-automation verification, it returns `needs_ops`,
 activates only the configured CDP Chrome, and leaves it open for the user. Explain the required
 action and continue after the user confirms completion. Policy refusals are reported without
-activating Chrome because they are not an interactive login or verification state.
+activating Chrome because they are not an interactive login or verification state. After an
+ordinary terminal result, the runner closes its tab and exits the Donald Chrome when no other run
+is active. `needs_ops` and explicit `--keep-browser-open` runs keep Chrome open.
 
 ## Prepare A Job
 

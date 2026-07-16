@@ -39,6 +39,7 @@ SCOPE_CONFIGS = {
         "label": "ChatGPT image generation",
     },
 }
+SCOPE_PATTERN = re.compile(r"^donald-[a-z0-9]+(?:-[a-z0-9]+)*$")
 SKILL_DIRECTORY_NAME = Path(__file__).resolve().parents[1].name
 DEFAULT_SCOPE = SKILL_DIRECTORY_NAME if SKILL_DIRECTORY_NAME in SCOPE_CONFIGS else ""
 AGENT_BROWSER_INSTALL_URL = "https://agent-browser.dev/installation"
@@ -69,11 +70,12 @@ class ProfileConfigError(RuntimeError):
 
 def resolve_scope(value: str | None = None) -> str:
     scope = str(value or DEFAULT_SCOPE).strip()
-    if scope in SCOPE_CONFIGS:
+    if SCOPE_PATTERN.fullmatch(scope):
         return scope
     choices = ", ".join(SCOPE_CONFIGS)
     raise ProfileConfigError(
-        f"Choose which skill to configure with --scope. Available values: {choices}"
+        "Choose a Donald skill with --scope using a lowercase kebab-case name "
+        f"such as one of: {choices}"
     )
 
 
@@ -533,12 +535,26 @@ def configured_browser(path: Path | None = None, scope: str | None = None) -> di
     return config
 
 
+def configured_scope_names() -> list[str]:
+    scopes = list(SCOPE_CONFIGS)
+    config_root = default_config_path(scopes[0]).parent
+    if config_root.is_dir():
+        for candidate in sorted(config_root.glob("donald-*.json")):
+            try:
+                scope = resolve_scope(candidate.stem)
+            except ProfileConfigError:
+                continue
+            if scope not in scopes:
+                scopes.append(scope)
+    return scopes
+
+
 def _existing_profile_binding(
     profile_directory: str,
     source_user_data_dir: Path,
 ) -> tuple[str, dict[str, Any]] | None:
     expected_source = source_user_data_dir.expanduser().resolve()
-    for candidate_scope in SCOPE_CONFIGS:
+    for candidate_scope in configured_scope_names():
         candidate_path = default_config_path(candidate_scope)
         try:
             candidate = read_config(candidate_path, candidate_scope)
@@ -906,6 +922,30 @@ def _verify_existing_cdp_owner(config: dict[str, Any], port: int) -> None:
         )
 
 
+def close_cdp_browser(config: dict[str, Any], port: int, timeout: int = 10) -> dict[str, Any]:
+    version = _cdp_version(port)
+    if not version:
+        return {"status": "already_closed", "cdp_port": port}
+    _verify_existing_cdp_owner(config, port)
+    pid = _listening_process_id(port)
+    websocket_url = str(version.get("webSocketDebuggerUrl") or "")
+    if not websocket_url:
+        raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
+    close_error = ""
+    try:
+        with _CDPConnection.connect(websocket_url, timeout=10) as connection:
+            connection.call("Browser.close")
+    except (ConnectionError, OSError, ValueError, json.JSONDecodeError, ProfileConfigError) as error:
+        close_error = str(error)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _cdp_version(port):
+            return {"status": "closed", "cdp_port": port, "pid": int(pid) if pid else None}
+        time.sleep(0.2)
+    detail = f": {close_error}" if close_error else ""
+    raise ProfileConfigError(f"Chrome CDP on port {port} did not exit after preflight{detail}")
+
+
 def activate_browser(config: dict[str, Any], port: int) -> dict[str, Any]:
     if not _cdp_version(port):
         raise ProfileConfigError(f"Chrome CDP is unavailable on port {port}")
@@ -1082,58 +1122,72 @@ def preflight_browser(
                 f"Chrome did not expose CDP port {port} within {timeout}s. Command: {launch_command}"
             )
 
-    background_target_id = create_background_page(port, url)
-    background_url = wait_for_background_page_url(
-        port, background_target_id, url, timeout=min(timeout, 15)
-    )
-    background_visibility = hide_browser_without_focus(config, port, previous_frontmost_pid)
-    session_prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", session).strip("-") or "donald-cdp"
-    transport_session = f"{session_prefix[:30]}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-    agent_browser = ensure_agent_browser(auto_install=True)["executable"]
-    attach_command = [
-        agent_browser,
-        "--session",
-        transport_session,
-        "--cdp",
-        str(port),
-        "get",
-        "url",
-    ]
-    attach = _run(attach_command, timeout=60)
-    if attach.returncode != 0:
-        raise ProfileConfigError(
-            "Chrome CDP is reachable, but agent-browser could not attach: "
-            f"{attach.stdout.strip()}"
+    try:
+        background_target_id = create_background_page(port, url)
+        background_url = wait_for_background_page_url(
+            port, background_target_id, url, timeout=min(timeout, 15)
         )
-    agent_browser_url = attach.stdout.strip()
-    if background_url != "about:blank" and agent_browser_url == "about:blank":
-        deadline = time.time() + 5
-        while time.time() < deadline and agent_browser_url == "about:blank":
-            time.sleep(0.2)
-            attach = _run(attach_command, timeout=30)
-            if attach.returncode != 0:
-                raise ProfileConfigError(
-                    "agent-browser attached but could not reread the background page URL: "
-                    f"{attach.stdout.strip()}"
-                )
-            agent_browser_url = attach.stdout.strip()
-    background_visibility = hide_browser_without_focus(config, port, previous_frontmost_pid)
-    return {
-        "status": "ready",
-        "profile": config["profile"],
-        "user_data_dir": str(user_data_dir),
-        "cdp_port": port,
-        "browser": version.get("Browser"),
-        "browser_websocket": bool(version.get("webSocketDebuggerUrl")),
-        "agent_browser_session": transport_session,
-        "requested_session": session,
-        "url": background_url,
-        "agent_browser_url": agent_browser_url,
-        "background_target_id": background_target_id,
-        "background_visibility": background_visibility,
-        "launch_command": launch_command,
-        "attach_command": attach_command,
-    }
+        background_visibility = hide_browser_without_focus(config, port, previous_frontmost_pid)
+        session_prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", session).strip("-") or "donald-cdp"
+        transport_session = f"{session_prefix[:30]}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        agent_browser = ensure_agent_browser(auto_install=True)["executable"]
+        attach_command = [
+            agent_browser,
+            "--session",
+            transport_session,
+            "--cdp",
+            str(port),
+            "get",
+            "url",
+        ]
+        attach = _run(attach_command, timeout=60)
+        if attach.returncode != 0:
+            raise ProfileConfigError(
+                "Chrome CDP is reachable, but agent-browser could not attach: "
+                f"{attach.stdout.strip()}"
+            )
+        agent_browser_url = attach.stdout.strip()
+        if background_url != "about:blank" and agent_browser_url == "about:blank":
+            deadline = time.time() + 5
+            while time.time() < deadline and agent_browser_url == "about:blank":
+                time.sleep(0.2)
+                attach = _run(attach_command, timeout=30)
+                if attach.returncode != 0:
+                    raise ProfileConfigError(
+                        "agent-browser attached but could not reread the background page URL: "
+                        f"{attach.stdout.strip()}"
+                    )
+                agent_browser_url = attach.stdout.strip()
+        background_visibility = hide_browser_without_focus(config, port, previous_frontmost_pid)
+        result = {
+            "status": "ready",
+            "profile": config["profile"],
+            "user_data_dir": str(user_data_dir),
+            "cdp_port": port,
+            "browser": version.get("Browser"),
+            "browser_websocket": bool(version.get("webSocketDebuggerUrl")),
+            "agent_browser_session": transport_session,
+            "requested_session": session,
+            "url": background_url,
+            "agent_browser_url": agent_browser_url,
+            "background_target_id": background_target_id,
+            "background_visibility": background_visibility,
+            "launch_command": launch_command,
+            "attach_command": attach_command,
+        }
+    except Exception as error:
+        if launch_command:
+            try:
+                close_cdp_browser(config, port)
+            except ProfileConfigError as cleanup_error:
+                raise ProfileConfigError(f"{error}; preflight cleanup failed: {cleanup_error}") from error
+        raise
+    result["browser_cleanup"] = (
+        close_cdp_browser(config, port)
+        if launch_command
+        else {"status": "not_owned", "reason": "browser_was_already_running", "cdp_port": port}
+    )
+    return result
 
 
 def check_config(path: Path, scope: str, auto_install: bool) -> tuple[int, dict[str, Any]]:
@@ -1178,7 +1232,8 @@ def _emit(payload: dict[str, Any]) -> None:
 
 def target_statuses() -> list[dict[str, Any]]:
     targets = []
-    for scope, metadata in SCOPE_CONFIGS.items():
+    for scope in configured_scope_names():
+        metadata = SCOPE_CONFIGS.get(scope, {"label": scope})
         path = default_config_path(scope)
         target: dict[str, Any] = {
             "scope": scope,
@@ -1203,9 +1258,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scope",
-        choices=list(SCOPE_CONFIGS),
         default=DEFAULT_SCOPE or None,
-        help="Skill-specific browser configuration to read or write.",
+        help="Donald skill name whose browser configuration should be read or written.",
     )
     parser.add_argument(
         "--config",

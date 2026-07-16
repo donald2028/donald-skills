@@ -25,6 +25,7 @@ from profile_config import (
     frontmost_process_id,
     hide_browser_without_focus,
     list_cdp_targets,
+    preflight_browser,
     restore_frontmost_process_if_browser_active,
 )
 
@@ -231,16 +232,42 @@ def _close_if_open(port: int, target_id: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--session", default="", help="Accepted for parity with preflight; browser control stays on CDP.")
-    parser.add_argument("--cdp", required=True, type=int, help="Configured Chrome CDP port.")
+    parser.add_argument("--session", default="", help="Optional agent-browser session prefix for runner startup.")
+    parser.add_argument("--cdp", type=int, help="Explicit CDP port override; otherwise use the configured Profile port.")
     parser.add_argument("--account", required=True, help="Exact WeChat Official Account nickname.")
     parser.add_argument("--wechat-id", default="", help="Optional exact WeChat ID for search-result disambiguation.")
     parser.add_argument("--pages", type=int, default=20, help="Article picker pages to capture, including page one.")
     parser.add_argument("--output-root", type=Path, help="Exact WeChat collection root override.")
     args = parser.parse_args()
-    del args.session
     if args.pages < 1:
         raise SystemExit("--pages must be >= 1")
+
+    try:
+        browser_config = configured_browser()
+        args.cdp = args.cdp or int(browser_config["chrome"]["default_cdp_port"])
+        startup = preflight_browser(
+            browser_config,
+            args.cdp,
+            args.session or "donald-wechat-collect",
+            "about:blank",
+            60,
+        )
+        startup_target_id = str(startup.get("background_target_id") or "")
+        if startup_target_id:
+            close_background_page(args.cdp, startup_target_id)
+    except (OSError, ProfileConfigError, subprocess.SubprocessError) as error:
+        print(
+            json.dumps(
+                {
+                    "status": "needs_ops",
+                    "reason": "browser_startup_failed",
+                    "hint": str(error),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
 
     output_root = resolve_tool_output_root("wechat", args.output_root)
     account_root = output_root / _safe_path_part(args.account)
@@ -249,7 +276,6 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     previous_frontmost_pid = frontmost_process_id()
-    browser_config = configured_browser()
     home_target_id = create_background_page(args.cdp, WECHAT_HOME)
     hide_browser_without_focus(browser_config, args.cdp, previous_frontmost_pid)
     editor_target_id = ""

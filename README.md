@@ -70,10 +70,18 @@ donald-skills/
 
 `skills/` 是唯一需要手工维护的 skill 源。`.claude/skills/` 和 `.agents/skills/` 由同步脚本生成，避免维护多份副本。plugin 安装则直接从根目录的 `skills/` 自动发现内容。
 
+浏览器业务 skill 通过 `REQUIRED SUB-SKILL` 调用 `donald-config-browser`，由 Agent 先完成环境、
+Profile 绑定和 CDP 验证，再进入各自 runner。这个依赖写在 workflow 指令中，不依赖某个 Agent
+专用的工具名；Claude Code、Codex 和其他兼容 Agent Skills 的运行时都加载同一份正文。脚本、
+references 和 assets 仍保留在各自 skill 内，不通过兄弟目录路径互相 import。
+默认的整库和 aggregate plugin 安装会同时提供依赖；若某个运行时允许选择性安装单个 skill，
+安装浏览器业务 skill 时必须同时选择 `donald-config-browser`。
+
 ## 添加 skill
 
 1. 创建 `skills/<skill-name>/SKILL.md`，目录名和 frontmatter `name` 使用相同的 kebab-case 名称。
-2. 把该 skill 需要的脚本、参考资料和资源放在自己的目录内，保持可独立分发。
+2. 把该 skill 需要的脚本、参考资料和资源放在自己的目录内；如需复用另一个 workflow，使用
+   `**REQUIRED SUB-SKILL:** Invoke <skill-name>` 声明，并确保 aggregate plugin 同时分发两者。
 3. 同步运行时镜像并执行检查：
 
 ```bash

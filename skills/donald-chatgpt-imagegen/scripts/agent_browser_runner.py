@@ -794,12 +794,11 @@ def _cleanup_agent_browser(args: argparse.Namespace, cwd: Path) -> None:
             if item.get("run_id") != getattr(args, "_active_run_id", "")
         ]
         state["active_runs"] = active
-        only_blank_tabs_remain = (
+        no_non_blank_tabs_remain = (
             bool(blank_tab_summary.get("listed"))
-            and bool(blank_tab_summary.get("about_blank_tab_ids"))
             and int(blank_tab_summary.get("non_blank_count") or 0) == 0
         )
-        if not args.keep_browser_open and not active and (state.get("launched_by_runner") or only_blank_tabs_remain):
+        if not args.keep_browser_open and not active and (state.get("launched_by_runner") or no_non_blank_tabs_remain):
             close_browser = True
             state["launched_by_runner"] = False
         _write_cdp_state_locked(args, state)
@@ -2493,23 +2492,28 @@ JSON.stringify((() => {
     "unusual activity", "complete the challenge", "验证码", "安全验证"
   ].some((marker) => text.includes(marker));
   let humanReason = "";
-  if (!hasPrompt && (challengeFrame || challengeText)) humanReason = "anti_automation_verification";
-  else if (!hasPrompt && (loginPath || loginControl)) humanReason = "login_required";
+  if (challengeFrame || challengeText) humanReason = "anti_automation_verification";
+  else if (loginPath || loginControl) humanReason = "login_required";
   return {hasPrompt, humanReason};
 })())
 """.strip(),
                     timeout=30,
                 )
-                if state.get("hasPrompt"):
-                    return
                 if state.get("humanReason"):
                     _activate_for_human_attention(args, str(state["humanReason"]))
+                if state.get("hasPrompt"):
+                    return
             except HumanAttentionRequired:
                 raise
             except Exception:
                 pass
         else:
             snapshot = _snapshot(args, cwd)
+            lowered = snapshot.lower()
+            if any(marker in lowered for marker in ("verify you are human", "captcha", "security check")):
+                _activate_for_human_attention(args, "anti_automation_verification")
+            if any(marker in lowered for marker in ("log in", "sign in", "登录")):
+                _activate_for_human_attention(args, "login_required")
             if (
                 'role="textbox"' in snapshot
                 or 'aria-label="Chat with ChatGPT"' in snapshot
@@ -2517,11 +2521,6 @@ JSON.stringify((() => {
                 or "Message ChatGPT" in snapshot
             ):
                 return
-            lowered = snapshot.lower()
-            if any(marker in lowered for marker in ("verify you are human", "captcha", "security check")):
-                _activate_for_human_attention(args, "anti_automation_verification")
-            if any(marker in lowered for marker in ("log in", "sign in", "登录")):
-                _activate_for_human_attention(args, "login_required")
         time.sleep(1)
     raise TimeoutError("ChatGPT prompt textbox did not become visible")
 
@@ -4424,6 +4423,7 @@ def _run_one_request(
     after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
     upload_mentions = {Path(path).name: Path(path).name in after_upload for path in references}
 
+    _wait_for_prompt_box(args, cwd)
     _paste_prompt(args, cwd, message)
     _screenshot(args, cwd, trace_dir / "03_after_prompt.png")
 

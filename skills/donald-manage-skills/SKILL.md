@@ -22,7 +22,9 @@ runtimes.
 
 - Prefer root `skills/<skill-name>/` as the canonical source.
 - Use lowercase kebab-case for the directory and frontmatter `name`.
-- Keep each published skill self-contained so it can be copied or installed independently.
+- Keep each skill's code and resources self-contained; do not import sibling skill paths.
+- Allow workflow dependencies only when the aggregate plugin ships both skills. Declare them as
+  `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and keep the instruction runtime-neutral.
 - Put only required instructions in `SKILL.md`; add `scripts/`, `references/`, `assets/`, or
   `agents/` only when they support the workflow.
 - Treat `.claude/skills/` and `.agents/skills/` as generated mirrors when a sync script owns them.
@@ -38,6 +40,11 @@ Inspect nearby skills for repository conventions. For a new skill, create a vali
 only `name` and `description` in frontmatter, then implement the smallest useful body and resources.
 For an existing skill, preserve unrelated content and remove only artifacts made obsolete by the
 change.
+
+When one skill provides a shared workflow for others, cross-reference it instead of duplicating
+its instructions. Use the canonical bare skill name; mention the plugin-qualified name only as a
+runtime lookup aid. Verify the required skill exists and is included by every aggregate plugin
+installation surface.
 
 ### Remove Or Rename
 

@@ -39,8 +39,14 @@ asks for them. Prefer the smallest structure that satisfies the current request.
 
 - `skills/` is the only hand-maintained source of production skills.
 - Use a flat `skills/<skill-name>/SKILL.md` layout until categories are genuinely needed.
-- A published skill must be self-contained. Its `SKILL.md`, references, and scripts must not
-  depend on sibling skills or repository-only documentation.
+- Keep each skill's scripts, references, and assets self-contained; they must not import or read a
+  sibling skill by repository-relative path.
+- A workflow may invoke another skill when both ship in the aggregate Donald plugin. Declare a
+  required workflow dependency in `SKILL.md` as `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and
+  keep the instruction runtime-neutral. A runtime without native skill invocation may use its
+  normal Agent Skills discovery/read fallback. Cross-skill invocation is orchestration, not a code
+  import. If the dependency is unavailable, stop before business execution and report
+  `needs_dependency` with aggregate-plugin installation guidance.
 - `.claude/skills/` and `.agents/skills/` are generated runtime mirrors. Never hand-edit them;
   run `python3 skills/sync_runtime_skills.py` after adding, renaming, moving, or removing a skill.
 - `.claude-plugin/` and `.codex-plugin/` describe the same aggregate plugin. Keep their names and
@@ -58,3 +64,5 @@ For every new or changed skill:
 3. Add `scripts/`, `references/`, `assets/`, or `agents/` only when the skill needs them.
 4. Run the runtime sync and repository validation commands documented in `README.md`.
 5. Confirm `npx skills add . --list` discovers the intended skills and no unrelated directories.
+6. Confirm every declared required sub-skill exists in `skills/` and ships through each aggregate
+   plugin manifest.

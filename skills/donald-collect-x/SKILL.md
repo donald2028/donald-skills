@@ -10,21 +10,19 @@ session over CDP, preserve raw response runs, and compile deterministic JSONL/Ma
 
 ## Prerequisites
 
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before this workflow
+  (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). Configure the
+  `donald-collect-x` scope and continue only after its check and preflight report `ready`. That
+  skill owns environment setup, Profile selection, shared Cookie state, and one-off CDP proof; do
+  not reproduce those steps here. If the runtime has no native skill-invocation action, load the
+  installed dependency through its normal Agent Skills discovery/read fallback. If it is not
+  installed, report `needs_dependency` with aggregate Donald plugin installation guidance and stop
+  before running the collector.
 - Use Python 3.10+, `agent-browser`, and Google Chrome.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
-- Check this skill's independent Profile binding before collecting:
-
-```bash
-python3 "$SKILL_DIR/scripts/profile_config.py" check
-```
-
-If it reports `needs_initialization`, `stale_profile`, or `incomplete_user_data_dir`, run
-`environment`, then `profiles`; present the choices and wait for the user to confirm one before
-running `set --profile <choice>`. This bundled script automatically uses the
-`donald-collect-x` config. If another skill selects the same Profile, both configs reuse the
-same CDP User Data, cookies, login state, and port. The collector itself runs the headed
-Chrome/CDP/agent-browser preflight before opening X and stops with `needs_ops` if any layer is
-unavailable.
+- The configuration preflight closes any Chrome it starts before returning. The collector runner
+  then starts and owns the headed Chrome/CDP session used for X and stops with `needs_ops` if any
+  runtime layer is unavailable.
 
 - Log in to X in the selected visible Profile.
 - `X_COLLECTOR_CHROME_EXECUTABLE` and `X_COLLECTOR_CHROME_DATA_DIR` remain explicit legacy

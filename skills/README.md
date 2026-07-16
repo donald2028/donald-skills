@@ -1,7 +1,7 @@
 # Skills
 
-This directory is the canonical source for Donald Skills. Keep each reusable workflow as a
-self-contained directory:
+This directory is the canonical source for Donald Skills. Keep each reusable workflow's code and
+resources in its own directory:
 
 ```text
 skills/
@@ -14,7 +14,9 @@ skills/
 ```
 
 Use a flat layout until the collection is large enough to need categories. A skill must not read
-files outside its own directory because installers may distribute it independently.
+files outside its own directory. Workflow-level composition is allowed when the aggregate plugin
+ships both skills: declare it in `SKILL.md` with `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and
+let the agent invoke the dependency instead of importing its files.
 
 After changing this tree, regenerate the Claude Code and Codex project mirrors:
 
