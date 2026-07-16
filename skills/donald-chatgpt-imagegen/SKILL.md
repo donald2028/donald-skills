@@ -1,6 +1,6 @@
 ---
 name: donald-chatgpt-imagegen
-description: Generate and download images through an external ChatGPT Web session using a visible Chrome browser, with optional local reference images, multiple candidates, aspect ratios, resumable conversations, and recovery artifacts. Use when the user requests ChatGPT external image generation, 外部出图, browser-based ChatGPT image generation, or wants to avoid the current runtime's built-in image generator.
+description: Generate and download images through an external ChatGPT Web session using a visible Chrome browser, with optional local reference images, multiple candidates, aspect ratios, resumable conversations, and recovery artifacts. Use when the user requests ChatGPT external image generation, 外部出图, browser-based ChatGPT image generation, or wants to avoid the current runtime's built-in image generator. Also use it as an external fallback when Codex's built-in image generation is blocked by safety restrictions, fails repeatedly, or otherwise cannot complete the requested image generation, subject to ChatGPT's own policies.
 ---
 
 # Generate Images With ChatGPT
