@@ -1,0 +1,4 @@
+interface:
+  display_name: "Safely Commit Git Changes"
+  short_description: "Review, commit, and optionally push Git changes"
+  default_prompt: "Use $donald-safe-commit to review and safely commit the current Git changes."

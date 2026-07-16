@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research GitHub Repositories"
+  short_description: "Clone, refresh, and inspect GitHub repositories"
+  default_prompt: "Use $donald-research-github to acquire and analyze this GitHub repository."
