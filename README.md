@@ -38,6 +38,14 @@ npx skills add donald2028/donald-skills -g
 npx skills add donald2028/donald-skills --list
 ```
 
+选择性安装浏览器业务 skill 时，可以同时选择公共配置依赖，避免首次使用时再确认安装：
+
+```bash
+npx skills add donald2028/donald-skills -g \
+  --skill donald-collect-x \
+  --skill donald-config-browser
+```
+
 ### Claude Code plugin
 
 ```bash
@@ -129,7 +137,9 @@ Profile 绑定和 CDP 验证，再进入各自 runner。这个依赖写在 workf
 专用的工具名；Claude Code、Codex 和其他兼容 Agent Skills 的运行时都加载同一份正文。脚本、
 references 和 assets 仍保留在各自 skill 内，不通过兄弟目录路径互相 import。
 默认的整库和 aggregate plugin 安装会同时提供依赖；若某个运行时允许选择性安装单个 skill，
-安装浏览器业务 skill 时必须同时选择 `donald-config-browser`。
+浏览器业务 skill 会在真正调用时检查 `donald-config-browser`。缺少时，它会先征得用户同意，
+再把依赖安装到相同 scope 和 agent target，并在成功后继续原任务；用户也可以在首次安装时同时
+选择两个 skill，避免这一步确认。
 
 ## 添加 skill
 

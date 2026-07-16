@@ -45,8 +45,12 @@ asks for them. Prefer the smallest structure that satisfies the current request.
   required workflow dependency in `SKILL.md` as `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and
   keep the instruction runtime-neutral. A runtime without native skill invocation may use its
   normal Agent Skills discovery/read fallback. Cross-skill invocation is orchestration, not a code
-  import. If the dependency is unavailable, stop before business execution and report
-  `needs_dependency` with aggregate-plugin installation guidance.
+  import. Resolve dependencies lazily when the caller skill is invoked: if one is unavailable, stop
+  before business execution, explain the requirement, and ask the user for permission to install it
+  into the same scope and agent target. After an approved successful install, discover and invoke
+  the dependency and continue the original request. Report `needs_dependency` with exact
+  install/retry guidance only when the user declines, installation fails, or the runtime cannot
+  load the installed dependency.
 - `.claude/skills/` and `.agents/skills/` are generated runtime mirrors. Never hand-edit them;
   run `npm run build` after adding, renaming, moving, or removing a skill.
 - `package.json` is the only hand-maintained source for shared plugin metadata and version. Run

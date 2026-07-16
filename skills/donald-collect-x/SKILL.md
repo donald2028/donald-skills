@@ -10,14 +10,21 @@ session over CDP, preserve raw response runs, and compile deterministic JSONL/Ma
 
 ## Prerequisites
 
-- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before this workflow
-  (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). Configure the
-  `donald-collect-x` scope and continue only after its check and preflight report `ready`. That
-  skill owns environment setup, Profile selection, shared Cookie state, and one-off CDP proof; do
-  not reproduce those steps here. If the runtime has no native skill-invocation action, load the
-  installed dependency through its normal Agent Skills discovery/read fallback. If it is not
-  installed, report `needs_dependency` with aggregate Donald plugin installation guidance and stop
-  before running the collector.
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before any environment check or collector
+  command (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). First
+  look for it in the runtime's available skills. If it is available, invoke it for the
+  `donald-collect-x` scope and continue only after its check and preflight report `ready`. If it is
+  unavailable, tell the user that this workflow needs the browser configuration skill and ask
+  permission to install it into the same skill scope and agent target. After approval, use the
+  runtime's normal installer; with Skills CLI, run
+  `npx skills add donald2028/donald-skills --skill donald-config-browser --yes`, adding `--global`
+  only when this skill is installed globally and preserving the current agent target when needed.
+  Discover and invoke the installed dependency, then continue the original collection request. If
+  the user declines, installation fails, or the runtime cannot load it, report `needs_dependency`
+  with exact install/retry guidance and stop before business execution. If the runtime has no
+  native skill-invocation action, use its normal Agent Skills discovery/read fallback. The
+  dependency owns environment setup, Profile selection, shared Cookie state, and one-off CDP proof;
+  do not reproduce those steps here.
 - Use Python 3.10+, `agent-browser`, and Google Chrome.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
 - The configuration preflight closes any Chrome it starts before returning. The collector runner
