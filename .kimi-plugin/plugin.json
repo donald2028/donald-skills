@@ -8,7 +8,6 @@
     "url": "https://github.com/donald2028"
   },
   "homepage": "https://github.com/donald2028/donald-skills",
-  "repository": "https://github.com/donald2028/donald-skills",
   "license": "MIT",
   "keywords": [
     "agents",
@@ -23,13 +22,9 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Donald Skills",
-    "shortDescription": "Use Donald's reusable agent skills.",
-    "longDescription": "Install and use Donald's reusable agent skills in Codex.",
+    "shortDescription": "Use Donald's reusable agent skills",
+    "longDescription": "Use Donald's reusable skills for repository maintenance, research, browser workflows, and content collection.",
     "developerName": "donald2028",
-    "category": "Productivity",
-    "capabilities": [
-      "Skill management"
-    ],
-    "defaultPrompt": "Help me use Donald Skills."
+    "websiteURL": "https://github.com/donald2028/donald-skills"
   }
 }

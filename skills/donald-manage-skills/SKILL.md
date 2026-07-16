@@ -1,6 +1,6 @@
 ---
 name: donald-manage-skills
-description: Use when adding, updating, removing, auditing, validating, packaging, versioning, or publishing skills in a reusable Agent Skills repository that supports Skills CLI, Claude Code, and Codex.
+description: Use when adding, updating, removing, auditing, validating, packaging, versioning, or publishing skills in a reusable multi-runtime Agent Skills repository.
 ---
 
 # Manage Skill Repository
@@ -14,7 +14,7 @@ runtimes.
    `skills/` tree, runtime mirrors, and Git status.
 2. State the requested outcome and the checks that will prove it.
 3. Change only canonical skill files and the minimum repository metadata required by the request.
-4. Regenerate runtime mirrors with the repository's sync script when one exists.
+4. Run the repository build to synchronize channel manifests and runtime mirrors.
 5. Run the available skill, plugin, and repository validators.
 6. Review the diff and sensitive-file status before any requested commit or push.
 
@@ -28,7 +28,8 @@ runtimes.
 - Put only required instructions in `SKILL.md`; add `scripts/`, `references/`, `assets/`, or
   `agents/` only when they support the workflow.
 - Treat `.claude/skills/` and `.agents/skills/` as generated mirrors when a sync script owns them.
-- Keep Claude and Codex plugin names and versions aligned.
+- Treat `package.json` as the canonical source for shared channel metadata and version when the
+  repository build owns those fields.
 - Do not add subagents, hooks, MCP servers, categories, or release tooling without a concrete need.
 - Never commit credentials, local settings, caches, generated output, or session-only plans.
 
@@ -53,9 +54,9 @@ regenerate mirrors, and verify that no stale symlink or duplicate skill name rem
 
 ### Release Or Publish
 
-Change versions only when a release is requested. Keep aggregate plugin manifests and marketplace
-metadata consistent, validate installation discovery, then perform the repository's sensitive-file
-check before committing or pushing.
+Change versions only when a release is requested. Set the version once through the repository
+build, verify that every generated manifest and marketplace is synchronized, validate installation
+discovery, then perform the repository's sensitive-file check before committing or pushing.
 
 ## Verification
 

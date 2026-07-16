@@ -48,9 +48,19 @@ asks for them. Prefer the smallest structure that satisfies the current request.
   import. If the dependency is unavailable, stop before business execution and report
   `needs_dependency` with aggregate-plugin installation guidance.
 - `.claude/skills/` and `.agents/skills/` are generated runtime mirrors. Never hand-edit them;
-  run `python3 skills/sync_runtime_skills.py` after adding, renaming, moving, or removing a skill.
-- `.claude-plugin/` and `.codex-plugin/` describe the same aggregate plugin. Keep their names and
-  versions aligned.
+  run `npm run build` after adding, renaming, moving, or removing a skill.
+- `package.json` is the only hand-maintained source for shared plugin metadata and version. Run
+  `npm run build` to project those fields into every committed channel manifest; preserve
+  platform-specific fields such as `interface` in their native manifest.
+- `.claude-plugin/` and `.codex-plugin/` describe the same aggregate plugin. Their shared metadata
+  is generated from `package.json`.
+- `.cursor-plugin/plugin.json` and `.kimi-plugin/plugin.json` expose the same aggregate `skills/`
+  tree for Cursor and Kimi Code.
+- `gemini-extension.json` and `GEMINI.md` are the Gemini CLI extension entry points; keep the
+  extension pointed at the canonical root `skills/` tree.
+- OpenCode natively discovers the generated `.claude/skills/` and `.agents/skills/` mirrors. Do
+  not add a second OpenCode skill copy or plugin bootstrap unless the user explicitly asks for
+  OpenCode-specific behavior.
 - `.agents/plugins/marketplace.json` and `.claude-plugin/marketplace.json` expose the same plugin
   from the repository root.
 - Keep secrets and runtime output out of Git. Commit examples as `.env.example`, never `.env`.
@@ -62,7 +72,7 @@ For every new or changed skill:
 1. Use a kebab-case directory name and matching frontmatter `name`.
 2. Make the frontmatter `description` specific enough for reliable triggering.
 3. Add `scripts/`, `references/`, `assets/`, or `agents/` only when the skill needs them.
-4. Run the runtime sync and repository validation commands documented in `README.md`.
+4. Run the build and repository validation commands documented in `README.md`.
 5. Confirm `npx skills add . --list` discovers the intended skills and no unrelated directories.
 6. Confirm every declared required sub-skill exists in `skills/` and ships through each aggregate
    plugin manifest.

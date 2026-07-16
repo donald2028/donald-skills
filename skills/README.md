@@ -18,11 +18,13 @@ files outside its own directory. Workflow-level composition is allowed when the 
 ships both skills: declare it in `SKILL.md` with `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and
 let the agent invoke the dependency instead of importing its files.
 
-After changing this tree, regenerate the Claude Code and Codex project mirrors:
+After changing this tree, rebuild the channel manifests and runtime mirrors:
 
 ```bash
-python3 skills/sync_runtime_skills.py
-python3 skills/sync_runtime_skills.py --check
+npm run build
+npm run build:check
 ```
 
-The aggregate Claude and Codex plugin manifests discover skills directly from this directory.
+The aggregate Claude, Codex, Cursor, Kimi Code, and Gemini CLI manifests discover skills directly
+from this directory. OpenCode discovers the generated `.claude/skills/` and `.agents/skills/`
+mirrors according to its native Agent Skills search paths.

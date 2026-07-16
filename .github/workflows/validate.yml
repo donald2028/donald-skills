@@ -19,10 +19,14 @@ jobs:
 
       - name: Validate JSON manifests
         run: |
+          python3 -m json.tool package.json >/dev/null
           python3 -m json.tool .claude-plugin/marketplace.json >/dev/null
           python3 -m json.tool .claude-plugin/plugin.json >/dev/null
           python3 -m json.tool .codex-plugin/plugin.json >/dev/null
+          python3 -m json.tool .cursor-plugin/plugin.json >/dev/null
+          python3 -m json.tool .kimi-plugin/plugin.json >/dev/null
+          python3 -m json.tool gemini-extension.json >/dev/null
           python3 -m json.tool .agents/plugins/marketplace.json >/dev/null
 
-      - name: Validate runtime mirrors
-        run: python3 skills/sync_runtime_skills.py --check
+      - name: Validate generated manifests and runtime mirrors
+        run: python3 scripts/build.py --check

@@ -1,0 +1,6 @@
+{
+  "name": "donald-skills",
+  "version": "0.1.0",
+  "description": "A reusable skill collection for Claude Code, Codex, Cursor, Gemini CLI, Kimi Code, OpenCode, and compatible agents.",
+  "contextFileName": "GEMINI.md"
+}

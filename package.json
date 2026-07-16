@@ -1,6 +1,8 @@
 {
   "name": "donald-skills",
+  "displayName": "Donald Skills",
   "version": "0.1.0",
+  "private": true,
   "description": "A reusable skill collection for Claude Code, Codex, Cursor, Gemini CLI, Kimi Code, OpenCode, and compatible agents.",
   "author": {
     "name": "donald2028",
@@ -20,16 +22,8 @@
     "kimi",
     "opencode"
   ],
-  "skills": "./skills/",
-  "interface": {
-    "displayName": "Donald Skills",
-    "shortDescription": "Use Donald's reusable agent skills.",
-    "longDescription": "Install and use Donald's reusable agent skills in Codex.",
-    "developerName": "donald2028",
-    "category": "Productivity",
-    "capabilities": [
-      "Skill management"
-    ],
-    "defaultPrompt": "Help me use Donald Skills."
+  "scripts": {
+    "build": "python3 scripts/build.py",
+    "build:check": "python3 scripts/build.py --check"
   }
 }
