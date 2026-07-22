@@ -1,18 +1,18 @@
 ---
 name: donald-config-browser
-description: Install and verify agent-browser, list local Chrome Profiles with login emails, bind each Donald browser skill to its own selected Profile, initialize shared per-Profile Chrome user-data-dirs, and prove headed Chrome control through agent-browser over CDP. Use before Donald browser collection or image-generation skills, or to inspect, change, reset, or repair one skill's browser Profile selection.
+description: "Perform first-time setup or repair for Donald browser skills: install and verify agent-browser, select a local Chrome Profile, persist a per-skill binding, initialize shared per-Profile Chrome user-data-dirs, and prove headed Chrome control over CDP. Use when no binding exists, the user asks to inspect, change, or reset a binding, or a browser runner reports a configuration or environment failure; do not use as a gate before every routine browser task."
 ---
 
 # Configure Agent Browser Profile
 
-Prepare each browser skill independently before collection or image-generation work. A successful
-setup means the skill has its own Profile binding and a real headed Chrome launched from that
-Profile's persistent `user-data-dir` has passed an `agent-browser --cdp` control check.
+Prepare each browser skill independently once, then reuse its saved binding. A successful setup
+means the skill has its own Profile binding and a real headed Chrome launched from that Profile's
+persistent `user-data-dir` has passed an `agent-browser --cdp` control check. The binding remains
+valid for later tasks until the user changes it or a runner reports a configuration failure.
 
-Other Donald browser workflows invoke this skill as their required configuration sub-skill. When
-invoked that way, use the caller's skill name as `--scope`, complete the environment, binding,
-check, and preflight phases here, then return control to the caller. Do not duplicate the caller's
-business workflow or import files from its skill directory.
+Other Donald browser workflows invoke this skill only for first-time setup or repair. When invoked
+that way, use the caller's skill name as `--scope`. Do not duplicate the caller's business workflow
+or import files from its skill directory.
 
 Keep bindings separate from browser state:
 
@@ -37,13 +37,45 @@ Keep bindings separate from browser state:
 The JSON contains paths and Profile metadata, not passwords or tokens. The runtime browser data is
 sensitive because it contains copied login state. Never commit, upload, or inspect it unnecessarily.
 
-## Phase 1: Check The Environment
+## Invocation Policy
 
-Resolve `SKILL_DIR` to the directory containing this `SKILL.md`. List the independently configurable
-targets, then check the common environment:
+Routine browser tasks take the fast path: the caller runs its bundled business runner directly.
+That runner reads the saved binding and owns the live Chrome/CDP/agent-browser startup check. Do
+not invoke this skill, enumerate Profiles, or run a separate preflight merely because a new task
+started.
+
+When this skill is invoked, resolve `SKILL_DIR` to the directory containing this `SKILL.md`, resolve
+the caller's scope, and inspect the saved binding first:
+
+```bash
+python3 "$SKILL_DIR/scripts/profile_config.py" --scope <skill-name> show
+```
+
+- If it reports `ready` and the user requested at most an inspection, report the saved binding when
+  requested and return control immediately. Do not run `environment`, `profiles`, `check`, or
+  `preflight`.
+- If the user requested a reset, run `reset` directly. Do not check the environment or list Profiles.
+- If no binding exists, perform Phases 1–3.
+- If the user explicitly requests a Profile change, skip the cached binding and perform Phases 1–3.
+- If a runner reported a configuration or environment failure, use `check` to diagnose it, then run
+  only the repair steps indicated by the result. Run `preflight` once after a repair.
+
+A saved binding is sticky. Never ask the user to select a Profile again solely because this is a
+new task or session.
+
+## Phase 1: Check The Environment For Setup Or Repair
+
+When this skill is used standalone and the target is unknown, list the independently configurable
+targets:
 
 ```bash
 python3 "$SKILL_DIR/scripts/profile_config.py" targets
+```
+
+When a caller supplied its exact scope, do not run `targets` or ask for a target. For first-time
+setup or repair, check the common environment:
+
+```bash
 python3 "$SKILL_DIR/scripts/profile_config.py" environment
 ```
 
@@ -52,12 +84,13 @@ Homebrew (macOS fallback), then runs its official browser setup. It never invoke
 installer exists or global installation needs administrator action, report `needs_ops` with the
 returned error.
 
-This phase also requires Google Chrome and its normal User Data directory. Do not continue to a
-browser task until it reports `ready`.
+This phase also requires Google Chrome and its normal User Data directory. Do not continue with
+setup or repair until it reports `ready`.
 
-## Phase 2: Choose A Skill And Profile
+## Phase 2: Choose A Profile Only When Needed
 
-Ask which target to initialize or change. Existing browser workflows use these scope values:
+If no caller supplied a scope, ask which target to initialize or change. Do not ask again when the
+caller already supplied its exact scope. Existing browser workflows use these scope values:
 
 - `donald-chatgpt-imagegen`
 - `donald-collect-wechat`
@@ -67,7 +100,7 @@ A future Donald browser skill may use its own lowercase kebab-case `donald-*` sk
 scope without changing this script. The first saved binding makes it appear in `targets`. Use the
 exact caller skill name so its runner reads the same config file.
 
-List usable Profiles without changing config:
+List usable Profiles without changing config only for those cases:
 
 ```bash
 python3 "$SKILL_DIR/scripts/profile_config.py" \
@@ -105,9 +138,9 @@ selected Profile directory and must not be Chrome's normal User Data root. If an
 already bound to that Profile, initialization reuses its existing directory and port and rejects a
 conflicting override.
 
-## Phase 3: Prove Chrome Over CDP
+## Phase 3: Prove Chrome Over CDP Once
 
-Check files and selection, then perform a real headed preflight:
+After a new binding or repair, check files and selection, then perform one real headed preflight:
 
 ```bash
 python3 "$SKILL_DIR/scripts/profile_config.py" --scope <skill-name> show

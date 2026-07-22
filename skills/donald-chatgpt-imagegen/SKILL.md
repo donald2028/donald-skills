@@ -10,26 +10,32 @@ enough session evidence to resume or recover downloads without resubmitting the 
 
 ## Prerequisites
 
-- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before any environment check or image
-  command (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). First
-  look for it in the runtime's available skills. If it is available, invoke it for the
-  `donald-chatgpt-imagegen` scope and continue only after its check and preflight report `ready`.
-  If it is unavailable, tell the user that this workflow needs the browser configuration skill and
-  ask permission to install it into the same skill scope and agent target. After approval, use the
-  runtime's normal installer; with Skills CLI, run
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a
+  routine per-run gate (`donald-skills:donald-config-browser` when the runtime namespaces plugin
+  skills). First confirm that it exists in the runtime's already available skill catalog; this
+  discovery must not invoke it or run any configuration command. If it is unavailable, tell the
+  user that this workflow requires the setup/repair dependency and ask permission to install it
+  into the same skill scope and agent target. After approval, use the runtime's normal installer;
+  with Skills CLI, run
   `npx skills add donald2028/donald-skills --skill donald-config-browser --yes`, adding `--global`
   only when this skill is installed globally and preserving the current agent target when needed.
-  Discover and invoke the installed dependency, then continue the original image request. If the
-  user declines, installation fails, or the runtime cannot load it, report `needs_dependency` with
-  exact install/retry guidance and stop before business execution. If the runtime has no native
-  skill-invocation action, use its normal Agent Skills discovery/read fallback. The dependency owns
-  environment setup, Profile confirmation, shared Cookie state, recommendation rules, and one-off
-  CDP proof; do not reproduce those steps here.
-- Install `agent-browser` and Python Pillow.
-- Use Google Chrome/Chromium on macOS or Linux.
+  Discover the installed dependency, then continue. If the user declines, installation fails, or
+  the runtime cannot load it, report `needs_dependency` with exact install/retry guidance and stop
+  before business execution. On the normal path, do not invoke the available dependency and do not
+  run separate `environment`, `profiles`, `check`, or `preflight` commands; prepare the job and run
+  the bundled image runner directly. The runner reads the saved `donald-chatgpt-imagegen` binding
+  and owns the live Chrome/CDP attach check. Invoke the dependency for that scope only when the user
+  asks to configure, inspect, change, reset, or repair the binding, or when the runner reports
+  `browser_profile_unconfigured` or identifies a missing, stale, or incomplete browser
+  configuration. If the runtime has no native skill-invocation action, use its normal Agent Skills
+  discovery/read fallback. The dependency owns first-time environment setup, Profile confirmation,
+  shared Cookie state, recommendation rules, and repair; do not reproduce those steps here.
+- Runtime requirements are `agent-browser`, Python Pillow, and Google Chrome/Chromium on macOS or
+  Linux. Do not probe them separately on the normal path; run the bundled command and handle only
+  the missing layer it reports. Invoke browser setup or repair only for browser-specific failures.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
-- The configuration preflight closes any Chrome it starts before returning. The image runner then
-  starts and owns the generation browser lifecycle.
+- After setup, the image runner starts and owns the generation browser lifecycle. Do not run a
+  separate configuration preflight before it.
 
 - Log in to ChatGPT in the selected visible Profile.
 - Passing `--user-data-dir` or `CHATGPT_WEB_USER_DATA_DIR` selects an explicit CDP data directory;

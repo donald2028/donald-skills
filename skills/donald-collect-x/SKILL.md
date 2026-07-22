@@ -10,31 +10,39 @@ session over CDP, preserve raw response runs, and compile deterministic JSONL/Ma
 
 ## Prerequisites
 
-- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before any environment check or collector
-  command (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). First
-  look for it in the runtime's available skills. If it is available, invoke it for the
-  `donald-collect-x` scope and continue only after its check and preflight report `ready`. If it is
-  unavailable, tell the user that this workflow needs the browser configuration skill and ask
-  permission to install it into the same skill scope and agent target. After approval, use the
-  runtime's normal installer; with Skills CLI, run
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a
+  routine per-run gate (`donald-skills:donald-config-browser` when the runtime namespaces plugin
+  skills). First confirm that it exists in the runtime's already available skill catalog; this
+  discovery must not invoke it or run any configuration command. If it is unavailable, tell the
+  user that this workflow requires the setup/repair dependency and ask permission to install it
+  into the same skill scope and agent target. After approval, use the runtime's normal installer;
+  with Skills CLI, run
   `npx skills add donald2028/donald-skills --skill donald-config-browser --yes`, adding `--global`
   only when this skill is installed globally and preserving the current agent target when needed.
-  Discover and invoke the installed dependency, then continue the original collection request. If
-  the user declines, installation fails, or the runtime cannot load it, report `needs_dependency`
-  with exact install/retry guidance and stop before business execution. If the runtime has no
-  native skill-invocation action, use its normal Agent Skills discovery/read fallback. The
-  dependency owns environment setup, Profile selection, shared Cookie state, and one-off CDP proof;
-  do not reproduce those steps here.
-- Use Python 3.10+, `agent-browser`, and Google Chrome.
+  Discover the installed dependency, then continue. If the user declines, installation fails, or
+  the runtime cannot load it, report `needs_dependency` with exact install/retry guidance and stop
+  before business execution. On the normal path, do not invoke the available dependency and do not
+  run separate `environment`, `profiles`, `check`, or `preflight` commands; run the requested
+  bundled collector directly. The collector reads the saved `donald-collect-x` binding and owns the
+  live Chrome/CDP/agent-browser startup check. Invoke the dependency for that scope only when the
+  user asks to configure, inspect, change, reset, or repair the binding, or when the collector
+  reports `browser_profile_unconfigured` or a `cdp_unavailable` hint identifies missing, stale, or
+  incomplete browser configuration. If the runtime has no native skill-invocation action, use its
+  normal Agent Skills discovery/read fallback. The dependency owns first-time environment setup,
+  Profile selection, shared Cookie state, and repair; do not reproduce those steps here.
+- Runtime requirements are Python 3.10+, `agent-browser`, and Google Chrome. Do not probe them
+  separately on the normal path; run the bundled collector and handle only the missing layer it
+  reports. Invoke browser setup or repair only for browser-specific failures.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
-- The configuration preflight closes any Chrome it starts before returning. The collector runner
-  then starts and owns the headed Chrome/CDP session used for X and stops with `needs_ops` if any
-  runtime layer is unavailable.
+- After setup, the collector runner starts and owns the headed Chrome/CDP session used for X; do
+  not run a separate configuration preflight. It stops with `needs_ops` if a runtime layer is
+  unavailable.
 
 - Log in to X in the selected visible Profile.
 - `X_COLLECTOR_CHROME_EXECUTABLE` and `X_COLLECTOR_CHROME_DATA_DIR` remain explicit legacy
   overrides; the collector still verifies `agent-browser --cdp` attach before collecting.
-- Install `curl`; install `ffmpeg` and `yt-dlp` when video/media download is required.
+- Media download additionally uses `curl`, with `ffmpeg` and `yt-dlp` for video fallbacks. Do not
+  probe them before collection; the downloader records unavailable media honestly.
 
 On macOS, keep the automatically launched headed Chrome hidden during normal automation; this is
 not headless mode. Do not activate it during normal

@@ -11,26 +11,33 @@ the captured network responses as evidence.
 
 ## Prerequisites
 
-- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` before any environment check or collector
-  command (`donald-skills:donald-config-browser` when the runtime namespaces plugin skills). First
-  look for it in the runtime's available skills. If it is available, invoke it for the
-  `donald-collect-wechat` scope and continue only after its check and preflight report `ready`. If
-  it is unavailable, tell the user that this workflow needs the browser configuration skill and
-  ask permission to install it into the same skill scope and agent target. After approval, use the
-  runtime's normal installer; with Skills CLI, run
+- **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a
+  routine per-run gate (`donald-skills:donald-config-browser` when the runtime namespaces plugin
+  skills). First confirm that it exists in the runtime's already available skill catalog; this
+  discovery must not invoke it or run any configuration command. If it is unavailable, tell the
+  user that this workflow requires the setup/repair dependency and ask permission to install it
+  into the same skill scope and agent target. After approval, use the runtime's normal installer;
+  with Skills CLI, run
   `npx skills add donald2028/donald-skills --skill donald-config-browser --yes`, adding `--global`
   only when this skill is installed globally and preserving the current agent target when needed.
-  Discover and invoke the installed dependency, then continue the original collection request. If
-  the user declines, installation fails, or the runtime cannot load it, report `needs_dependency`
-  with exact install/retry guidance and stop before business execution. If the runtime has no
-  native skill-invocation action, use its normal Agent Skills discovery/read fallback. The
-  dependency owns environment setup, Profile selection, shared Cookie state, and one-off CDP proof;
-  do not reproduce those steps here.
-- Install `agent-browser` and Google Chrome.
+  Discover the installed dependency, then continue. If the user declines, installation fails, or
+  the runtime cannot load it, report `needs_dependency` with exact install/retry guidance and stop
+  before business execution. On the normal path, do not invoke the available dependency and do not
+  run separate `environment`, `profiles`, `check`, or `preflight` commands; run the requested
+  bundled collector directly. The collector reads the saved `donald-collect-wechat` binding and
+  owns the live Chrome/CDP/agent-browser startup check. Invoke the dependency for that scope only
+  when the user asks to configure, inspect, change, reset, or repair the binding, or when the
+  collector reports `browser_profile_unconfigured` or a `browser_startup_failed` hint identifies
+  missing, stale, or incomplete browser configuration. If the runtime has no native skill-invocation
+  action, use its normal Agent Skills discovery/read fallback. The dependency owns first-time
+  environment setup, Profile selection, shared Cookie state, and repair; do not reproduce those
+  steps here.
+- Runtime requirements are `agent-browser` and Google Chrome. Do not probe them separately on the
+  normal path; run the bundled collector and handle only the missing layer it reports. Invoke
+  browser setup or repair only for browser-specific failures.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
-- The configuration preflight closes any Chrome it starts before returning. Each bundled collector
-  then starts the configured headed Chrome as part of its own runner flow; `--cdp` is only an
-  explicit legacy override.
+- After setup, each bundled collector starts the configured headed Chrome as part of its own runner
+  flow; do not run a separate configuration preflight. `--cdp` is only an explicit legacy override.
 
 - Log in to the WeChat Official Account backend in that Profile.
 

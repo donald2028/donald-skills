@@ -132,14 +132,19 @@ donald-skills/
 
 `skills/` 是唯一需要手工维护的 skill 源。`.claude/skills/` 和 `.agents/skills/` 由同步脚本生成，避免维护多份副本；OpenCode 会直接利用这两份官方支持的兼容目录。Claude、Codex、Cursor、Kimi Code 和 Gemini CLI 的 plugin/extension manifest 也都指向根目录的 `skills/`，避免运行时之间出现内容漂移。
 
-浏览器业务 skill 通过 `REQUIRED SUB-SKILL` 调用 `donald-config-browser`，由 Agent 先完成环境、
-Profile 绑定和 CDP 验证，再进入各自 runner。这个依赖写在 workflow 指令中，不依赖某个 Agent
-专用的工具名；Claude Code、Codex 和其他兼容 Agent Skills 的运行时都加载同一份正文。脚本、
-references 和 assets 仍保留在各自 skill 内，不通过兄弟目录路径互相 import。
-默认的整库和 aggregate plugin 安装会同时提供依赖；若某个运行时允许选择性安装单个 skill，
-浏览器业务 skill 会在真正调用时检查 `donald-config-browser`。缺少时，它会先征得用户同意，
-再把依赖安装到相同 scope 和 agent target，并在成功后继续原任务；用户也可以在首次安装时同时
-选择两个 skill，避免这一步确认。
+浏览器业务 skill 把 `donald-config-browser` 声明为首次配置和故障修复用的 `REQUIRED SUB-SKILL`。
+第一次使用时，由它完成环境、Profile 绑定和一次 CDP 验证；绑定成功后，后续任务直接进入各自
+runner，由 runner 读取持久配置并完成本次真正需要的 Chrome/CDP 启动检查，不再重复调用配置
+skill、枚举 Profile 或先启动再关闭一次预检 Chrome。只有用户明确要求查看、换绑、重置，或者
+runner 返回配置类故障时，才再次调用 `donald-config-browser`。
+
+这个依赖写在 workflow 指令中，不依赖某个 Agent 专用的工具名；Claude Code、Codex 和其他兼容
+Agent Skills 的运行时都加载同一份正文。脚本、references 和 assets 仍保留在各自 skill 内，不
+通过兄弟目录路径互相 import。业务 skill 启动时只从运行时已经提供的 skill catalog 确认依赖
+存在，不调用配置 workflow 或执行环境命令。默认的整库和 aggregate plugin 安装会同时提供依赖；
+若某个运行时允许选择性安装单个 skill 且依赖缺失，浏览器业务 skill 会在业务执行前征得用户
+同意并安装到相同 scope 和 agent target。用户也可以在首次安装时同时选择两个 skill，避免第一
+次配置时再确认。
 
 ## 添加 skill
 
