@@ -15,6 +15,13 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 PACKAGE_PATH = REPO / "package.json"
+BROWSER_RUNTIME_SOURCE_DIR = REPO / "skills/donald-config-browser/scripts"
+BROWSER_RUNTIME_FILES = ("profile_config.py", "browser_runtime.py")
+BROWSER_RUNTIME_CONSUMERS = (
+    "donald-chatgpt-imagegen",
+    "donald-collect-wechat",
+    "donald-collect-x",
+)
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
@@ -158,6 +165,38 @@ def sync_outputs(outputs: dict[Path, str], *, check: bool) -> int:
     return 0
 
 
+def sync_browser_runtime(*, check: bool) -> int:
+    changed: list[Path] = []
+    for skill_name in BROWSER_RUNTIME_CONSUMERS:
+        target_dir = REPO / "skills" / skill_name / "scripts"
+        for filename in BROWSER_RUNTIME_FILES:
+            source = BROWSER_RUNTIME_SOURCE_DIR / filename
+            target = target_dir / filename
+            if not target.is_file() or target.read_bytes() != source.read_bytes():
+                changed.append(target)
+                if not check:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+    if check:
+        if changed:
+            print("Out of sync browser runtime (run npm run build):")
+            for path in changed:
+                print(f"  {path.relative_to(REPO)}")
+            return 1
+        print(
+            f"In sync: {len(BROWSER_RUNTIME_FILES)} browser runtime file(s) "
+            f"vendored to {len(BROWSER_RUNTIME_CONSUMERS)} skill(s).",
+            flush=True,
+        )
+        return 0
+    print(
+        f"Vendored browser runtime to {len(BROWSER_RUNTIME_CONSUMERS)} skill(s) "
+        f"({len(changed)} file(s) changed).",
+        flush=True,
+    )
+    return 0
+
+
 def sync_runtime_mirrors(*, check: bool) -> int:
     command = [sys.executable, str(REPO / "skills/sync_runtime_skills.py")]
     if check:
@@ -198,6 +237,9 @@ def main() -> int:
         package["version"] = args.version
 
     status = sync_outputs(build_outputs(package), check=args.check)
+    if status:
+        return status
+    status = sync_browser_runtime(check=args.check)
     if status:
         return status
     return sync_runtime_mirrors(check=args.check)

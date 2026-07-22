@@ -2,7 +2,7 @@
 """One-command orchestrator: capture -> extract -> download for an X
 account's own Posts + Articles timeline.
 
-    python research_user.py --handle OpenAI --max-posts 200
+    python research_user.py --handle OpenAI --capture-max-posts 200
     python research_user.py --handle OpenAI --since 2026-05-01
     python research_user.py --handle OpenAI --incremental
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,13 @@ from typing import Any
 import capture_user_timeline
 import download_media
 import extract_user_timeline
+from browser_runtime import BrowserSession
 from profile_config import ProfileConfigError
 from output_paths import resolve_tool_output_root
 from research_post import (
+    HUMAN_ATTENTION_REASONS,
     activate_for_human_attention,
-    ensure_chrome_cdp,
+    browser_session_options,
     resolve_cdp_port,
 )
 
@@ -82,6 +85,145 @@ def load_manifest(post_dir: Path) -> dict[str, Any]:
 
 VALID_MODES = ("head", "backfill", "full")
 HEAD_OVERLAP_K = 2
+STATUS_SCHEMA_VERSION = 1
+INTERRUPT_RECOVERY_HINT = (
+    "Rerun the same command to resume from immutable runs; the account lock was released."
+)
+
+
+def account_output_paths(handle: str, data_root: Path) -> tuple[Path, Path]:
+    output_root = data_root.expanduser().resolve()
+    return output_root, output_root / handle / "_user"
+
+
+def invalid_output_root_result(
+    handle: str,
+    output_root: Path,
+    post_dir: Path,
+) -> dict[str, Any] | None:
+    root_name = output_root.name.lstrip("@").casefold()
+    passed_handle_dir = root_name == handle.casefold()
+    passed_user_dir = (
+        output_root.name == "_user"
+        and output_root.parent.name.lstrip("@").casefold() == handle.casefold()
+    )
+    if not passed_handle_dir and not passed_user_dir:
+        return None
+
+    suggested_root = output_root.parent if passed_handle_dir else output_root.parent.parent
+    result = status_result(
+        "needs_ops",
+        handle,
+        output_root,
+        post_dir,
+        reason="invalid_output_root",
+        hint=(
+            "--output-root must be the X collection root, not a handle or _user directory; "
+            f"pass {suggested_root} so the canonical user directory is "
+            f"{suggested_root / handle / '_user'}."
+        ),
+    )
+    result["suggested_output_root"] = str(suggested_root)
+    result["suggested_canonical_user_dir"] = str(suggested_root / handle / "_user")
+    return result
+
+
+def _archive_counts(
+    post_dir: Path,
+    timeline: dict[str, Any] | None = None,
+) -> tuple[int, int, int]:
+    source = timeline
+    if source is None:
+        meta_path = post_dir / "timeline.meta.json"
+        if meta_path.exists():
+            try:
+                source = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                source = None
+    source = source or {}
+    sections = source.get("section_counts") or {}
+    posts = int(sections.get("posts") or 0)
+    articles = int(sections.get("articles") or 0)
+    total = int(source.get("count") or posts + articles)
+    return posts, articles, total
+
+
+def status_result(
+    status: str,
+    handle: str,
+    output_root: Path,
+    post_dir: Path,
+    *,
+    reason: str | None = None,
+    hint: str | None = None,
+    stop_reason: str | None = None,
+    timeline: dict[str, Any] | None = None,
+    capture_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    capture_result = capture_result or {}
+    posts, articles, total = _archive_counts(post_dir, timeline)
+    result = {
+        "schema_version": STATUS_SCHEMA_VERSION,
+        "status": status,
+        "reason": reason,
+        "hint": hint,
+        "handle": handle,
+        "output_root": str(output_root),
+        "canonical_user_dir": str(post_dir),
+        "user_dir": str(post_dir),
+        "stop_reason": stop_reason or reason,
+        "posts": posts,
+        "articles": articles,
+        "total_items": total,
+        "capture_posts_seen": int(capture_result.get("capture_posts_seen") or 0),
+        "capture_new_posts": int(capture_result.get("capture_new_posts") or 0),
+        "capture_known_overlap_posts": int(
+            capture_result.get("capture_known_overlap_posts") or 0
+        ),
+        "known_before_posts": int(capture_result.get("known_before_posts") or 0),
+        "articles_included": bool(capture_result.get("articles_included", False)),
+    }
+    for key in ("responses", "new_responses", "rejected_responses"):
+        if key in capture_result:
+            result[key] = capture_result[key]
+    return result
+
+
+def write_status_meta(post_dir: Path, result: dict[str, Any]) -> None:
+    meta_path = post_dir / "timeline.meta.json"
+    meta: dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+    meta.update({
+        "schema_version": STATUS_SCHEMA_VERSION,
+        "handle": result["handle"],
+        "captured_at": meta.get("captured_at")
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "status": result["status"],
+        "reason": result["reason"],
+        "stop_reason": result["stop_reason"],
+        "output_root": result["output_root"],
+        "canonical_user_dir": result["canonical_user_dir"],
+        "count": result["total_items"],
+        "section_counts": {
+            "posts": result["posts"],
+            "articles": result["articles"],
+        },
+        "capture_posts_seen": result["capture_posts_seen"],
+        "capture_new_posts": result["capture_new_posts"],
+        "capture_known_overlap_posts": result["capture_known_overlap_posts"],
+        "known_before_posts": result["known_before_posts"],
+        "articles_included": result["articles_included"],
+    })
+    if result.get("hint"):
+        meta["recovery_hint"] = result["hint"]
+    extract_user_timeline.atomic_write_text(
+        meta_path,
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def _post_status_ids(post: dict[str, Any]) -> list[str]:
@@ -147,6 +289,13 @@ def append_manifest(
         entry["capture_responses"] = capture_result.get("responses")
         entry["capture_new_responses"] = capture_result.get("new_responses")
         entry["capture_rejected_responses"] = capture_result.get("rejected_responses")
+        entry["capture_posts_seen"] = capture_result.get("capture_posts_seen")
+        entry["capture_new_posts"] = capture_result.get("capture_new_posts")
+        entry["capture_known_overlap_posts"] = capture_result.get(
+            "capture_known_overlap_posts"
+        )
+        entry["known_before_posts"] = capture_result.get("known_before_posts")
+        entry["articles_included"] = capture_result.get("articles_included")
     manifest["runs"].append(entry)
     post_dir.mkdir(parents=True, exist_ok=True)
     manifest_path(post_dir).write_text(
@@ -186,51 +335,139 @@ def run(
     incremental: bool = False,
     download_media_files: bool = True,
     mode: str = "full",
+    include_articles: bool | None = None,
+    article_max_scrolls: int = capture_user_timeline.ARTICLE_MAX_SCROLLS,
+    article_stable_rounds: int = capture_user_timeline.ARTICLE_STABLE_ROUNDS,
+    article_timeout_seconds: int = capture_user_timeline.ARTICLE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     handle = extract_user_timeline.normalize_handle(handle)
-    post_dir = data_root.expanduser().resolve() / handle / "_user"
+    output_root, post_dir = account_output_paths(handle, data_root)
+    invalid_root = invalid_output_root_result(handle, output_root, post_dir)
+    if invalid_root:
+        return invalid_root
+    if incremental:
+        mode = "head"  # back-compat alias
+    if include_articles is None:
+        include_articles = mode != "head"
+
     try:
         port = resolve_cdp_port(port)
     except ProfileConfigError as error:
-        return {"status": "needs_ops", "reason": "browser_profile_unconfigured", "hint": str(error)}
-    if incremental:
-        mode = "head"  # back-compat alias
+        return status_result(
+            "needs_ops",
+            handle,
+            output_root,
+            post_dir,
+            reason="browser_profile_unconfigured",
+            hint=str(error),
+        )
 
     holder_pid = acquire_session_lock(post_dir)
     if holder_pid is not None:
-        return {"status": "needs_ops", "reason": "already_running",
-                "hint": f"Another collection for {handle} is already running "
-                        f"(pid {holder_pid}); wait for it to finish instead of "
-                        "starting a second one against the same CDP tab."}
+        return status_result(
+            "needs_ops",
+            handle,
+            output_root,
+            post_dir,
+            reason="already_running",
+            hint=(
+                f"Another collection for {handle} is already running (pid {holder_pid}); "
+                "wait for it to finish instead of starting a second one against the same CDP tab."
+            ),
+        )
 
     try:
-        if not ensure_chrome_cdp(port):
-            return {"status": "needs_ops", "reason": "cdp_unavailable",
-                    "hint": getattr(ensure_chrome_cdp, "last_error", "") or
-                            "Run the shared Chrome-over-CDP preflight, log in to X, then rerun."}
+        browser_session: BrowserSession | None = None
+        browser: capture_user_timeline.AgentBrowser | None = None
+        result: dict[str, Any]
+        try:
+            explicit_config, require_initialized_profile = browser_session_options(port)
+            browser_session = BrowserSession(
+                scope="donald-collect-x",
+                session=f"donald-x-user-{handle}",
+                url=f"https://x.com/{handle}",
+                port=port,
+                config=explicit_config,
+                require_initialized_profile=require_initialized_profile,
+            ).open()
+            browser = capture_user_timeline.AgentBrowser(
+                port,
+                target_id=browser_session.target_id,
+            )
 
-        overlap_ids, overlap_k = resolve_overlap(mode, post_dir)
-        cap = capture_user_timeline.capture(
-            handle, post_dir, browser=capture_user_timeline.AgentBrowser(port),
-            max_scrolls=max_scrolls, stable_rounds=stable_rounds,
-            max_posts=max_posts, since=since, overlap_ids=overlap_ids, overlap_k=overlap_k)
-        if cap["status"] != "complete":
-            return activate_for_human_attention(cap, port)
+            overlap_ids, overlap_k = resolve_overlap(mode, post_dir)
+            cap = capture_user_timeline.capture(
+                handle, post_dir, browser=browser,
+                max_scrolls=max_scrolls, stable_rounds=stable_rounds,
+                max_posts=max_posts, since=since, overlap_ids=overlap_ids, overlap_k=overlap_k,
+                include_articles=include_articles,
+                article_max_scrolls=article_max_scrolls,
+                article_stable_rounds=article_stable_rounds,
+                article_timeout_seconds=article_timeout_seconds)
+            if cap["status"] != "complete":
+                reason = cap.get("reason") or "capture_failed"
+                result = status_result(
+                    "needs_ops",
+                    handle,
+                    output_root,
+                    post_dir,
+                    reason=reason,
+                    hint=cap.get("hint"),
+                    capture_result=cap,
+                )
+                if browser_session and cap.get("reason") in HUMAN_ATTENTION_REASONS:
+                    result["browser_activation"] = browser_session.preserve_for_human()
+                else:
+                    result = activate_for_human_attention(result, port)
+                write_status_meta(post_dir, result)
+            else:
+                # max_posts/since/overlap are browser capture boundaries only. Rebuild the
+                # persisted timeline from every immutable run so a small head budget can never
+                # truncate previously archived history.
+                timeline = extract_user_timeline.write_timeline(handle, output_root)
+                timeline = preserve_capture_stop_reason(post_dir, timeline, cap)
+                if download_media_files:
+                    timeline = download_media.download_timeline(post_dir)
 
-        # The overlap stop only tells the scroll loop when to stop early — the saved
-        # timeline.jsonl must keep the full accumulated history, not just this run's
-        # new delta.
-        timeline = extract_user_timeline.write_timeline(
-            handle, data_root, max_posts=max_posts, since=since)
-        timeline = preserve_capture_stop_reason(post_dir, timeline, cap)
-        if download_media_files:
-            timeline = download_media.download_timeline(post_dir)
-
-        append_manifest(post_dir, timeline, capture_result=cap)
-        return {
-            "status": "complete", "handle": handle, "user_dir": str(post_dir),
-            "posts": timeline["count"], "stop_reason": timeline["stop_reason"],
-        }
+                append_manifest(post_dir, timeline, capture_result=cap)
+                result = status_result(
+                    "complete",
+                    handle,
+                    output_root,
+                    post_dir,
+                    stop_reason=timeline["stop_reason"],
+                    timeline=timeline,
+                    capture_result=cap,
+                )
+                write_status_meta(post_dir, result)
+        except KeyboardInterrupt:
+            result = status_result(
+                "interrupted",
+                handle,
+                output_root,
+                post_dir,
+                hint=INTERRUPT_RECOVERY_HINT,
+                stop_reason="interrupted",
+            )
+            write_status_meta(post_dir, result)
+        except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError) as error:
+            result = status_result(
+                "needs_ops",
+                handle,
+                output_root,
+                post_dir,
+                reason="cdp_unavailable",
+                hint=str(error),
+            )
+            write_status_meta(post_dir, result)
+        finally:
+            if browser is not None:
+                browser.close()
+            if browser_session is not None:
+                cleanup = browser_session.close()
+                if "result" in locals():
+                    result["browser_cleanup"] = cleanup
+        return result
     finally:
         release_session_lock(post_dir)
 
@@ -252,13 +489,48 @@ def main() -> int:
     parser.add_argument("--max-scrolls", type=int, default=60)
     parser.add_argument("--stable-rounds", type=int, default=capture_user_timeline.DEFAULT_STABLE_ROUNDS,
                         help="Consecutive scroll rounds without new posts before stopping.")
-    parser.add_argument("--max-posts", type=int, default=None)
-    parser.add_argument("--since", default=None, help="ISO date, e.g. 2026-05-01.")
+    parser.add_argument(
+        "--capture-max-posts",
+        "--max-posts",
+        dest="max_posts",
+        type=int,
+        default=None,
+        help="Posts budget for this browser pass only; never truncates the persisted timeline.",
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="ISO date capture boundary, e.g. 2026-05-01; does not trim archived output.",
+    )
     parser.add_argument("--incremental", action="store_true",
                         help="Alias for --mode head: stop once reconnected with the previous run.")
     parser.add_argument("--mode", choices=VALID_MODES, default="full",
                         help="head: catch new posts and stop at reconnect. "
                              "backfill/full: keep scrolling to extend the older tail.")
+    parser.add_argument(
+        "--include-articles",
+        action="store_true",
+        default=None,
+        help="Capture Articles too. Head mode skips Articles unless this flag is passed.",
+    )
+    parser.add_argument(
+        "--article-max-scrolls",
+        type=int,
+        default=capture_user_timeline.ARTICLE_MAX_SCROLLS,
+        help="Independent maximum scroll rounds for the Articles phase.",
+    )
+    parser.add_argument(
+        "--article-stable-rounds",
+        type=int,
+        default=capture_user_timeline.ARTICLE_STABLE_ROUNDS,
+        help="Independent stable-round limit for the Articles phase.",
+    )
+    parser.add_argument(
+        "--article-timeout-seconds",
+        type=int,
+        default=capture_user_timeline.ARTICLE_TIMEOUT_SECONDS,
+        help="Independent wall-clock budget for the Articles phase.",
+    )
     parser.add_argument("--no-media", action="store_true",
                         help="Capture and parse timeline only; skip media downloads for faster sampling.")
     args = parser.parse_args()
@@ -267,9 +539,17 @@ def main() -> int:
     result = run(args.handle, output_root, port=args.cdp, max_scrolls=args.max_scrolls,
                  stable_rounds=args.stable_rounds, max_posts=args.max_posts,
                  since=args.since, incremental=args.incremental,
-                 download_media_files=not args.no_media, mode=args.mode)
+                 download_media_files=not args.no_media, mode=args.mode,
+                 include_articles=args.include_articles,
+                 article_max_scrolls=args.article_max_scrolls,
+                 article_stable_rounds=args.article_stable_rounds,
+                 article_timeout_seconds=args.article_timeout_seconds)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result["status"] == "complete" else 2
+    if result["status"] == "complete":
+        return 0
+    if result["status"] == "interrupted":
+        return 130
+    return 2
 
 
 if __name__ == "__main__":

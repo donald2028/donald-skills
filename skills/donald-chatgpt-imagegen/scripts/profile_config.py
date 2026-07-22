@@ -39,6 +39,12 @@ SCOPE_CONFIGS = {
         "label": "ChatGPT image generation",
     },
 }
+LEGACY_SCOPE_ALIASES = {
+    "donald-collect-wechat": ("donald-collect-wechat-accounts",),
+    "donald-collect-x": ("donald-collect-x-posts",),
+    "donald-chatgpt-imagegen": ("donald-generate-images-with-chatgpt",),
+}
+SCOPE_PATTERN = re.compile(r"^donald-[a-z0-9]+(?:-[a-z0-9]+)*$")
 SKILL_DIRECTORY_NAME = Path(__file__).resolve().parents[1].name
 DEFAULT_SCOPE = SKILL_DIRECTORY_NAME if SKILL_DIRECTORY_NAME in SCOPE_CONFIGS else ""
 AGENT_BROWSER_INSTALL_URL = "https://agent-browser.dev/installation"
@@ -69,11 +75,12 @@ class ProfileConfigError(RuntimeError):
 
 def resolve_scope(value: str | None = None) -> str:
     scope = str(value or DEFAULT_SCOPE).strip()
-    if scope in SCOPE_CONFIGS:
+    if SCOPE_PATTERN.fullmatch(scope):
         return scope
     choices = ", ".join(SCOPE_CONFIGS)
     raise ProfileConfigError(
-        f"Choose which skill to configure with --scope. Available values: {choices}"
+        "Choose a Donald skill with --scope using a lowercase kebab-case name "
+        f"such as one of: {choices}"
     )
 
 
@@ -525,6 +532,20 @@ def configured_browser(path: Path | None = None, scope: str | None = None) -> di
     resolved_scope = resolve_scope(scope)
     config_path = path or default_config_path(resolved_scope)
     config = read_config(config_path, resolved_scope)
+    if config is None and path is None:
+        for legacy_scope in LEGACY_SCOPE_ALIASES.get(resolved_scope, ()):
+            legacy_path = default_config_path(legacy_scope)
+            legacy_config = read_config(legacy_path, legacy_scope)
+            if legacy_config is None:
+                continue
+            config = {
+                **legacy_config,
+                "scope": resolved_scope,
+                "migrated_from_scope": legacy_scope,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_config(config_path, config)
+            break
     if config is None:
         raise ProfileConfigError(
             f"Chrome-over-CDP is not initialized for {resolved_scope}. Run the "
@@ -533,12 +554,26 @@ def configured_browser(path: Path | None = None, scope: str | None = None) -> di
     return config
 
 
+def configured_scope_names() -> list[str]:
+    scopes = list(SCOPE_CONFIGS)
+    config_root = default_config_path(scopes[0]).parent
+    if config_root.is_dir():
+        for candidate in sorted(config_root.glob("donald-*.json")):
+            try:
+                scope = resolve_scope(candidate.stem)
+            except ProfileConfigError:
+                continue
+            if scope not in scopes:
+                scopes.append(scope)
+    return scopes
+
+
 def _existing_profile_binding(
     profile_directory: str,
     source_user_data_dir: Path,
 ) -> tuple[str, dict[str, Any]] | None:
     expected_source = source_user_data_dir.expanduser().resolve()
-    for candidate_scope in SCOPE_CONFIGS:
+    for candidate_scope in configured_scope_names():
         candidate_path = default_config_path(candidate_scope)
         try:
             candidate = read_config(candidate_path, candidate_scope)
@@ -697,6 +732,7 @@ class _CDPConnection:
         self._sock = sock
         self._buffer = b""
         self._next_id = 0
+        self.events: list[dict[str, Any]] = []
 
     @classmethod
     def connect(cls, ws_url: str, timeout: float = 30.0) -> "_CDPConnection":
@@ -744,6 +780,9 @@ class _CDPConnection:
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
         self._sock.close()
 
+    def close(self) -> None:
+        self._sock.close()
+
     def _recv_frame(self) -> tuple[int, bytes]:
         while True:
             parsed = _decode_ws_frame(self._buffer)
@@ -768,14 +807,45 @@ class _CDPConnection:
             if opcode != 0x1:
                 continue
             message = json.loads(response.decode("utf-8"))
+            if message.get("method"):
+                self.events.append(message)
             if message.get("id") != message_id:
                 continue
             if message.get("error"):
                 raise ProfileConfigError(f"CDP {method} failed: {message['error']}")
             return message.get("result") or {}
 
+    def poll_events(self, timeout: float = 0.05) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        old_timeout = self._sock.gettimeout()
+        self._sock.settimeout(timeout)
+        try:
+            while True:
+                parsed = _decode_ws_frame(self._buffer)
+                if parsed is None:
+                    try:
+                        chunk = self._sock.recv(4096)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    self._buffer += chunk
+                    continue
+                opcode, payload, consumed = parsed
+                self._buffer = self._buffer[consumed:]
+                if opcode != 0x1:
+                    continue
+                message = json.loads(payload.decode("utf-8"))
+                if message.get("method"):
+                    self.events.append(message)
+                    collected.append(message)
+        finally:
+            self._sock.settimeout(old_timeout)
+        return collected
+
 
 def create_background_page(port: int, url: str = "about:blank") -> str:
+    previous_frontmost_pid = frontmost_process_id()
     version = _cdp_version(port)
     websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
     if not websocket_url:
@@ -790,7 +860,71 @@ def create_background_page(port: int, url: str = "about:blank") -> str:
     target_id = str(result.get("targetId") or "")
     if not target_id:
         raise ProfileConfigError("Chrome did not return a target id for the background page")
+    if previous_frontmost_pid:
+        restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
     return target_id
+
+
+def list_cdp_targets(port: int) -> list[dict[str, Any]]:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/list", timeout=5
+        ) as response:
+            targets = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        raise ProfileConfigError(f"Could not list Chrome CDP targets on port {port}: {error}") from error
+    return [target for target in targets if isinstance(target, dict)]
+
+
+def cdp_target(port: int, target_id: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in list_cdp_targets(port) if str(item.get("id") or "") == target_id),
+        None,
+    )
+
+
+def connect_cdp_target(port: int, target_id: str, timeout: float = 30.0) -> _CDPConnection:
+    target = cdp_target(port, target_id)
+    websocket_url = str((target or {}).get("webSocketDebuggerUrl") or "")
+    if not websocket_url:
+        raise ProfileConfigError(f"Chrome CDP page target {target_id} is unavailable")
+    try:
+        return _CDPConnection.connect(websocket_url, timeout=timeout)
+    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+        raise ProfileConfigError(f"Could not connect to CDP page {target_id}: {error}") from error
+
+
+def call_background_page(
+    port: int,
+    target_id: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    try:
+        with connect_cdp_target(port, target_id, timeout=timeout) as connection:
+            return connection.call(method, params)
+    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+        raise ProfileConfigError(f"Could not call {method} on CDP page {target_id}: {error}") from error
+
+
+def close_background_page(port: int, target_id: str) -> None:
+    version = _cdp_version(port)
+    websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
+    if not websocket_url:
+        raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
+    try:
+        with _CDPConnection.connect(websocket_url, timeout=10) as connection:
+            result = connection.call("Target.closeTarget", {"targetId": target_id})
+    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+        raise ProfileConfigError(f"Could not close background CDP page {target_id}: {error}") from error
+    if result.get("success") is False:
+        raise ProfileConfigError(f"Chrome refused to close background CDP page {target_id}")
+    for _ in range(20):
+        if cdp_target(port, target_id) is None:
+            return
+        time.sleep(0.1)
+    raise ProfileConfigError(f"Background CDP page {target_id} remained open after close")
 
 
 def wait_for_background_page_url(
@@ -839,7 +973,7 @@ def chrome_launch_command(config: dict[str, Any], port: int, url: str = "about:b
     ]
     executable = str(chrome["executable"])
     if sys.platform == "darwin" and executable == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome":
-        return ["open", "-g", "-j", "-n", "-a", "Google Chrome", "--args", *launch_args]
+        return ["open", "-g", "-n", "-a", "Google Chrome", "--args", *launch_args]
     return [executable, *launch_args]
 
 
@@ -904,6 +1038,62 @@ def _verify_existing_cdp_owner(config: dict[str, Any], port: int) -> None:
             f"CDP port {port} is already in use by a different or unverifiable Chrome process. "
             "Choose another port or close that process; refusing to attach to the wrong account."
         )
+
+
+def start_cdp_browser(
+    config: dict[str, Any],
+    port: int,
+    timeout: int = 60,
+    *,
+    allow_launch: bool = True,
+    require_initialized_profile: bool = True,
+) -> dict[str, Any]:
+    if not 1 <= port <= 65535:
+        raise ProfileConfigError("CDP port must be between 1 and 65535")
+    user_data_dir = Path(config["chrome"]["cdp_user_data_dir"])
+    profile_dir = user_data_dir / config["profile"]["directory"]
+    if require_initialized_profile and (
+        not (user_data_dir / "Local State").is_file() or not profile_dir.is_dir()
+    ):
+        raise ProfileConfigError(
+            f"Configured CDP user-data-dir is incomplete: {user_data_dir}. Reinitialize it."
+        )
+    if not require_initialized_profile:
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
+    version = _cdp_version(port)
+    if version:
+        _verify_existing_cdp_owner(config, port)
+        pid = _listening_process_id(port)
+        return {
+            "status": "ready",
+            "launched": False,
+            "launch_command": None,
+            "browser": version,
+            "pid": int(pid) if pid.isdigit() else None,
+        }
+    if not allow_launch:
+        raise ProfileConfigError(f"Chrome CDP is unavailable on port {port}")
+
+    launch_command = _launch_chrome(config, port, "about:blank")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        version = _cdp_version(port)
+        if version:
+            break
+        time.sleep(0.5)
+    if not version:
+        raise ProfileConfigError(
+            f"Chrome did not expose CDP port {port} within {timeout}s. Command: {launch_command}"
+        )
+    pid = _listening_process_id(port)
+    return {
+        "status": "ready",
+        "launched": True,
+        "launch_command": launch_command,
+        "browser": version,
+        "pid": int(pid) if pid.isdigit() else None,
+    }
 
 
 def close_cdp_browser(config: dict[str, Any], port: int, timeout: int = 10) -> dict[str, Any]:
@@ -986,10 +1176,13 @@ def show_browser_without_focus(config: dict[str, Any], port: int) -> dict[str, A
         'tell application "System Events"\n'
         "set previousPid to unix id of first application process whose frontmost is true\n"
         f"tell first application process whose unix id is {pid}\n"
-        "set visible to true\n"
+        f"if previousPid is not {pid} then set frontmost to false\n"
+        "if visible is false then set visible to true\n"
         f"if previousPid is not {pid} then set frontmost to false\n"
         "end tell\n"
-        f"if previousPid is not {pid} then set frontmost of first application process whose unix id is previousPid to true\n"
+        "set currentPid to unix id of first application process whose frontmost is true\n"
+        f"if currentPid is {pid} and previousPid is not {pid} then "
+        "set frontmost of first application process whose unix id is previousPid to true\n"
         "return previousPid\n"
         "end tell"
     )
@@ -1071,6 +1264,23 @@ def restore_frontmost_process(pid: int) -> dict[str, Any]:
     return {"status": "restored", "pid": pid}
 
 
+def restore_frontmost_process_if_browser_active(pid: int, port: int) -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {"status": "platform_default", "pid": pid}
+    time.sleep(0.25)
+    current_pid = frontmost_process_id()
+    browser_pid_text = _listening_process_id(port)
+    browser_pid = int(browser_pid_text) if browser_pid_text.isdigit() else None
+    if current_pid is None or browser_pid is None or current_pid != browser_pid or current_pid == pid:
+        return {
+            "status": "unchanged",
+            "pid": pid,
+            "current_pid": current_pid,
+            "browser_pid": browser_pid,
+        }
+    return restore_frontmost_process(pid)
+
+
 def preflight_browser(
     config: dict[str, Any],
     port: int,
@@ -1083,28 +1293,10 @@ def preflight_browser(
     previous_frontmost_pid = frontmost_process_id()
     ensure_agent_browser(auto_install=True)
     user_data_dir = Path(config["chrome"]["cdp_user_data_dir"])
-    profile_dir = user_data_dir / config["profile"]["directory"]
-    if not (user_data_dir / "Local State").is_file() or not profile_dir.is_dir():
-        raise ProfileConfigError(
-            f"Configured CDP user-data-dir is incomplete: {user_data_dir}. Reinitialize it."
-        )
-
-    version = _cdp_version(port)
-    launch_command: list[str] | None = None
-    if version:
-        _verify_existing_cdp_owner(config, port)
-    else:
-        launch_command = _launch_chrome(config, port, "about:blank")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            version = _cdp_version(port)
-            if version:
-                break
-            time.sleep(0.5)
-        if not version:
-            raise ProfileConfigError(
-                f"Chrome did not expose CDP port {port} within {timeout}s. Command: {launch_command}"
-            )
+    startup = start_cdp_browser(config, port, timeout)
+    version = startup["browser"]
+    launch_command = startup["launch_command"]
+    background_target_id = ""
 
     try:
         background_target_id = create_background_page(port, url)
@@ -1165,12 +1357,22 @@ def preflight_browser(
                 close_cdp_browser(config, port)
             except ProfileConfigError as cleanup_error:
                 raise ProfileConfigError(f"{error}; preflight cleanup failed: {cleanup_error}") from error
+        elif background_target_id:
+            try:
+                close_background_page(port, background_target_id)
+            except ProfileConfigError as cleanup_error:
+                raise ProfileConfigError(f"{error}; preflight cleanup failed: {cleanup_error}") from error
         raise
-    result["browser_cleanup"] = (
-        close_cdp_browser(config, port)
-        if launch_command
-        else {"status": "not_owned", "reason": "browser_was_already_running", "cdp_port": port}
-    )
+    if launch_command:
+        result["browser_cleanup"] = close_cdp_browser(config, port)
+    else:
+        close_background_page(port, background_target_id)
+        result["browser_cleanup"] = {
+            "status": "target_closed",
+            "target_id": background_target_id,
+            "reason": "browser_was_already_running",
+            "cdp_port": port,
+        }
     return result
 
 
@@ -1216,7 +1418,8 @@ def _emit(payload: dict[str, Any]) -> None:
 
 def target_statuses() -> list[dict[str, Any]]:
     targets = []
-    for scope, metadata in SCOPE_CONFIGS.items():
+    for scope in configured_scope_names():
+        metadata = SCOPE_CONFIGS.get(scope, {"label": scope})
         path = default_config_path(scope)
         target: dict[str, Any] = {
             "scope": scope,
@@ -1241,9 +1444,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scope",
-        choices=list(SCOPE_CONFIGS),
         default=DEFAULT_SCOPE or None,
-        help="Skill-specific browser configuration to read or write.",
+        help="Donald skill name whose browser configuration should be read or written.",
     )
     parser.add_argument(
         "--config",

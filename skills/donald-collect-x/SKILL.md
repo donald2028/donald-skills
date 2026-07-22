@@ -44,11 +44,19 @@ session over CDP, preserve raw response runs, and compile deterministic JSONL/Ma
 - Media download additionally uses `curl`, with `ffmpeg` and `yt-dlp` for video fallbacks. Do not
   probe them before collection; the downloader records unavailable media honestly.
 
-On macOS, keep the automatically launched headed Chrome hidden during normal automation; this is
-not headless mode. Do not activate it during normal
+On macOS, keep the automatically launched headed Chrome visible behind the active app during
+normal automation; this is not headless mode and does not make Chrome frontmost. The shared
+runtime launches it in the background without hiding it so every browser skill uses the same
+renderable lifecycle. Do not activate it during normal
 collection. When the collector detects a login wall, rate limit, or blocking error page, it returns
 `needs_ops`, activates only the configured CDP Chrome, and leaves it open for the user. Explain the
 required action and continue after the user confirms completion.
+
+The collector uses the shared Donald `BrowserSession`: it operates only on the target ID allocated
+to the current run, closes that target and its CDP connection in `finally`, and exits Chrome only
+when the shared runtime launched it and no other browser skill run is active. It never reuses an
+arbitrary existing `x.com` tab. Any `about:blank` target created while proving agent-browser attach
+is owned by the run and removed during cleanup; pre-existing tabs are not swept.
 
 Do not forge cookies, replay GraphQL endpoints, run headless, or bypass login walls, captcha, rate
 limits, or challenges. Return `needs_ops` when the visible session needs human action.
@@ -58,8 +66,11 @@ limits, or challenges. Return `needs_ops` when the visible session needs human a
 By default, account and post outputs are written under the system Documents folder at
 `Donald Skills/Data/x/`. Set `DONALD_SKILLS_OUTPUT_ROOT` to change the shared Data root for all
 Donald tools, or pass `--output-root <path>` to replace the X root for one command. The CLI override
-wins over the environment setting. Never default to the installed skill or current working
-directory.
+wins over the environment setting. `--output-root` must be the collection root, never
+`<root>/<handle>` or `<root>/<handle>/_user`; account output is always canonicalized to
+`<output-root>/<handle>/_user/`. The collector rejects a handle/user directory before opening the
+browser and every result reports both `output_root` and `canonical_user_dir`. Never default to the
+installed skill or current working directory.
 
 Always choose the post and scroll budgets explicitly:
 
@@ -67,22 +78,30 @@ Always choose the post and scroll budgets explicitly:
 python3 "$SKILL_DIR/scripts/research_user.py" \
   --handle <handle> \
   --mode full \
-  --max-posts 200 \
+  --capture-max-posts 200 \
   --max-scrolls 200
 ```
 
-Use `--no-media` for a faster text/metadata pass. Posts are the primary stream; Articles are
+`--capture-max-posts` (with `--max-posts` retained as an alias), `--max-scrolls`, and `--since`
+bound only the current browser pass. Progress and final outputs are always rebuilt from every
+immutable file in `runs/`, so a small head budget never truncates existing history. Use
+`--no-media` for a faster text/metadata pass. Posts are the primary stream; Articles are
 supplementary and do not replace a requested Posts quota.
 
 Choose one collection mode:
 
-- `--mode head`: collect new posts and stop after reconnecting with known status IDs.
+- `--mode head`: collect new posts and stop after reconnecting with known status IDs. It skips the
+  Articles tab by default; pass `--include-articles` to opt in.
 - `--mode backfill`: extend the older tail across repeated sessions.
 - `--mode full`: perform a first or unconstrained historical pass.
 
 `--incremental` is an alias for `--mode head`. Use `--since YYYY-MM-DD` for a date boundary. If a
 run stops at `max_scrolls_reached` while `post_count` was still rising, increase the budget and rerun;
 do not report the account as exhausted.
+
+When Articles are included, their independent bounds are `--article-max-scrolls`,
+`--article-stable-rounds`, and `--article-timeout-seconds`; do not reuse the Posts budget as an
+implicit Articles wait.
 
 ## Collect One Post Or Thread
 
@@ -101,10 +120,19 @@ quotes, or reposts as the account's own evidence.
 ## Completion Check
 
 - Confirm `<handle>/_user/timeline.jsonl` and `timeline.meta.json` exist for account runs.
-- Inspect `stop_reason`, `count`, `section_counts`, newest/oldest status IDs, and
+- Inspect `status`, `reason`, `stop_reason`, `count`, `section_counts`, `output_root`,
+  `canonical_user_dir`, newest/oldest status IDs, and
   `capture_debug.jsonl` when growth looks suspicious.
 - Confirm X Articles include their structured body blocks, not only a `t.co` link.
 - Report media as downloaded, reused, skipped, or blocked.
-- Report the handle, mode, count, stop reason, output root, and any operator action required.
+- Report the handle, mode, Posts/Articles counts, capture-new/known-overlap counts, stop reason,
+  output root, canonical user directory, and any operator action required.
+
+The CLI emits one JSON status object for success and failure. Stable operator reasons include
+`browser_profile_unconfigured`, `cdp_unavailable`, `login_wall`, `captcha`, and `rate_limited`.
+Ctrl-C returns `status=interrupted`, writes `stop_reason=interrupted` plus a recovery hint to
+`timeline.meta.json`, closes the owned browser target, and releases the account lock. Omit `--cdp`
+to use the configured Profile port (including non-9222 ports); pass it only as an explicit
+operations override.
 
 See `references/output-contract.md` for the artifact layout.

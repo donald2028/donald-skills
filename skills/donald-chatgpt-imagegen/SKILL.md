@@ -35,7 +35,9 @@ enough session evidence to resume or recover downloads without resubmitting the 
   the missing layer it reports. Invoke browser setup or repair only for browser-specific failures.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
 - After setup, the image runner starts and owns the generation browser lifecycle. Do not run a
-  separate configuration preflight before it.
+  separate configuration preflight before it. Startup, target ownership, cross-skill active-run
+  tracking, and teardown use the shared Donald `BrowserSession`; ChatGPT-specific code begins only
+  after that runtime returns an owned target ID.
 
 - Log in to ChatGPT in the selected visible Profile.
 - Passing `--user-data-dir` or `CHATGPT_WEB_USER_DATA_DIR` selects an explicit CDP data directory;
@@ -46,8 +48,10 @@ enough session evidence to resume or recover downloads without resubmitting the 
 The first run may open Chrome and require interactive login. Return `needs_ops` instead of bypassing
 login, MFA, captcha, policy refusals, or account restrictions.
 
-On macOS, keep the automatically launched headed Chrome hidden during normal automation; this is
-not headless mode. Do not activate it during normal
+On macOS, keep the automatically launched headed Chrome visible behind the active app during
+normal automation; this is not headless mode and does not make Chrome frontmost. The shared
+runtime launches the window in the background without hiding it because macOS stops servicing CDP
+screenshots for a fully hidden application. Do not activate it during normal
 generation. When the runner detects login or anti-automation verification, it returns `needs_ops`,
 activates only the configured CDP Chrome, and leaves it open for the user. Explain the required
 action and continue after the user confirms completion. Policy refusals are reported without
@@ -112,6 +116,17 @@ python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest returned by 
 
 The runner reuses an existing session URL by default. Do not use `--no-resume` unless the saved
 conversation is unavailable or the user explicitly requests a fresh conversation.
+
+During generation the runner records a structured page-health observation every 20 seconds in
+`chatgpt_progress.jsonl`: target-conversation continuity, composer/challenge state, message counts,
+and any recognized assistant generation error. It still checks more frequently between heartbeats.
+An explicit ChatGPT generation error ends the wait immediately with structured
+`generation_failed` and `recommended_next_action=submit_new_request`; it must not wait until the
+image timeout or surface a raw traceback.
+Generated-image downloads use the logged-in browser and retry transient failures four times. An
+authenticated ChatGPT URL must not fall back to an unauthenticated HTTP request. If all attempts
+fail, preserve the conversation and candidates and return structured `download_failed` with
+`recommended_next_action=collect_current_first` instead of raising a traceback.
 
 If ChatGPT completed generation but a candidate was not downloaded, collect from the saved
 conversation without sending the prompt again:

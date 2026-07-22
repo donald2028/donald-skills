@@ -1,6 +1,6 @@
 ---
 name: donald-collect-wechat
-description: Collect or refresh a WeChat Official Account's article list, public article bodies, publish timestamps, digests, images, and audio markers through a headed logged-in Chrome session that stays hidden during normal automation. Use for 微信公众号内容采集、公众号文章抓取、导出公众号历史文章、增量补采, or building a traceable local archive from a WeChat account.
+description: Collect or refresh a WeChat Official Account's article list, public article bodies, publish timestamps, digests, images, and audio markers through a headed logged-in Chrome session that stays behind the active app during normal automation. Use for 微信公众号内容采集、公众号文章抓取、导出公众号历史文章、增量补采, or building a traceable local archive from a WeChat account.
 ---
 
 # Collect WeChat Accounts
@@ -41,16 +41,25 @@ the captured network responses as evidence.
 
 - Log in to the WeChat Official Account backend in that Profile.
 
-On macOS, keep the automatically launched headed Chrome hidden throughout normal collection; this
-is not headless mode and prevents delayed page work from promoting Chrome to the foreground. When
+On macOS, keep the automatically launched headed Chrome visible behind the active app throughout
+normal collection; this is not headless mode and does not make Chrome frontmost. The shared
+runtime launches it in the background without hiding it so every browser skill uses the same
+renderable lifecycle. When
 login, verification, risk control, or anti-automation requires operator interaction, return
 `needs_ops`, explain the required action, and keep Chrome open until the user confirms completion.
 The bundled runners activate only the configured Chrome when they recognize such a page.
 
-After their runner startup proves `agent-browser --cdp` can attach, the bundled collectors create
-dedicated browser-level CDP targets with `background: true`, enable focus emulation, and use trusted
-CDP input. They never call focus-stealing `agent-browser tab new`, `tab`, `open`, or input commands
-on the normal path. Treat Chrome becoming frontmost as a collection failure.
+After their runner startup proves `agent-browser --cdp` can attach, the bundled collectors use
+runner-owned browser-level CDP targets, enable focus emulation, and use trusted CDP input. The body
+collector starts its session on the first selected article and reuses that target for later
+articles; it does not leave an `about:blank` lifecycle placeholder open. The collectors never call
+focus-stealing `agent-browser tab new`, `tab`, `open`, or input commands on the normal path. Treat
+Chrome becoming frontmost as a collection failure.
+
+Startup and teardown use the same shared Donald `BrowserSession` as other browser skills. The
+runner records the exact target IDs it creates, closes them in `finally`, and closes Chrome only
+when the shared runtime launched it and no other browser skill run is active. Blank targets created
+while proving agent-browser attach are task-owned and removed; pre-existing tabs are never swept.
 
 Do not bypass login, captcha, risk prompts, or account permissions. Return `needs_ops` when human
 interaction is required.
@@ -113,10 +122,10 @@ third-party reposts. Model ordinary articles as `content_type=article` and WeCha
 only a WeChat-generated copy/preview of `content`: leave the semantic title empty, use a short
 `display_title` only in indexes, and write the complete backend `content` once to `article.md`.
 
-Each ordinary article opens in a dedicated `background: true` CDP target. The body script closes
-that target in a `finally` block and verifies its target ID is gone before continuing. It
-deliberately keeps only a recognized login or verification target open, activates Chrome for the operator, and records
-`browser_tab_cleanup: kept_open_for_human`. Public interaction counts are best-effort: record
+Ordinary articles reuse the body collector's single runner-owned CDP target, which starts on the
+first selected article instead of `about:blank` and is closed by `BrowserSession` after the run. It
+deliberately keeps only a recognized login or verification target open, activates Chrome for the
+operator, and records `browser_tab_cleanup: kept_open_for_human`. Public interaction counts are best-effort: record
 reading, like, or share counts only when the public page exposes them; otherwise write
 `interaction_metrics.status: unavailable` instead of treating page defaults such as `0` as real
 measurements. 图文 already materialized from backend `content` does not open a redundant public

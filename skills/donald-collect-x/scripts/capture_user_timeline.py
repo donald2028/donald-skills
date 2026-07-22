@@ -10,18 +10,18 @@ from __future__ import annotations
 import json
 import random
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from capture_thread import AgentBrowser, _jitter_sleep, detect_block
-from extract_thread import _maybe_body, iter_tweets, load_tweets_from_runs
+from extract_thread import _maybe_body, _merge, iter_tweets, load_tweets_from_runs
 from extract_user_timeline import (
     build_timeline_posts,
     count_sections,
     extract_timeline_tweet,
     find_stop_cut,
-    limit_output_posts,
     write_timeline_jsonl,
 )
 
@@ -30,6 +30,8 @@ DEFAULT_BOTTOM_STABLE_ROUNDS = 5
 PROFILE_SCROLL_RANGE = (3000, 5000)
 ARTICLE_SCROLL_RANGE = (2400, 4000)
 ARTICLE_STABLE_ROUNDS = 2
+ARTICLE_MAX_SCROLLS = 20
+ARTICLE_TIMEOUT_SECONDS = 90
 MAX_ERROR_PAGE_RETRIES = 3
 BOTTOM_REMAINING_PX = 1200
 
@@ -73,18 +75,14 @@ def write_progress_timeline(
     handle: str,
     post_dir: Path,
     posts: list[dict[str, Any]],
-    *,
-    max_posts: int | None = None,
-    since: str | None = None,
 ) -> dict[str, Any]:
-    visible_posts, _ = limit_output_posts(posts, max_posts=max_posts, since=since)
     timeline = {
         "handle": handle,
         "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "stop_reason": "capturing",
-        "count": len(visible_posts),
-        "section_counts": count_sections(visible_posts),
-        "posts": visible_posts,
+        "count": len(posts),
+        "section_counts": count_sections(posts),
+        "posts": posts,
     }
     write_timeline_jsonl(post_dir, timeline)
     return timeline
@@ -109,7 +107,14 @@ def _capture_articles(
     sleep,
     max_scrolls: int,
     stable_rounds: int = ARTICLE_STABLE_ROUNDS,
+    timeout_seconds: int = ARTICLE_TIMEOUT_SECONDS,
+    monotonic=time.monotonic,
 ) -> str | None:
+    started_at = monotonic()
+
+    def timed_out() -> bool:
+        return timeout_seconds >= 0 and monotonic() - started_at >= timeout_seconds
+
     block = _recover_blocking_page(browser, sleep)
     if block:
         return block
@@ -120,6 +125,14 @@ def _capture_articles(
     last_scroll_marker = _scroll_marker(browser)
     stable = 0
     for round_index in range(max_scrolls):
+        if timed_out():
+            append_capture_debug(post_dir, {
+                "phase": "articles",
+                "round": round_index,
+                "stable": stable,
+                "stop_reason": "article_timeout",
+            })
+            return None
         block = _recover_blocking_page(browser, sleep)
         if block:
             return block
@@ -196,6 +209,66 @@ def _capture_articles(
             "stop_reason": None,
         })
     return None
+
+
+def _load_response_tweets(path: Path) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    tweets: list[dict[str, Any]] = []
+    for raw in iter_tweets(_maybe_body(payload)):
+        item = extract_timeline_tweet(raw)
+        if item.get("status_id"):
+            tweets.append(item)
+    return tweets
+
+
+def _merge_session_tweets(
+    session_tweets: dict[str, dict[str, Any]], path: Path
+) -> None:
+    for item in _load_response_tweets(path):
+        status_id = item["status_id"]
+        if status_id not in session_tweets:
+            session_tweets[status_id] = item
+        else:
+            _merge(session_tweets[status_id], item)
+
+
+def _post_status_ids(post: dict[str, Any]) -> set[str]:
+    if post.get("is_thread"):
+        return {
+            item["status_id"]
+            for item in post.get("thread", [])
+            if item.get("status_id")
+        }
+    status_id = post.get("status_id")
+    return {status_id} if status_id else set()
+
+
+def _capture_counts(
+    session_posts: list[dict[str, Any]],
+    existing_posts: list[dict[str, Any]],
+) -> dict[str, int]:
+    known_ids = {
+        status_id
+        for post in existing_posts
+        for status_id in _post_status_ids(post)
+    }
+    captured_posts = [
+        post for post in session_posts if post.get("source_section") == "posts"
+    ]
+    new_posts = sum(
+        1 for post in captured_posts if _post_status_ids(post) - known_ids
+    )
+    return {
+        "capture_posts_seen": len(captured_posts),
+        "capture_new_posts": new_posts,
+        "capture_known_overlap_posts": len(captured_posts) - new_posts,
+        "known_before_posts": sum(
+            1 for post in existing_posts if post.get("source_section") == "posts"
+        ),
+    }
 
 
 def _save_response_once(browser: Browser, request_id: str, path: Path) -> bool:
@@ -287,20 +360,42 @@ def capture(
     since: str | None = None,
     overlap_ids: set[str] | None = None,
     overlap_k: int = 1,
+    include_articles: bool = True,
+    article_max_scrolls: int = ARTICLE_MAX_SCROLLS,
+    article_stable_rounds: int = ARTICLE_STABLE_ROUNDS,
+    article_timeout_seconds: int = ARTICLE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     browser = browser or AgentBrowser()
     runs = post_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
 
-    browser.open(f"https://x.com/{handle}")
-    block = _recover_blocking_page(browser, sleep)
-    if block:
-        return {"status": "needs_ops", "reason": block, "responses": 0}
-    browser.enter_page()
-
+    existing_posts = build_timeline_posts(
+        load_tweets_from_runs(runs, extract_fn=extract_timeline_tweet), handle)
+    session_tweets: dict[str, dict[str, Any]] = {}
     saved: set[str] = set()
     new_responses = 0
     rejected_responses = 0
+
+    def session_posts() -> list[dict[str, Any]]:
+        return build_timeline_posts(list(session_tweets.values()), handle)
+
+    def capture_result(status: str, **values: Any) -> dict[str, Any]:
+        return {
+            "status": status,
+            "responses": len(saved),
+            "new_responses": new_responses,
+            "rejected_responses": rejected_responses,
+            "articles_included": include_articles,
+            **_capture_counts(session_posts(), existing_posts),
+            **values,
+        }
+
+    browser.open(f"https://x.com/{handle}")
+    block = _recover_blocking_page(browser, sleep)
+    if block:
+        return capture_result("needs_ops", reason=block)
+    browser.enter_page()
+
     last_size = -1
     last_scroll_marker = _scroll_marker(browser)
     stable = 0
@@ -308,7 +403,7 @@ def capture(
     for round_index in range(max_scrolls):
         block = _recover_blocking_page(browser, sleep)
         if block:
-            return {"status": "needs_ops", "reason": block, "responses": len(saved)}
+            return capture_result("needs_ops", reason=block)
         round_had_timeline_response = False
         request_ids = browser.list_request_ids("UserTweets")
         new_ids = [rid for rid in request_ids if rid not in saved]
@@ -323,6 +418,7 @@ def capture(
                     new_responses += 1
                     round_valid += 1
                     round_had_timeline_response = True
+                    _merge_session_tweets(session_tweets, path)
                 if saved_response or existed:
                     saved.add(rid)
                 elif not path.exists():
@@ -332,12 +428,12 @@ def capture(
 
         posts = build_timeline_posts(
             load_tweets_from_runs(runs, extract_fn=extract_timeline_tweet), handle)
+        captured_posts = session_posts()
         write_checkpoint(post_dir, posts)
-        write_progress_timeline(
-            handle, post_dir, posts, max_posts=max_posts, since=since)
+        write_progress_timeline(handle, post_dir, posts)
 
         cut, reason = find_stop_cut(
-            posts, max_posts=max_posts, since=since,
+            captured_posts, max_posts=max_posts, since=since,
             overlap_ids=overlap_ids, overlap_k=overlap_k)
         if cut is not None:
             stop_reason = reason
@@ -349,6 +445,7 @@ def capture(
                 "valid_new_responses": round_valid,
                 "rejected_responses": round_rejected,
                 "post_count": len(posts),
+                "capture_post_count": len(captured_posts),
                 "stop_reason": stop_reason,
             })
             break
@@ -414,23 +511,24 @@ def capture(
         browser.scroll(random.randint(*PROFILE_SCROLL_RANGE))
         sleep()
 
-    if stop_reason == "max_posts":
-        return {
-            "status": "complete",
-            "responses": len(saved),
-            "new_responses": new_responses,
-            "rejected_responses": rejected_responses,
-            "stop_reason": stop_reason,
-        }
+    if include_articles:
+        block = _capture_articles(
+            browser,
+            post_dir,
+            runs,
+            saved,
+            sleep,
+            article_max_scrolls,
+            stable_rounds=article_stable_rounds,
+            timeout_seconds=article_timeout_seconds,
+        )
+        if block:
+            return capture_result("needs_ops", reason=block)
+    else:
+        append_capture_debug(post_dir, {
+            "phase": "articles",
+            "event": "skipped",
+            "stop_reason": "articles_not_requested",
+        })
 
-    block = _capture_articles(browser, post_dir, runs, saved, sleep, max_scrolls)
-    if block:
-        return {"status": "needs_ops", "reason": block, "responses": len(saved)}
-
-    return {
-        "status": "complete",
-        "responses": len(saved),
-        "new_responses": new_responses,
-        "rejected_responses": rejected_responses,
-        "stop_reason": stop_reason,
-    }
+    return capture_result("complete", stop_reason=stop_reason)

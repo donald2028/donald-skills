@@ -14,23 +14,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from browser_runtime import BrowserSession
 from output_paths import resolve_tool_output_root
 from profile_config import (
     ProfileConfigError,
-    activate_browser,
     close_background_page,
-    configured_browser,
     connect_cdp_target,
     create_background_page,
     frontmost_process_id,
-    hide_browser_without_focus,
     list_cdp_targets,
-    preflight_browser,
     restore_frontmost_process_if_browser_active,
 )
 
 
 WECHAT_HOME = "https://mp.weixin.qq.com/"
+ACCOUNT_SEARCH_PLACEHOLDER_MARKER = "输入文章来源的账号名称"
 
 
 def _safe_path_part(value: str) -> str:
@@ -110,8 +108,9 @@ def _click_exact_text(connection: Any, text: str, selectors: str = "a,button,li,
 
 
 def _set_search_query(connection: Any, account: str) -> None:
+    marker_json = json.dumps(ACCOUNT_SEARCH_PLACEHOLDER_MARKER)
     placeholder_predicate = (
-        'return (el.placeholder || "").includes("输入文章来源的账号名称或微信号");'
+        f'return (el.placeholder || "").includes({marker_json});'
     )
     _click_expression(
         connection,
@@ -123,7 +122,7 @@ def _set_search_query(connection: Any, account: str) -> None:
         f"""
 (() => {{
   const el = [...document.querySelectorAll("input")].find(input =>
-    (input.placeholder || "").includes("输入文章来源的账号名称或微信号")
+    (input.placeholder || "").includes({marker_json})
   );
   if (!el) return false;
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
@@ -155,10 +154,11 @@ def _account_result_expression(account: str, wechat_id: str) -> str:
     wechat_id_json = json.dumps(wechat_id)
     predicate = f"""
 const label = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+const nickname = (el.querySelector(".inner_link_account_nickname")?.textContent || "").trim();
 const account = {account_json};
 const wechatId = {wechat_id_json};
-if (wechatId) return label.startsWith(account + " 微信号：" + wechatId);
-return label === account || label.startsWith(account + " 微信号：");
+if (wechatId) return nickname === account && label.includes(wechatId);
+return nickname === account || label === account || label.startsWith(account + " 微信号：");
 """.strip()
     return _element_rect_expression(predicate, "li,[role=radio],[role=listitem]")
 
@@ -227,7 +227,37 @@ def _close_if_open(port: int, target_id: str) -> None:
     if not target_id:
         return
     if any(str(target.get("id") or "") == target_id for target in list_cdp_targets(port)):
+        previous_frontmost_pid = frontmost_process_id()
         close_background_page(port, target_id)
+        if previous_frontmost_pid:
+            restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
+
+
+def _open_editor_target(
+    connection: Any,
+    *,
+    port: int,
+    before_ids: set[str],
+    home_target_id: str,
+    home_url: str,
+) -> str:
+    previous_frontmost_pid = frontmost_process_id()
+    try:
+        _click_exact_text(connection, "文章")
+    finally:
+        if previous_frontmost_pid:
+            restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
+    target_id = _wait_for_editor_target(port, before_ids, home_target_id)
+    if target_id:
+        return target_id
+    token = parse_qs(urlsplit(home_url).query).get("token", [""])[0]
+    if not token:
+        raise RuntimeError("Could not open the article editor or derive its token")
+    return create_background_page(
+        port,
+        "https://mp.weixin.qq.com/cgi-bin/appmsg"
+        f"?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77&createType=0&token={token}&lang=zh_CN",
+    )
 
 
 def main() -> int:
@@ -242,20 +272,16 @@ def main() -> int:
     if args.pages < 1:
         raise SystemExit("--pages must be >= 1")
 
+    browser_session: BrowserSession | None = None
     try:
-        browser_config = configured_browser()
-        args.cdp = args.cdp or int(browser_config["chrome"]["default_cdp_port"])
-        startup = preflight_browser(
-            browser_config,
-            args.cdp,
-            args.session or "donald-wechat-collect",
-            "about:blank",
-            60,
-        )
-        startup_target_id = str(startup.get("background_target_id") or "")
-        if startup_target_id:
-            close_background_page(args.cdp, startup_target_id)
-    except (OSError, ProfileConfigError, subprocess.SubprocessError) as error:
+        browser_session = BrowserSession(
+            scope="donald-collect-wechat",
+            session=args.session or "donald-wechat-collect",
+            url=WECHAT_HOME,
+            port=args.cdp,
+        ).open()
+        args.cdp = browser_session.port
+    except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError) as error:
         print(
             json.dumps(
                 {
@@ -275,14 +301,14 @@ def main() -> int:
     run_dir = account_root / "runs" / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    previous_frontmost_pid = frontmost_process_id()
-    home_target_id = create_background_page(args.cdp, WECHAT_HOME)
-    hide_browser_without_focus(browser_config, args.cdp, previous_frontmost_pid)
+    home_target_id = browser_session.target_id
     editor_target_id = ""
     home_connection: Any | None = None
     editor_connection: Any | None = None
     responses: list[dict[str, Any]] = []
     cleanup = "closed"
+    business_error: Exception | None = None
+    browser_cleanup: dict[str, Any] = {"status": "not_closed"}
     try:
         home_connection = connect_cdp_target(args.cdp, home_target_id)
         home_connection.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
@@ -293,25 +319,19 @@ def main() -> int:
             timeout=12,
         )
         if "cgi-bin/home" not in str((state or {}).get("url") or ""):
-            activation = activate_browser(browser_config, args.cdp)
+            activation = browser_session.preserve_for_human()
             cleanup = "kept_open_for_human"
             print(json.dumps({"status": "needs_ops", "run_dir": str(run_dir), "browser_activation": activation}, ensure_ascii=False, indent=2))
             return 2
 
         before_ids = {str(target.get("id") or "") for target in list_cdp_targets(args.cdp)}
-        _click_exact_text(home_connection, "文章")
-        editor_target_id = _wait_for_editor_target(args.cdp, before_ids, home_target_id)
-        if not editor_target_id:
-            token = parse_qs(urlsplit(str(state.get("url") or "")).query).get("token", [""])[0]
-            if not token:
-                raise RuntimeError("Could not open the article editor or derive its token")
-            editor_target_id = create_background_page(
-                args.cdp,
-                "https://mp.weixin.qq.com/cgi-bin/appmsg"
-                f"?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77&createType=0&token={token}&lang=zh_CN",
-            )
-        hide_browser_without_focus(browser_config, args.cdp, previous_frontmost_pid)
-
+        editor_target_id = _open_editor_target(
+            home_connection,
+            port=args.cdp,
+            before_ids=before_ids,
+            home_target_id=home_target_id,
+            home_url=str(state.get("url") or ""),
+        )
         editor_connection = connect_cdp_target(args.cdp, editor_target_id)
         editor_connection.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
         editor_connection.call("Network.enable")
@@ -319,7 +339,12 @@ def main() -> int:
         _click_exact_text(editor_connection, "超链接")
         _wait_value(editor_connection, 'document.body?.innerText.includes("编辑超链接")', timeout=8)
         _click_exact_text(editor_connection, "选择其他账号", "button,[role=button],div,span")
-        _wait_value(editor_connection, '[...document.querySelectorAll("input")].some(el => (el.placeholder || "").includes("输入文章来源的账号名称或微信号"))', timeout=8)
+        marker_json = json.dumps(ACCOUNT_SEARCH_PLACEHOLDER_MARKER)
+        _wait_value(
+            editor_connection,
+            f'[...document.querySelectorAll("input")].some(el => (el.placeholder || "").includes({marker_json}))',
+            timeout=8,
+        )
         _set_search_query(editor_connection, args.account)
         _wait_value(editor_connection, _account_result_expression(args.account, args.wechat_id), timeout=8)
 
@@ -345,6 +370,8 @@ def main() -> int:
             responses.append(response)
             _save_response(run_dir, args.account, page_number, response)
 
+    except (OSError, ProfileConfigError, RuntimeError, TimeoutError) as error:
+        business_error = error
     finally:
         if editor_connection is not None:
             editor_connection.close()
@@ -352,11 +379,26 @@ def main() -> int:
             home_connection.close()
         if cleanup == "closed":
             _close_if_open(args.cdp, editor_target_id)
-            if home_target_id != editor_target_id:
-                _close_if_open(args.cdp, home_target_id)
-            hide_browser_without_focus(browser_config, args.cdp, previous_frontmost_pid)
-            if previous_frontmost_pid:
-                restore_frontmost_process_if_browser_active(previous_frontmost_pid, args.cdp)
+        browser_cleanup = browser_session.close()
+        cleanup = browser_cleanup["status"]
+
+    if business_error is not None:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "reason": "wechat_ui_flow_failed",
+                    "retryable": True,
+                    "error_type": type(business_error).__name__,
+                    "hint": str(business_error),
+                    "run_dir": str(run_dir),
+                    "browser_cleanup": browser_cleanup,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
 
     parse = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("parse_appmsgpublish.py")), str(account_root)],

@@ -25,6 +25,7 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageStat
 
+from browser_runtime import BrowserSession
 from output_paths import resolve_tool_state_root
 from profile_config import (
     ProfileConfigError,
@@ -72,6 +73,8 @@ BUSY_MARKERS = (
 )
 GENERATION_FAILED_MARKERS = (
     "Image generation failed",
+    "unable to generate the image because the image generation tool encountered an error",
+    "image generation tool encountered an error",
     "生成工具这次连续报错",
     "没有成功产出图片",
 )
@@ -781,6 +784,11 @@ def _terminate_owned_cdp_chrome(args: argparse.Namespace, cwd: Path) -> None:
 
 
 def _cleanup_agent_browser(args: argparse.Namespace, cwd: Path) -> None:
+    browser_session = getattr(args, "_browser_session", None)
+    if browser_session is not None:
+        args._browser_cleanup = browser_session.close(preserve=bool(args.keep_browser_open))
+        return
+
     close_browser = False
     blank_tab_summary: dict[str, Any] = {"listed": False, "about_blank_tab_ids": [], "non_blank_count": 0}
     if not args.keep_browser_open:
@@ -980,26 +988,41 @@ def _write_cdp_state_locked(args: argparse.Namespace, state: dict[str, Any]) -> 
 
 
 def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
-    args._active_run_id = f"{os.getpid()}:{args.session}:{time.time()}"
-    transport_session = _agent_browser_transport_session(args)
-    with _cdp_state_lock(args, args.lock_timeout):
-        state = _read_cdp_state_locked(args)
-        state["active_runs"].append(
-            {
-                "run_id": args._active_run_id,
-                "pid": os.getpid(),
-                "session": args.session,
-                "agent_browser_transport_session": transport_session,
-                "tab_label": getattr(args, "_tab_label", ""),
-                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-        )
-        _write_cdp_state_locked(args, state)
-        _ensure_browser_connection(args, cwd)
-        if getattr(args, "_launched_chrome", False):
-            state = _read_cdp_state_locked(args)
-            state["launched_by_runner"] = True
-            _write_cdp_state_locked(args, state)
+    del cwd
+    original_transport_session = _agent_browser_transport_session(args)
+    if getattr(args, "_uses_shared_browser_profile", False):
+        config = configured_browser()
+    else:
+        config = {
+            "scope": "donald-chatgpt-imagegen",
+            "profile": {"directory": args.profile, "name": args.profile, "email": ""},
+            "chrome": {
+                "cdp_user_data_dir": str(Path(args.user_data_dir).expanduser()),
+                "default_cdp_port": int(_cdp_launch_port(args)),
+                "executable": args.executable_path,
+            },
+        }
+    browser_session = BrowserSession(
+        scope="donald-chatgpt-imagegen",
+        session=original_transport_session,
+        url="about:blank",
+        port=int(_cdp_launch_port(args)),
+        config=config,
+        timeout=60,
+        lock_timeout=args.lock_timeout,
+        allow_launch=not args.no_launch_browser,
+    ).open()
+    args._browser_session = browser_session
+    args._agent_browser_transport_session = browser_session.transport_session
+    args._active_run_id = browser_session.run_id
+    args._owned_tab_cdp_target_id = browser_session.target_id
+    args._owned_tab_cdp_url = browser_session.target_url
+    args._owned_tab_cdp_error = ""
+    args._opened_tab = True
+    args._tab_label = ""
+    args._launched_chrome = browser_session.launched
+    args._frontmost_pid_before_launch = browser_session.previous_frontmost_pid
+    args.cdp = str(browser_session.port)
 
 
 def _launch_chrome_for_cdp(args: argparse.Namespace, cwd: Path) -> None:
@@ -1171,8 +1194,24 @@ def _is_busy(text: str) -> bool:
     return any(marker in text for marker in BUSY_MARKERS)
 
 
+def _generation_error_from_text(text: str) -> dict[str, str] | None:
+    normalized = " ".join((text or "").split())
+    lowered = normalized.lower()
+    matched = next(
+        (marker for marker in GENERATION_FAILED_MARKERS if marker.lower() in lowered),
+        "",
+    )
+    if not matched:
+        return None
+    return {
+        "error_type": "chatgpt_generation_error",
+        "matched_marker": matched,
+        "message": normalized[-800:],
+    }
+
+
 def _has_generation_failed(text: str) -> bool:
-    return any(marker in text for marker in GENERATION_FAILED_MARKERS)
+    return _generation_error_from_text(text) is not None
 
 
 def _reference_upload_failure(text: str, references: list[str]) -> dict[str, Any] | None:
@@ -1650,6 +1689,7 @@ def _emit_progress(
     recognized_count: int = 0,
     downloaded_count: int = 0,
     retry_index: int = 0,
+    page_health: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     elapsed = max(0.0, time.time() - started_at)
     estimated_total = _estimated_total_seconds(expected_count)
@@ -1667,6 +1707,7 @@ def _emit_progress(
         "retry_index": retry_index,
         "estimated_total_seconds": round(estimated_total, 1) if estimated_total else None,
         "estimated_remaining_seconds": round(max(0.0, estimated_total - elapsed), 1) if estimated_total else None,
+        **({"page_health": page_health} if page_health is not None else {}),
     }
     progress_path = Path(job["download_dir"]) / "chatgpt_progress.jsonl"
     progress_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1675,6 +1716,66 @@ def _emit_progress(
     print(json.dumps(progress, ensure_ascii=False), file=sys.stderr, flush=True)
     _write_session_patch(job, {"label": label, "status": status, "progress": progress})
     return progress
+
+
+def _generation_page_health(
+    args: argparse.Namespace,
+    cwd: Path,
+    expected_conversation_url: str | None,
+    page_text: str,
+) -> dict[str, Any]:
+    observation = _eval_json(
+        args,
+        cwd,
+        r"""
+JSON.stringify((() => {
+  const assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+  const latest = assistants.length ? assistants[assistants.length - 1] : null;
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const hasComposer = Array.from(document.querySelectorAll('[contenteditable="true"]')).some(visible);
+  const challengeFrame = Array.from(document.querySelectorAll('iframe'))
+    .some((frame) => /captcha|challenge|turnstile|verify/i.test(`${frame.src} ${frame.title}`));
+  return {
+    href: window.location.href,
+    userMessageCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    assistantMessageCount: assistants.length,
+    latestAssistantMessage: latest ? (latest.innerText || latest.textContent || "") : "",
+    hasComposer,
+    challengeFrame,
+  };
+})())
+""".strip(),
+        timeout=30,
+    )
+    current_url = str(observation.get("href") or "")
+    current_id = _conversation_id_from_url(current_url)
+    expected_id = _conversation_id_from_url(expected_conversation_url or "")
+    latest_assistant = str(observation.get("latestAssistantMessage") or "")
+    generation_error = _generation_error_from_text(latest_assistant) or _generation_error_from_text(page_text)
+    conversation_ok = bool(
+        current_id
+        and (
+            not expected_id
+            or current_id == expected_id
+            or (_temporary_conversation_id(expected_id) and not _temporary_conversation_id(current_id))
+        )
+    )
+    status = "generation_error" if generation_error else ("ok" if conversation_ok else "unexpected_page")
+    return {
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": status,
+        "conversation_ok": conversation_ok,
+        "has_composer": bool(observation.get("hasComposer")),
+        "challenge_frame": bool(observation.get("challengeFrame")),
+        "user_message_count": max(0, int(observation.get("userMessageCount") or 0)),
+        "assistant_message_count": max(0, int(observation.get("assistantMessageCount") or 0)),
+        "generation_active": _is_busy(page_text),
+        **({"generation_error": generation_error} if generation_error else {}),
+    }
 
 
 def _conversation_id_from_url(url: str) -> str | None:
@@ -1687,6 +1788,10 @@ def _conversation_id_from_url(url: str) -> str | None:
 def _conversation_href_from_url(url: str) -> str | None:
     conversation_id = _conversation_id_from_url(url)
     return f"/c/{conversation_id}" if conversation_id else None
+
+
+def _temporary_conversation_id(conversation_id: str | None) -> bool:
+    return bool(conversation_id and conversation_id.startswith("WEB:"))
 
 
 def _current_url(args: argparse.Namespace, cwd: Path) -> str:
@@ -1764,6 +1869,7 @@ def _ensure_expected_conversation(
     args: argparse.Namespace,
     cwd: Path,
     expected_conversation_url: str | None,
+    baseline_user_message_count: int | None = None,
 ) -> dict[str, Any]:
     expected_id = _conversation_id_from_url(expected_conversation_url or "")
     if not expected_id:
@@ -1807,6 +1913,22 @@ def _ensure_expected_conversation(
     if current_id == expected_id:
         return event
 
+    if _temporary_conversation_id(expected_id) and current_id and not _temporary_conversation_id(current_id):
+        message_counts = _conversation_message_counts(args, cwd)
+        if (
+            baseline_user_message_count is not None
+            and message_counts["user_message_count"] > baseline_user_message_count
+        ):
+            event.update(
+                {
+                    "canonicalized": True,
+                    "restore_reason": "temporary_conversation_url_canonicalized",
+                    "previous_conversation_id": expected_id,
+                    "message_counts": message_counts,
+                }
+            )
+            return event
+
     restored_url = _open_conversation(args, cwd, expected_conversation_url)
     restored_id = _conversation_id_from_url(restored_url)
     event.update(
@@ -1825,6 +1947,30 @@ def _ensure_expected_conversation(
             f"expected={expected_conversation_url} current={current_url} restored={restored_url}"
         )
     return event
+
+
+def _persist_canonical_conversation(
+    job: dict[str, Any],
+    label: int | str,
+    event: dict[str, Any],
+    fallback_url: str | None,
+) -> str | None:
+    if not event.get("canonicalized"):
+        return fallback_url
+    current_url = str(event.get("current_url") or "")
+    current_id = _conversation_id_from_url(current_url)
+    if not current_id:
+        return fallback_url
+    _write_session_patch(
+        job,
+        {
+            "label": label,
+            "conversation_id": current_id,
+            "conversation_url": current_url,
+            "conversation_guard": event,
+        },
+    )
+    return current_url
 
 
 def _stale_generation_refresh_due(
@@ -3457,21 +3603,35 @@ def _download_url_with_browser(
   return JSON.stringify({{ ok: true, size: blob.size, type: blob.type, data_url: dataUrl }});
 }})()
 """
-    output = _eval_js(args, cwd, script, timeout=240).strip()
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
-        start = output.find("{")
-        end = output.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        payload = json.loads(output[start : end + 1])
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    data_url = payload.get("data_url", "")
-    if "," not in data_url:
-        raise RuntimeError("browser fetch did not return a data URL")
-    output_path.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
+    errors: list[str] = []
+    for attempt, delay in enumerate((0, 2, 5, 10), start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            output = _eval_js(args, cwd, script, timeout=240).strip()
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                start = output.find("{")
+                end = output.rfind("}")
+                if start < 0 or end <= start:
+                    raise
+                payload = json.loads(output[start : end + 1])
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            data_url = payload.get("data_url", "")
+            if "," not in data_url:
+                raise RuntimeError("browser fetch did not return a data URL")
+            output_path.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
+            return
+        except Exception as error:
+            errors.append(f"attempt {attempt}: {type(error).__name__}: {error}")
+    raise RuntimeError("browser-authenticated image download failed after 4 attempts: " + " | ".join(errors))
+
+
+def _url_requires_browser_credentials(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host == "chatgpt.com" or host.endswith(".chatgpt.com")
 
 
 def _download_urls(
@@ -3489,6 +3649,8 @@ def _download_urls(
         try:
             _download_url_with_browser(args, cwd, url, output_path)
         except Exception:
+            if _url_requires_browser_credentials(url):
+                raise
             method = "urllib_fallback"
             request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -3512,13 +3674,27 @@ def _download_candidates(
     candidates: list[dict[str, Any]],
     output_dir: Path,
     prefix: str,
+    failures: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     downloaded: list[dict[str, Any]] = []
     for index, candidate in enumerate(candidates, start=1):
         output_path = output_dir / f"{prefix}_{index:02d}.png"
         url = candidate.get("src") or ""
-        item = _download_urls(args, cwd, [url], output_dir, f"{prefix}_{index:02d}_fetch")[0]
+        try:
+            item = _download_urls(args, cwd, [url], output_dir, f"{prefix}_{index:02d}_fetch")[0]
+        except Exception as error:
+            if failures is not None:
+                failures.append(
+                    {
+                        "candidate_index": index,
+                        "source_url": url,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "recognized_candidate": _candidate_debug(candidate),
+                    }
+                )
+            continue
         item_path = Path(item["path"])
         if item_path != output_path:
             item_path.replace(output_path)
@@ -3576,8 +3752,10 @@ def _collect_generated_images_with_retries(
     filtered_reference_downloads: list[dict[str, str]] = []
     candidates: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    download_failures: list[dict[str, Any]] = []
     conversation_restores: list[dict[str, Any]] = []
     conversation_guard: dict[str, Any] | None = None
+    active_expected_conversation_url = expected_conversation_url
     expected_count = _expected_image_count(job, label)
     download_limit = _candidate_download_limit(expected_count, references)
     file_prefix = f"{job['job_name']}_agent_browser_{_variant_prefix(label)}_generated"
@@ -3603,11 +3781,46 @@ def _collect_generated_images_with_retries(
         last_candidate_growth_at: float | None = None
         last_generation_refresh_at: float | None = None
         best_candidate_count = 0
+        detected_generation_error: dict[str, str] | None = None
         while time.time() < deadline:
-            conversation_guard = _ensure_expected_conversation(args, cwd, expected_conversation_url)
+            conversation_guard = _ensure_expected_conversation(
+                args,
+                cwd,
+                active_expected_conversation_url,
+                baseline_user_message_count,
+            )
+            active_expected_conversation_url = _persist_canonical_conversation(
+                job,
+                label,
+                conversation_guard,
+                active_expected_conversation_url,
+            )
             if conversation_guard.get("restored"):
                 conversation_restores.append(conversation_guard)
             page_text = _page_text(args, cwd)
+            detected_generation_error = _generation_error_from_text(page_text)
+            if detected_generation_error:
+                page_health = _generation_page_health(
+                    args,
+                    cwd,
+                    active_expected_conversation_url,
+                    page_text,
+                )
+                detected_generation_error = (
+                    page_health.get("generation_error") or detected_generation_error
+                )
+                _emit_progress(
+                    job,
+                    label=label,
+                    phase="generation_error",
+                    status="generation_failed",
+                    started_at=started_at,
+                    expected_count=expected_count,
+                    recognized_count=len(best_candidates),
+                    retry_index=retry_index,
+                    page_health=page_health,
+                )
+                break
             policy_refusal = _content_policy_refusal(page_text)
             if policy_refusal:
                 _emit_progress(
@@ -3664,6 +3877,13 @@ def _collect_generated_images_with_retries(
                 best_candidate_count = len(candidates)
                 last_candidate_growth_at = time.time()
             if time.time() >= next_progress_at:
+                page_health = _generation_page_health(
+                    args,
+                    cwd,
+                    active_expected_conversation_url,
+                    page_text,
+                )
+                detected_generation_error = page_health.get("generation_error")
                 _emit_progress(
                     job,
                     label=label,
@@ -3673,8 +3893,11 @@ def _collect_generated_images_with_retries(
                     expected_count=expected_count,
                     recognized_count=len(candidates),
                     retry_index=retry_index,
+                    page_health=page_health,
                 )
                 next_progress_at = time.time() + progress_interval
+                if detected_generation_error:
+                    break
             if _has_generation_failed(visible_state):
                 break
             button_state = _generation_button_state(args, cwd)
@@ -3682,7 +3905,7 @@ def _collect_generated_images_with_retries(
             now = time.time()
             if _stale_generation_refresh_due(
                 generation_active=generation_active,
-                expected_conversation_url=expected_conversation_url,
+                expected_conversation_url=active_expected_conversation_url,
                 started_at=generation_wait_started_at,
                 last_candidate_growth_at=last_candidate_growth_at,
                 last_generation_refresh_at=last_generation_refresh_at,
@@ -3692,7 +3915,7 @@ def _collect_generated_images_with_retries(
                 refresh_event = _refresh_expected_conversation(
                     args,
                     cwd,
-                    expected_conversation_url or "",
+                    active_expected_conversation_url or "",
                     reason="stale_generation_active_refresh",
                     candidate_count=len(candidates),
                     expected_count=expected_count,
@@ -3754,6 +3977,7 @@ def _collect_generated_images_with_retries(
                     selected_candidates,
                     Path(job["download_dir"]),
                     file_prefix,
+                    download_failures,
                 )
                 downloaded, filtered_reference_downloads = _filter_reference_downloads(
                     downloaded_all,
@@ -3820,16 +4044,56 @@ def _collect_generated_images_with_retries(
                         "conversation_restores": conversation_restores,
                         **completion_metadata,
                     }
+                if download_failures:
+                    result = {
+                        "status": "download_failed",
+                        "error_type": "generated_image_download_failed",
+                        "retryable": True,
+                        "terminal": False,
+                        "recommended_next_action": "collect_current_first",
+                        "generation_state": "complete_download_pending",
+                        "safe_to_fallback": False,
+                        "should_collect_current_first": True,
+                        "label": label,
+                        "mode": mode,
+                        "resumed": resumed,
+                        "image_count": 0,
+                        "raw_image_count": 0,
+                        "recognized_candidate_count": len(selected_candidates),
+                        "recognized_candidates": recognized_candidates,
+                        "expected_image_count": expected_count,
+                        "partial": False,
+                        "images": [],
+                        "download_failures": download_failures,
+                        "failure_retries": failures,
+                        "conversation_guard": conversation_guard,
+                        "conversation_restores": conversation_restores,
+                    }
+                    _write_session_patch(job, {**result, "label": label})
+                    _screenshot(args, cwd, trace_dir / "05_download_failed.png")
+                    return result
             if len(candidates) < expected_count:
                 _scroll_down(args, cwd, 700)
                 time.sleep(2)
                 continue
             time.sleep(5)
 
-        conversation_guard = _ensure_expected_conversation(args, cwd, expected_conversation_url)
+        conversation_guard = _ensure_expected_conversation(
+            args,
+            cwd,
+            active_expected_conversation_url,
+            baseline_user_message_count,
+        )
+        active_expected_conversation_url = _persist_canonical_conversation(
+            job,
+            label,
+            conversation_guard,
+            active_expected_conversation_url,
+        )
         if conversation_guard.get("restored"):
             conversation_restores.append(conversation_guard)
         page_text = _page_text(args, cwd)
+        detected_generation_error = detected_generation_error or _generation_error_from_text(page_text)
         policy_refusal = _content_policy_refusal(page_text)
         if policy_refusal:
             result = {
@@ -3887,6 +4151,7 @@ def _collect_generated_images_with_retries(
                 selected_candidates,
                 Path(job["download_dir"]),
                 file_prefix,
+                download_failures,
             )
             downloaded, filtered_reference_downloads = _filter_reference_downloads(
                 downloaded_all,
@@ -3913,6 +4178,7 @@ def _collect_generated_images_with_retries(
                     "recognized_candidates": recognized_candidates,
                     "download_reason": download_reason,
                     "filtered_reference_downloads": filtered_reference_downloads,
+                    "download_failures": download_failures,
                     "output_count": len(downloaded),
                     "expected_image_count": expected_count,
                     "shortfall_count": max(0, expected_count - len(downloaded)),
@@ -3939,6 +4205,7 @@ def _collect_generated_images_with_retries(
                 "recognized_candidates": recognized_candidates,
                 "download_reason": download_reason,
                 "filtered_reference_downloads": filtered_reference_downloads,
+                "download_failures": download_failures,
                 "image_count": len(downloaded),
                 "images": downloaded,
                 "failure_retries": failures,
@@ -3949,7 +4216,7 @@ def _collect_generated_images_with_retries(
                 "conversation_restores": conversation_restores,
                 **completion_metadata,
             }
-        if not _has_generation_failed(page_text):
+        if not detected_generation_error:
             _write_session_patch(
                 job,
                 {
@@ -3968,6 +4235,7 @@ def _collect_generated_images_with_retries(
             "retry_available": retry_available,
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "conversation_url": (conversation_guard or {}).get("current_url") or _current_url(args, cwd),
+            "generation_error": detected_generation_error,
         }
         failures.append(failure)
         _write_session_patch(
@@ -3982,8 +4250,34 @@ def _collect_generated_images_with_retries(
             },
         )
         if not retry_available or not _click_try_again(args, cwd):
-            raise RuntimeError("ChatGPT image generation failed and agent-browser could not retry it")
+            result = {
+                "status": "generation_failed",
+                "error_type": "chatgpt_generation_error",
+                "retryable": True,
+                "terminal": True,
+                "recommended_next_action": "submit_new_request",
+                "generation_state": "failed",
+                "safe_to_fallback": False,
+                "should_collect_current_first": False,
+                "label": label,
+                "mode": mode,
+                "resumed": resumed,
+                "image_count": 0,
+                "raw_image_count": 0,
+                "recognized_candidate_count": 0,
+                "expected_image_count": expected_count,
+                "partial": False,
+                "images": [],
+                "generation_error": detected_generation_error,
+                "failure_retries": failures,
+                "conversation_guard": conversation_guard,
+                "conversation_restores": conversation_restores,
+            }
+            _write_session_patch(job, {**result, "label": label})
+            _screenshot(args, cwd, trace_dir / "05_generation_failed.png")
+            return result
         conversation_url = _wait_for_conversation_url(args, cwd)
+        active_expected_conversation_url = conversation_url
         _write_session_patch(
             job,
             {
@@ -4349,6 +4643,9 @@ def _run_one_request(
             expected_conversation_url=conversation_url,
             baseline_user_message_count=existing_session.get("baseline_user_message_count"),
         )
+        conversation_url = str(
+            (collected.get("conversation_guard") or {}).get("current_url") or conversation_url
+        )
         if not existing_session.get("continued_from"):
             rename = _retry_conversation_rename(args, job, cwd, conversation_url, rename)
             _write_session_patch(job, {"label": label, "title_rename": rename})
@@ -4507,6 +4804,9 @@ def _run_one_request(
         max_failure_retries=args.max_failure_retries,
         expected_conversation_url=conversation_url,
         baseline_user_message_count=baseline_message_counts["user_message_count"],
+    )
+    conversation_url = str(
+        (collected.get("conversation_guard") or {}).get("current_url") or conversation_url
     )
     if not continued_from:
         rename = _retry_conversation_rename(args, job, cwd, conversation_url, rename)
@@ -4695,15 +4995,33 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     progress_interval = max(5, int(getattr(args, "progress_interval", 20)))
     next_progress_at = 0.0
     candidates: list[dict[str, Any]] = []
+    detected_generation_error: dict[str, str] | None = None
     conversation_guard: dict[str, Any] | None = None
     conversation_restores: list[dict[str, Any]] = []
     while time.time() < deadline:
         conversation_guard = _ensure_expected_conversation(args, cwd, conversation_url)
         if conversation_guard.get("restored"):
             conversation_restores.append(conversation_guard)
+        page_text = _page_text(args, cwd)
+        detected_generation_error = _generation_error_from_text(page_text)
+        if detected_generation_error:
+            page_health = _generation_page_health(args, cwd, conversation_url, page_text)
+            detected_generation_error = page_health.get("generation_error") or detected_generation_error
+            _emit_progress(
+                job,
+                label="batch",
+                phase="generation_error",
+                status="generation_failed",
+                started_at=started_at,
+                expected_count=expected_count,
+                page_health=page_health,
+            )
+            break
         rows = _image_inventory(args, cwd)
         candidates = _generated_image_candidates(rows, set())
         if time.time() >= next_progress_at:
+            page_health = _generation_page_health(args, cwd, conversation_url, page_text)
+            detected_generation_error = page_health.get("generation_error")
             _emit_progress(
                 job,
                 label="batch",
@@ -4712,33 +5030,70 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
                 started_at=started_at,
                 expected_count=expected_count,
                 recognized_count=len(candidates),
+                page_health=page_health,
             )
             next_progress_at = time.time() + progress_interval
+            if detected_generation_error:
+                break
         if candidates:
             break
         _scroll_down(args, cwd, 700)
         time.sleep(2)
     selected_candidates = candidates[:_candidate_download_limit(expected_count, references)]
     recognized_candidates = [_candidate_debug(candidate) for candidate in selected_candidates]
+    download_failures: list[dict[str, Any]] = []
     downloaded_all = _download_candidates(
         args,
         cwd,
         selected_candidates,
         Path(job["download_dir"]),
         f"{job['job_name']}_agent_browser_batch_generated",
+        download_failures,
     )
     downloaded, filtered_reference_downloads = _filter_reference_downloads(downloaded_all, references)
     downloaded = _keep_expected_downloads(downloaded, expected_count)
     status = (
         "downloaded"
         if len(downloaded) >= expected_count
-        else ("partial_downloaded" if downloaded else "collect_current_no_new_images")
+        else (
+            "partial_downloaded"
+            if downloaded
+            else ("generation_failed" if detected_generation_error else "collect_current_no_new_images")
+        )
     )
-    completion_metadata = _generation_completion_metadata(
-        status=status,
-        image_count=len(downloaded),
-        expected_count=expected_count,
-        download_reason="partial_terminal" if status == "partial_downloaded" else status,
+    if selected_candidates and not downloaded and download_failures:
+        status = "download_failed"
+    completion_metadata = (
+        {
+            "generation_state": "failed",
+            "safe_to_fallback": False,
+            "should_collect_current_first": False,
+            "missing_image_count": expected_count,
+            "recommended_next_action": "submit_new_request",
+            "safe_to_request_missing_batch": False,
+            "missing_batch_request_count": 0,
+            "missing_image_followup_message": "",
+        }
+        if detected_generation_error
+        else (
+            {
+                "generation_state": "complete_download_pending",
+                "safe_to_fallback": False,
+                "should_collect_current_first": True,
+                "missing_image_count": expected_count,
+                "recommended_next_action": "collect_current_first",
+                "safe_to_request_missing_batch": False,
+                "missing_batch_request_count": 0,
+                "missing_image_followup_message": "",
+            }
+            if status == "download_failed"
+            else _generation_completion_metadata(
+                status=status,
+                image_count=len(downloaded),
+                expected_count=expected_count,
+                download_reason="partial_terminal" if status == "partial_downloaded" else status,
+            )
+        )
     )
     session_patch = {
         "status": status,
@@ -4752,6 +5107,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "recognized_candidates": recognized_candidates,
         "conversation_guard": conversation_guard,
         "conversation_restores": conversation_restores,
+        **({"generation_error": detected_generation_error} if detected_generation_error else {}),
+        **({"download_failures": download_failures} if download_failures else {}),
         **completion_metadata,
         "attempt": {
             "action": "collect_current",
@@ -4791,6 +5148,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "recognized_candidates": recognized_candidates,
         "conversation_guard": conversation_guard,
         "conversation_restores": conversation_restores,
+        **({"generation_error": detected_generation_error} if detected_generation_error else {}),
+        **({"download_failures": download_failures} if download_failures else {}),
         "filtered_reference_downloads": filtered_reference_downloads,
         "status": status,
         "image_count": len(downloaded),
@@ -4995,8 +5354,24 @@ def main() -> int:
     if not args.cdp and not args.auto_connect:
         args.cdp = args.cdp_port
     report: dict[str, Any] | None = None
-    _prepare_browser_lane(args, cwd)
-    _validate_profile(args)
+    try:
+        _prepare_browser_lane(args, cwd)
+        _validate_profile(args)
+    except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError, RuntimeError) as error:
+        if getattr(args, "_browser_session", None) is not None:
+            _cleanup_agent_browser(args, cwd)
+        print(
+            json.dumps(
+                {
+                    "status": "needs_ops",
+                    "reason": "browser_startup_failed",
+                    "hint": str(error),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
     exit_code = 0
     try:
         if args.mode == "single-batch-submit":
@@ -5016,8 +5391,6 @@ def main() -> int:
         }
         exit_code = 2
     finally:
-        if _report_has_conversation_result(report) or _job_has_conversation_session(job):
-            args._preserve_owned_tab = True
         _cleanup_agent_browser(args, cwd)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return exit_code

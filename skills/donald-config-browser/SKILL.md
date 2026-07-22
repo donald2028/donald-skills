@@ -33,9 +33,36 @@ Keep bindings separate from browser state:
   `%LOCALAPPDATA%\Donald Skills\Chrome CDP\` on Windows, and
   `${XDG_DATA_HOME:-~/.local/share}/donald-skills/chrome-cdp/` on Linux, with one directory per
   Chrome Profile.
+- Cross-skill lifecycle state: `~/Library/Application Support/Donald Skills/state/agent-browser/`
+  on macOS, `%LOCALAPPDATA%\Donald Skills\state\agent-browser\` on Windows, and
+  `${XDG_STATE_HOME:-~/.local/state}/donald-skills/agent-browser/` on Linux. Set
+  `DONALD_AGENT_BROWSER_STATE_DIR` only for an explicit state-root override.
 
 The JSON contains paths and Profile metadata, not passwords or tokens. The runtime browser data is
 sensitive because it contains copied login state. Never commit, upload, or inspect it unnecessarily.
+
+## Shared Runtime Contract
+
+`scripts/profile_config.py` and `scripts/browser_runtime.py` are the canonical browser base. The
+repository build vendors both files unchanged into every Donald browser business skill so a
+selectively installed skill remains self-contained without importing sibling skill paths. Never
+hand-edit the vendored copies; change these canonical files and run `npm run build`.
+
+Every normal business runner uses `BrowserSession` for the same lifecycle:
+
+1. Read the caller skill's saved binding and start or attach only to its verified Chrome/CDP lane.
+2. Create or reclaim one target owned by that run, then prove `agent-browser --cdp` can attach.
+3. Let the business code operate only on the owned target ID; never select an arbitrary matching tab.
+4. In `finally`, close the owned target and any blank target created during attach. Do not sweep
+   pre-existing user tabs. On macOS, sample the foreground app at cleanup time and restore it only
+   if closing a target made Chrome frontmost; never reactivate a stale session-start PID after
+   Chrome exits.
+5. Remove the run from cross-skill state. When no other run or retained operator target exists,
+   close Chrome only if the shared runtime originally launched that process.
+
+Only a recognized `needs_ops` state retains the owned target and browser for the operator. A later
+run reclaims that retained target instead of opening another page. Successful completion then
+performs the ordinary cleanup.
 
 ## Invocation Policy
 
@@ -62,6 +89,12 @@ python3 "$SKILL_DIR/scripts/profile_config.py" --scope <skill-name> show
 
 A saved binding is sticky. Never ask the user to select a Profile again solely because this is a
 new task or session.
+
+The shared config reader performs a one-time, exact legacy-scope migration for the former
+`donald-collect-wechat-accounts`, `donald-collect-x-posts`, and
+`donald-generate-images-with-chatgpt` names. It preserves the saved Profile, CDP user-data-dir, and
+port and writes the corresponding current scope atomically. Do not ask the user to reselect a
+Profile for these known renames.
 
 ## Phase 1: Check The Environment For Setup Or Repair
 
@@ -162,11 +195,11 @@ The preflight follows this exact sequence:
 5. If preflight started Chrome, close that exact CDP browser and wait for its port to stop listening
    before returning `ready`. The downstream runner must start and own its own Chrome lifecycle.
 
-On macOS, launch the headed Chrome instance with `open -g -j -n -a "Google Chrome"`: `-g`
-keeps it in the background and `-j` keeps the application hidden. This remains headed Chrome, not
-headless Chrome. Keep it hidden during normal automation because a visible Chrome window can
-promote itself after delayed page work even when a CDP target was created with `background=true`.
-Never activate Chrome or take keyboard focus. If login, MFA, captcha, risk confirmation,
+On macOS, launch the headed Chrome instance with `open -g -n -a "Google Chrome"`: `-g` keeps it
+behind the active app without making Chrome frontmost. This remains headed Chrome, not headless
+Chrome. Do not add `-j`: a fully hidden macOS app does not reliably service CDP screenshots. Never
+activate Chrome or take keyboard focus. If login, MFA,
+captcha, risk confirmation,
 or another anti-automation challenge requires a human, return `needs_ops`, run the controlled
 activation command below, and keep that Chrome open:
 

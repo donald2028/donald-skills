@@ -21,6 +21,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from browser_runtime import BrowserSession
 from archive_store import (
     article_record_path,
     build_article_record,
@@ -38,8 +39,6 @@ from profile_config import (
     configured_browser,
     create_background_page,
     frontmost_process_id,
-    hide_browser_without_focus,
-    preflight_browser,
     restore_frontmost_process_if_browser_active,
     wait_for_background_page_url,
 )
@@ -217,7 +216,14 @@ def _evaluate_background_page(port: int, target_id: str, script: str, timeout: i
     return value
 
 
-def fetch_article_with_cdp(url: str, cdp: str, session: str | None = None, timeout: int = 45) -> dict[str, Any]:
+def fetch_article_with_cdp(
+    url: str,
+    cdp: str,
+    session: str | None = None,
+    timeout: int = 45,
+    *,
+    target_id: str | None = None,
+) -> dict[str, Any]:
     del session  # Kept for CLI compatibility; focus-safe page control uses the configured CDP browser directly.
     port = int(cdp)
     script = r"""
@@ -340,11 +346,18 @@ def fetch_article_with_cdp(url: str, cdp: str, session: str | None = None, timeo
 })()
 """.strip()
     article: dict[str, Any] | None = None
-    previous_frontmost_pid = frontmost_process_id()
-    browser_config = configured_browser()
-    target_id = create_background_page(port, url)
+    owns_target = target_id is None
+    if target_id is None:
+        target_id = create_background_page(port, url)
+    else:
+        call_background_page(
+            port,
+            target_id,
+            "Page.navigate",
+            {"url": url},
+            timeout=timeout,
+        )
     try:
-        hide_browser_without_focus(browser_config, port, previous_frontmost_pid)
         wait_for_background_page_url(port, target_id, url, timeout=min(timeout, 15))
         call_background_page(
             port,
@@ -377,13 +390,15 @@ def fetch_article_with_cdp(url: str, cdp: str, session: str | None = None, timeo
         }
         if keep_open_for_human:
             article["browser_tab_cleanup"] = "kept_open_for_human"
-        else:
+        elif owns_target:
+            cleanup_frontmost_pid = frontmost_process_id()
             close_background_page(port, target_id)
-            hide_browser_without_focus(browser_config, port, previous_frontmost_pid)
-            if previous_frontmost_pid:
-                restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
+            if cleanup_frontmost_pid:
+                restore_frontmost_process_if_browser_active(cleanup_frontmost_pid, port)
             if article is not None:
                 article["browser_tab_cleanup"] = "closed"
+        elif article is not None:
+            article["browser_tab_cleanup"] = "session_target_reused"
     if article is None:
         raise RuntimeError(f"Could not inspect WeChat article target {target_id}")
     if article["blocked_reason"] in {
@@ -392,7 +407,7 @@ def fetch_article_with_cdp(url: str, cdp: str, session: str | None = None, timeo
     }:
         try:
             article["browser_activation"] = activate_browser(configured_browser(), int(cdp))
-        except (OSError, ProfileConfigError, subprocess.SubprocessError) as error:
+        except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError) as error:
             article["browser_activation"] = {"status": "error", "error": str(error)}
     return article
 
@@ -640,21 +655,23 @@ def main() -> int:
         help="Diagnostic only. Direct HTTP does not satisfy the browser-evidence workflow.",
     )
     args = parser.parse_args()
-    if not args.http_diagnostic:
+    browser_session: BrowserSession | None = None
+    account_root, items = load_index_entries(args.archive)
+    output_dir = account_root / "articles"
+    manifest_path = account_root / "body-fetch-manifest.json"
+    selected, missing = select_items(items, args.title_contains, limit=args.limit)
+    selected.extend(_direct_url_item(value, args.account) for value in args.url)
+    initial_url = next((str(item.get("url") or "").strip() for item in selected if item.get("url")), "")
+
+    if not args.http_diagnostic and initial_url:
         try:
-            browser_config = configured_browser()
-            port = int(args.cdp or browser_config["chrome"]["default_cdp_port"])
-            startup = preflight_browser(
-                browser_config,
-                port,
-                args.session or "donald-wechat-bodies",
-                "about:blank",
-                60,
-            )
-            startup_target_id = str(startup.get("background_target_id") or "")
-            if startup_target_id:
-                close_background_page(port, startup_target_id)
-            args.cdp = str(port)
+            browser_session = BrowserSession(
+                scope="donald-collect-wechat",
+                session=args.session or "donald-wechat-bodies",
+                url=initial_url,
+                port=int(args.cdp) if args.cdp else None,
+            ).open()
+            args.cdp = str(browser_session.port)
         except (OSError, ProfileConfigError, subprocess.SubprocessError) as error:
             print(
                 json.dumps(
@@ -668,12 +685,6 @@ def main() -> int:
                 )
             )
             return 2
-
-    account_root, items = load_index_entries(args.archive)
-    output_dir = account_root / "articles"
-    manifest_path = account_root / "body-fetch-manifest.json"
-    selected, missing = select_items(items, args.title_contains, limit=args.limit)
-    selected.extend(_direct_url_item(value, args.account) for value in args.url)
 
     manifest: dict[str, Any] = {
         "archive": str(account_root / "index.json"),
@@ -718,6 +729,7 @@ def main() -> int:
                         cdp=str(args.cdp),
                         session=args.session or None,
                         timeout=args.timeout,
+                        target_id=browser_session.target_id if browser_session is not None else None,
                     )
                     article = recover_metadata_text_post(item, article)
                     article = validate_article_identity(item, article)
@@ -806,10 +818,14 @@ def main() -> int:
             }
         )
         if article.get("browser_activation"):
+            if browser_session is not None:
+                browser_session.retain_target_for_human(str(article.get("cdp_target_id") or ""))
             print("needs_ops: complete login or verification in the active Chrome window")
         print(f"{article.get('fetch_status')}: {output}")
         if index < len(selected) and args.delay > 0:
             time.sleep(args.delay)
+        if article.get("browser_activation"):
+            break
 
     manifest["pruned_orphan_images"] = prune_unreferenced_images(account_root)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -817,6 +833,9 @@ def main() -> int:
     print(f"Wrote manifest -> {manifest_path}")
     if missing:
         print(f"Missing title terms: {', '.join(missing)}")
+    if browser_session is not None:
+        manifest["browser_cleanup"] = browser_session.close()
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 
 

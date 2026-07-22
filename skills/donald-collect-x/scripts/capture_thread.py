@@ -32,6 +32,10 @@ _BLOCK_MARKERS = {
     "something went wrong": "error_page",
     "try again": "error_page",
     "rate limit": "rate_limited",
+    "verify you are human": "captcha",
+    "prove you are human": "captcha",
+    "prove you're human": "captcha",
+    "captcha": "captcha",
 }
 _LOGIN_MARKERS = ("sign in to x", "log in", "create account", "sign up")
 _SESSION_MARKERS = ("notifications", "profile", "bookmarks", "home")
@@ -104,8 +108,9 @@ class AgentBrowser:
     `Network.*` CDP events; input is dispatched through the Input domain.
     """
 
-    def __init__(self, port: int = 9222) -> None:
+    def __init__(self, port: int = 9222, target_id: str = "") -> None:
         self.port = str(port)
+        self.target_id = target_id
         # Chrome exposes no "where is the mouse" query — the virtual cursor
         # position is whatever we last dispatched it to, tracked here so a
         # whole capture() session moves like one continuous hand instead of
@@ -120,6 +125,20 @@ class AgentBrowser:
         self._network_finished: set[str] = set()
 
     def _x_target(self) -> dict[str, Any]:
+        if self.target_id:
+            target = next(
+                (
+                    item
+                    for item in cdp_input.list_page_targets(int(self.port))
+                    if str(item.get("id") or "") == self.target_id
+                ),
+                None,
+            )
+            if target is None:
+                raise RuntimeError(
+                    f"Owned X page target {self.target_id} is unavailable on CDP port {self.port}"
+                )
+            return target
         target = cdp_input.find_page_target(int(self.port), "https://x.com/")
         if target is None:
             target = cdp_input.find_page_target(int(self.port), "https://twitter.com/")
@@ -151,11 +170,12 @@ class AgentBrowser:
 
     def open(self, url: str) -> None:
         self._reset_page_connection()
-        target = (
+        target = self._x_target() if self.target_id else (
             cdp_input.find_page_target(int(self.port), "https://x.com/")
             or cdp_input.find_page_target(int(self.port), "https://twitter.com/")
             or cdp_input.create_page_target(int(self.port), url)
         )
+        self.target_id = str(target.get("id") or self.target_id)
         self._page_conn = cdp_input.connect_to_target(target)
         self._page_conn.call("Page.enable")
         self._page_conn.call("Runtime.enable")
@@ -163,6 +183,9 @@ class AgentBrowser:
         self._page_conn.call("Page.navigate", {"url": url})
         time.sleep(4)
         self._drain_network_events(timeout=0.2)
+
+    def close(self) -> None:
+        self._reset_page_connection()
 
     def page_text(self) -> str:
         value = self._runtime_value("document.body.innerText.slice(0, 1200)")

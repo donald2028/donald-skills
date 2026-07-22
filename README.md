@@ -86,8 +86,8 @@ npx skills add donald2028/donald-skills -g
 ## 构建与版本同步
 
 `package.json` 是插件名称、版本、描述、作者、仓库地址和关键词的唯一维护入口。普通
-build 会把这些共享字段同步到所有 channel manifest 和 marketplace，并刷新 Claude/Codex
-runtime mirrors：
+build 会把这些共享字段同步到所有 channel manifest 和 marketplace，把 canonical 浏览器
+运行时 vendoring 到各浏览器业务 skill，并刷新 Claude/Codex runtime mirrors：
 
 ```bash
 npm run build
@@ -137,6 +137,14 @@ donald-skills/
 runner，由 runner 读取持久配置并完成本次真正需要的 Chrome/CDP 启动检查，不再重复调用配置
 skill、枚举 Profile 或先启动再关闭一次预检 Chrome。只有用户明确要求查看、换绑、重置，或者
 runner 返回配置类故障时，才再次调用 `donald-config-browser`。
+
+浏览器配置与浏览器运行时是两层能力。`donald-config-browser/scripts/profile_config.py` 和
+`browser_runtime.py` 是唯一 canonical 实现；`npm run build` 将它们逐字 vendoring 到 ChatGPT
+出图、X 采集和微信采集 skill，使选择性安装仍然自包含，同时避免手工复制产生行为漂移。业务
+runner 通过统一的 `BrowserSession` 启动 Chrome、认领本次 target、验证 agent-browser attach，
+并在 `finally` 中释放。普通结果关闭本次 target，最后一个活跃任务只关闭由 Donald 启动的
+Chrome；只有 `needs_ops` 明确保留页面并激活浏览器。attach 过程中新增的空白 target 也属于
+本次任务并会被清理，预先存在的用户页面不会被批量扫描或关闭。
 
 这个依赖写在 workflow 指令中，不依赖某个 Agent 专用的工具名；Claude Code、Codex 和其他兼容
 Agent Skills 的运行时都加载同一份正文。脚本、references 和 assets 仍保留在各自 skill 内，不

@@ -63,6 +63,38 @@ class ScopeRegistryTests(unittest.TestCase):
         self.assertEqual(binding[0], "donald-collect-linkedin")
         self.assertEqual(binding[1]["chrome"]["default_cdp_port"], 9345)
 
+    def test_migrates_known_legacy_scope_without_reselecting_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_root = Path(temporary)
+            legacy_path = config_root / "donald-collect-wechat-accounts.json"
+            legacy_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": profile_config.SCHEMA_VERSION,
+                        "scope": "donald-collect-wechat-accounts",
+                        "profile": {"directory": "Profile 22"},
+                        "chrome": {
+                            "source_user_data_dir": str(config_root / "Chrome"),
+                            "cdp_user_data_dir": str(config_root / "Chrome CDP" / "Profile 22"),
+                            "default_cdp_port": 9244,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {profile_config.CONFIG_ROOT_ENV: str(config_root)},
+            ):
+                migrated = profile_config.configured_browser(scope="donald-collect-wechat")
+                canonical_path = config_root / "donald-collect-wechat.json"
+                canonical_created = canonical_path.is_file()
+
+        self.assertEqual(migrated["scope"], "donald-collect-wechat")
+        self.assertEqual(migrated["profile"]["directory"], "Profile 22")
+        self.assertEqual(migrated["chrome"]["default_cdp_port"], 9244)
+        self.assertTrue(canonical_created)
+
 
 if __name__ == "__main__":
     unittest.main()

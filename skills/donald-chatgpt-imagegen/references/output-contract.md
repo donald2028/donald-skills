@@ -21,6 +21,9 @@ Skills application-state directory. They are not part of this user-facing output
 
 Session files record the conversation URL, reference mapping, attempts, resume state, and outputs.
 The run summary records request mode, variant results, image paths, and status.
+`chatgpt_progress.jsonl` records 20-second page-health heartbeats during generation so a run proves
+that it remained on the expected conversation and reports assistant error messages without waiting
+for the image timeout.
 
 Important terminal or recoverable states include:
 
@@ -29,4 +32,8 @@ Important terminal or recoverable states include:
   follow-up;
 - `policy_refused`: revise the prompt rather than retrying unchanged;
 - `timeout_no_images`: retain traces and session state for diagnosis or resume;
+- `generation_failed`: ChatGPT explicitly reported a generation-tool error; start a new request
+  instead of repeatedly collecting the failed conversation;
+- `download_failed`: ChatGPT produced candidates but the authenticated download stayed unavailable
+  after bounded retries; preserve the conversation and retry with `collect-current`;
 - login/challenge states: require operator action in the visible browser.
