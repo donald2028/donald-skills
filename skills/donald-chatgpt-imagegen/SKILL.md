@@ -119,8 +119,10 @@ conversation is unavailable or the user explicitly requests a fresh conversation
 
 During generation the runner records a structured page-health observation every 20 seconds in
 `chatgpt_progress.jsonl`: target-conversation continuity, composer/challenge state, message counts,
-and any recognized assistant generation error. It still checks more frequently between heartbeats.
-An explicit ChatGPT generation error ends the wait immediately with structured
+the compact latest-turn excerpt, and any recognized current-turn error text, visible error surface,
+or Retry control. Deep page-health inspection runs on that heartbeat, not on the shorter
+candidate-collection loop.
+An explicit ChatGPT generation error ends the wait at the next heartbeat with structured
 `generation_failed` and `recommended_next_action=submit_new_request`; it must not wait until the
 image timeout or surface a raw traceback.
 Generated-image downloads use the logged-in browser and retry transient failures four times. An

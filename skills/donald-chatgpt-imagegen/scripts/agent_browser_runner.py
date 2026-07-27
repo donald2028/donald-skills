@@ -75,8 +75,19 @@ GENERATION_FAILED_MARKERS = (
     "Image generation failed",
     "unable to generate the image because the image generation tool encountered an error",
     "image generation tool encountered an error",
+    "Something went wrong",
+    "Something is wrong",
+    "There was an error generating a response",
+    "Error generating response",
+    "Network error",
+    "Request timed out",
     "生成工具这次连续报错",
     "没有成功产出图片",
+    "出了点问题",
+    "出现错误",
+    "发生错误",
+    "网络错误",
+    "请求超时",
 )
 REFERENCE_UPLOAD_FAILED_MARKERS = (
     "Unable to upload",
@@ -1736,6 +1747,32 @@ JSON.stringify((() => {
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
+  const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
+  const latestTurn = turns.length ? turns[turns.length - 1] : (latest ? latest.closest("article,section") : null);
+  const belongsToCurrentTurn = (el) => {
+    const owner = el.closest('section[data-testid^="conversation-turn-"]');
+    return !owner || owner === latestTurn;
+  };
+  const labelParts = (el) => [
+    el.getAttribute("aria-label"),
+    el.getAttribute("title"),
+    el.innerText,
+    el.textContent,
+  ].filter(Boolean).map((value) => value.trim()).filter(Boolean);
+  const retryPattern = /^(try again|retry|再试一次|重试)$/i;
+  const retryControls = Array.from(document.querySelectorAll("button,[role='button'],a"))
+    .filter(visible)
+    .filter(belongsToCurrentTurn)
+    .filter((control) => labelParts(control).some((label) => retryPattern.test(label)));
+  const errorSurfaceTexts = Array.from(document.querySelectorAll(
+    '[role="alert"],[aria-live="assertive"],[data-testid*="error" i],[class*="toast" i]'
+  ))
+    .filter(visible)
+    .filter(belongsToCurrentTurn)
+    .map((el) => (el.innerText || el.textContent || "").trim())
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 8);
   const hasComposer = Array.from(document.querySelectorAll('[contenteditable="true"]')).some(visible);
   const challengeFrame = Array.from(document.querySelectorAll('iframe'))
     .some((frame) => /captcha|challenge|turnstile|verify/i.test(`${frame.src} ${frame.title}`));
@@ -1744,6 +1781,10 @@ JSON.stringify((() => {
     userMessageCount: document.querySelectorAll('[data-message-author-role="user"]').length,
     assistantMessageCount: assistants.length,
     latestAssistantMessage: latest ? (latest.innerText || latest.textContent || "") : "",
+    latestAssistantIsCurrent: Boolean(latest && (!latestTurn || latestTurn.contains(latest))),
+    latestTurnText: latestTurn ? (latestTurn.innerText || latestTurn.textContent || "") : "",
+    retryControlLabels: retryControls.map((control) => labelParts(control)[0] || "").filter(Boolean),
+    errorSurfaceTexts,
     hasComposer,
     challengeFrame,
   };
@@ -1754,8 +1795,32 @@ JSON.stringify((() => {
     current_url = str(observation.get("href") or "")
     current_id = _conversation_id_from_url(current_url)
     expected_id = _conversation_id_from_url(expected_conversation_url or "")
-    latest_assistant = str(observation.get("latestAssistantMessage") or "")
-    generation_error = _generation_error_from_text(latest_assistant) or _generation_error_from_text(page_text)
+    latest_assistant = (
+        str(observation.get("latestAssistantMessage") or "")
+        if observation.get("latestAssistantIsCurrent", True)
+        else ""
+    )
+    latest_turn = str(observation.get("latestTurnText") or "")
+    error_surface_texts = [
+        str(value)
+        for value in observation.get("errorSurfaceTexts") or []
+        if str(value).strip()
+    ]
+    retry_control_labels = [
+        str(value)
+        for value in observation.get("retryControlLabels") or []
+        if str(value).strip()
+    ]
+    scoped_error_text = "\n".join([latest_assistant, latest_turn, *error_surface_texts]).strip()
+    generation_error = _generation_error_from_text(scoped_error_text)
+    if not generation_error and retry_control_labels:
+        generation_error = {
+            "error_type": "chatgpt_generation_error",
+            "matched_marker": retry_control_labels[0],
+            "message": (scoped_error_text or retry_control_labels[0])[-800:],
+        }
+    if not generation_error and not scoped_error_text:
+        generation_error = _generation_error_from_text(page_text)
     conversation_ok = bool(
         current_id
         and (
@@ -1774,6 +1839,9 @@ JSON.stringify((() => {
         "user_message_count": max(0, int(observation.get("userMessageCount") or 0)),
         "assistant_message_count": max(0, int(observation.get("assistantMessageCount") or 0)),
         "generation_active": _is_busy(page_text),
+        "latest_turn_excerpt": latest_turn[-500:],
+        "retry_control_labels": retry_control_labels,
+        "error_surface_texts": error_surface_texts,
         **({"generation_error": generation_error} if generation_error else {}),
     }
 
@@ -2031,7 +2099,7 @@ def _click_try_again(args: argparse.Namespace, cwd: Path) -> bool:
     if _owned_tab_cdp_url(args):
         script = r"""
 (() => {
-  const labels = ["Try again", "重新生成", "再试一次"];
+  const labels = ["Try again", "Retry", "重新生成", "再试一次", "重试"];
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
@@ -2057,7 +2125,7 @@ def _click_try_again(args: argparse.Namespace, cwd: Path) -> bool:
             _wait_ms(args, cwd, 3000)
             return True
         return False
-    for label in ("Try again", "重新生成", "再试一次"):
+    for label in ("Try again", "Retry", "重新生成", "再试一次", "重试"):
         try:
             _call_agent(args, cwd, ["find", "text", label, "click"], timeout=120)
             _wait_ms(args, cwd, 3000)
@@ -3798,29 +3866,6 @@ def _collect_generated_images_with_retries(
             if conversation_guard.get("restored"):
                 conversation_restores.append(conversation_guard)
             page_text = _page_text(args, cwd)
-            detected_generation_error = _generation_error_from_text(page_text)
-            if detected_generation_error:
-                page_health = _generation_page_health(
-                    args,
-                    cwd,
-                    active_expected_conversation_url,
-                    page_text,
-                )
-                detected_generation_error = (
-                    page_health.get("generation_error") or detected_generation_error
-                )
-                _emit_progress(
-                    job,
-                    label=label,
-                    phase="generation_error",
-                    status="generation_failed",
-                    started_at=started_at,
-                    expected_count=expected_count,
-                    recognized_count=len(best_candidates),
-                    retry_index=retry_index,
-                    page_health=page_health,
-                )
-                break
             policy_refusal = _content_policy_refusal(page_text)
             if policy_refusal:
                 _emit_progress(
@@ -3865,7 +3910,6 @@ def _collect_generated_images_with_retries(
                 )
                 _screenshot(args, cwd, trace_dir / "05_policy_refused.png")
                 return result
-            visible_state = page_text
             rows = _image_inventory(args, cwd)
             candidates = _vertical_images(rows, baseline, baseline_user_message_count)
             if len(candidates) > len(best_candidates):
@@ -3884,6 +3928,19 @@ def _collect_generated_images_with_retries(
                     page_text,
                 )
                 detected_generation_error = page_health.get("generation_error")
+                if detected_generation_error:
+                    _emit_progress(
+                        job,
+                        label=label,
+                        phase="generation_error",
+                        status="generation_failed",
+                        started_at=started_at,
+                        expected_count=expected_count,
+                        recognized_count=len(best_candidates),
+                        retry_index=retry_index,
+                        page_health=page_health,
+                    )
+                    break
                 _emit_progress(
                     job,
                     label=label,
@@ -3896,10 +3953,6 @@ def _collect_generated_images_with_retries(
                     page_health=page_health,
                 )
                 next_progress_at = time.time() + progress_interval
-                if detected_generation_error:
-                    break
-            if _has_generation_failed(visible_state):
-                break
             button_state = _generation_button_state(args, cwd)
             generation_active = _generation_active_from_button_state(button_state)
             now = time.time()
@@ -4093,7 +4146,14 @@ def _collect_generated_images_with_retries(
         if conversation_guard.get("restored"):
             conversation_restores.append(conversation_guard)
         page_text = _page_text(args, cwd)
-        detected_generation_error = detected_generation_error or _generation_error_from_text(page_text)
+        if not detected_generation_error:
+            page_health = _generation_page_health(
+                args,
+                cwd,
+                active_expected_conversation_url,
+                page_text,
+            )
+            detected_generation_error = page_health.get("generation_error")
         policy_refusal = _content_policy_refusal(page_text)
         if policy_refusal:
             result = {
@@ -4127,7 +4187,7 @@ def _collect_generated_images_with_retries(
             )
             _screenshot(args, cwd, trace_dir / "05_policy_refused.png")
             return result
-        if best_candidates and not _has_generation_failed(page_text):
+        if best_candidates and not detected_generation_error:
             download_reason = (
                 "complete"
                 if len(best_candidates) >= expected_count

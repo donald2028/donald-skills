@@ -22,8 +22,10 @@ Skills application-state directory. They are not part of this user-facing output
 Session files record the conversation URL, reference mapping, attempts, resume state, and outputs.
 The run summary records request mode, variant results, image paths, and status.
 `chatgpt_progress.jsonl` records 20-second page-health heartbeats during generation so a run proves
-that it remained on the expected conversation and reports assistant error messages without waiting
-for the image timeout.
+that it remained on the expected conversation and reports a compact latest-turn excerpt,
+current-turn error text, visible error surfaces, and Retry controls without waiting for the image
+timeout. Deep page-health inspection is performed on the heartbeat rather than the shorter
+candidate-collection loop.
 
 Important terminal or recoverable states include:
 
