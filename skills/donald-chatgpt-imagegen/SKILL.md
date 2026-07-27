@@ -125,6 +125,10 @@ candidate-collection loop.
 An explicit ChatGPT generation error ends the wait at the next heartbeat with structured
 `generation_failed` and `recommended_next_action=submit_new_request`; it must not wait until the
 image timeout or surface a raw traceback.
+If the expected conversation URL remains open but the submitted user turn is missing for two
+consecutive heartbeats, the runner reports `generation_failed` with
+`error_type=chatgpt_submitted_turn_missing`. This covers blank, unrecoverable conversation shells
+without treating a single slow page render as terminal.
 Generated-image downloads use the logged-in browser and retry transient failures four times. An
 authenticated ChatGPT URL must not fall back to an unauthenticated HTTP request. If all attempts
 fail, preserve the conversation and candidates and return structured `download_failed` with

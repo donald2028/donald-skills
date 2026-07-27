@@ -14,7 +14,88 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import agent_browser_runner as runner  # noqa: E402
 
 
+class Clock:
+    now = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class GenerationHealthTests(unittest.TestCase):
+    def _run_generation_wait(
+        self,
+        page_health_states: list[dict[str, object]],
+    ) -> tuple[dict[str, object], int, float]:
+        clock = Clock()
+        args = argparse.Namespace(
+            timeout=60,
+            progress_interval=20,
+            stale_generation_refresh_interval=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {
+                "job_name": "health-check",
+                "download_dir": temporary,
+                "variant_count": 1,
+            }
+            with (
+                mock.patch.object(runner.time, "time", side_effect=clock.time),
+                mock.patch.object(runner.time, "sleep", side_effect=clock.sleep),
+                mock.patch.object(
+                    runner,
+                    "_ensure_expected_conversation",
+                    return_value={
+                        "current_url": "https://chatgpt.com/c/test",
+                        "restored": False,
+                    },
+                ),
+                mock.patch.object(
+                    runner,
+                    "_persist_canonical_conversation",
+                    return_value="https://chatgpt.com/c/test",
+                ),
+                mock.patch.object(runner, "_page_text", return_value=""),
+                mock.patch.object(
+                    runner,
+                    "_generation_page_health",
+                    side_effect=page_health_states,
+                ) as health_check,
+                mock.patch.object(runner, "_image_inventory", return_value=[]),
+                mock.patch.object(
+                    runner,
+                    "_generation_button_state",
+                    return_value={
+                        "checked": True,
+                        "generationActive": True,
+                        "readyForNextPrompt": False,
+                    },
+                ),
+                mock.patch.object(runner, "_scroll_down"),
+                mock.patch.object(runner, "_emit_progress"),
+                mock.patch.object(runner, "_write_session_patch"),
+                mock.patch.object(runner, "_screenshot"),
+            ):
+                result = runner._collect_generated_images_with_retries(
+                    args,
+                    job,
+                    Path.cwd(),
+                    Path(temporary),
+                    set(),
+                    [],
+                    label="batch",
+                    mode="single_batch_submit",
+                    resumed=False,
+                    max_failure_retries=0,
+                    expected_conversation_url="https://chatgpt.com/c/test",
+                    baseline_user_message_count=0,
+                )
+
+        return result, health_check.call_count, clock.now
+
     def test_recognizes_visible_something_went_wrong_error(self) -> None:
         error = runner._generation_error_from_text(
             "Something went wrong while generating your response."
@@ -128,17 +209,43 @@ class GenerationHealthTests(unittest.TestCase):
         self.assertIn('"Retry"', script)
         self.assertIn('"重试"', script)
 
+    def test_missing_submitted_turn_fails_after_two_heartbeats(self) -> None:
+        first_health = {
+            "conversation_ok": True,
+            "has_composer": True,
+            "challenge_frame": False,
+            "user_message_count": 0,
+        }
+        second_health = dict(first_health)
+
+        first_error = runner._missing_submitted_turn_error(
+            first_health,
+            baseline_user_message_count=0,
+            candidate_count=0,
+            consecutive_heartbeats=1,
+        )
+        second_error = runner._missing_submitted_turn_error(
+            second_health,
+            baseline_user_message_count=0,
+            candidate_count=0,
+            consecutive_heartbeats=2,
+        )
+        present_health = {**first_health, "user_message_count": 1}
+        present_error = runner._missing_submitted_turn_error(
+            present_health,
+            baseline_user_message_count=0,
+            candidate_count=0,
+            consecutive_heartbeats=2,
+        )
+
+        self.assertIsNone(first_error)
+        self.assertEqual(second_error["error_type"], "chatgpt_submitted_turn_missing")
+        self.assertFalse(second_health["submitted_turn_present"])
+        self.assertEqual(second_health["expected_minimum_user_message_count"], 1)
+        self.assertIsNone(present_error)
+        self.assertTrue(present_health["submitted_turn_present"])
+
     def test_generation_wait_checks_retry_health_on_progress_heartbeat(self) -> None:
-        class Clock:
-            now = 0.0
-
-            def time(self) -> float:
-                return self.now
-
-            def sleep(self, seconds: float) -> None:
-                self.now += seconds
-
-        clock = Clock()
         healthy = {
             "status": "ok",
             "conversation_ok": True,
@@ -155,74 +262,37 @@ class GenerationHealthTests(unittest.TestCase):
                 "message": "Retry",
             },
         }
-        args = argparse.Namespace(
-            timeout=60,
-            progress_interval=20,
-            stale_generation_refresh_interval=0,
+        result, health_check_count, elapsed = self._run_generation_wait(
+            [healthy, retry_error]
         )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            job = {
-                "job_name": "health-check",
-                "download_dir": temporary,
-                "variant_count": 1,
-            }
-            with (
-                mock.patch.object(runner.time, "time", side_effect=clock.time),
-                mock.patch.object(runner.time, "sleep", side_effect=clock.sleep),
-                mock.patch.object(
-                    runner,
-                    "_ensure_expected_conversation",
-                    return_value={
-                        "current_url": "https://chatgpt.com/c/test",
-                        "restored": False,
-                    },
-                ),
-                mock.patch.object(
-                    runner,
-                    "_persist_canonical_conversation",
-                    return_value="https://chatgpt.com/c/test",
-                ),
-                mock.patch.object(runner, "_page_text", return_value=""),
-                mock.patch.object(
-                    runner,
-                    "_generation_page_health",
-                    side_effect=[healthy, retry_error],
-                ) as health_check,
-                mock.patch.object(runner, "_image_inventory", return_value=[]),
-                mock.patch.object(
-                    runner,
-                    "_generation_button_state",
-                    return_value={
-                        "checked": True,
-                        "generationActive": True,
-                        "readyForNextPrompt": False,
-                    },
-                ),
-                mock.patch.object(runner, "_scroll_down"),
-                mock.patch.object(runner, "_emit_progress"),
-                mock.patch.object(runner, "_write_session_patch"),
-                mock.patch.object(runner, "_screenshot"),
-            ):
-                result = runner._collect_generated_images_with_retries(
-                    args,
-                    job,
-                    Path.cwd(),
-                    Path(temporary),
-                    set(),
-                    [],
-                    label="batch",
-                    mode="single_batch_submit",
-                    resumed=False,
-                    max_failure_retries=0,
-                    expected_conversation_url="https://chatgpt.com/c/test",
-                    baseline_user_message_count=0,
-                )
 
         self.assertEqual(result["status"], "generation_failed")
         self.assertEqual(result["generation_error"]["matched_marker"], "Retry")
-        self.assertEqual(health_check.call_count, 2)
-        self.assertEqual(clock.now, 20.0)
+        self.assertEqual(health_check_count, 2)
+        self.assertEqual(elapsed, 20.0)
+
+    def test_generation_wait_stops_when_submitted_turn_disappears(self) -> None:
+        empty_conversation = {
+            "status": "ok",
+            "conversation_ok": True,
+            "has_composer": True,
+            "challenge_frame": False,
+            "user_message_count": 0,
+            "generation_active": False,
+        }
+
+        result, health_check_count, elapsed = self._run_generation_wait(
+            [dict(empty_conversation), dict(empty_conversation)]
+        )
+
+        self.assertEqual(result["status"], "generation_failed")
+        self.assertEqual(result["error_type"], "chatgpt_submitted_turn_missing")
+        self.assertEqual(
+            result["generation_error"]["matched_marker"],
+            "submitted_turn_missing",
+        )
+        self.assertEqual(health_check_count, 2)
+        self.assertEqual(elapsed, 20.0)
 
 
 if __name__ == "__main__":

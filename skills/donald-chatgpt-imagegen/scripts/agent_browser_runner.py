@@ -110,6 +110,7 @@ POLICY_REFUSAL_MARKERS = (
 MAX_TIMING_SAMPLES = 50
 MAX_AGENT_BROWSER_TRANSPORT_SESSION_LENGTH = 40
 DEFAULT_STALE_GENERATION_REFRESH_SECONDS = 180
+MISSING_SUBMITTED_TURN_HEARTBEATS = 2
 DEFAULT_SUBMIT_THROTTLE_MIN_INTERVAL_SECONDS = 90
 DEFAULT_SUBMIT_THROTTLE_MAX_SUBMITS_PER_HOUR = 40
 DEFAULT_SUBMIT_THROTTLE_MAX_EXPECTED_IMAGES_PER_HOUR = 0
@@ -1843,6 +1844,45 @@ JSON.stringify((() => {
         "retry_control_labels": retry_control_labels,
         "error_surface_texts": error_surface_texts,
         **({"generation_error": generation_error} if generation_error else {}),
+    }
+
+
+def _missing_submitted_turn_error(
+    page_health: dict[str, Any],
+    *,
+    baseline_user_message_count: int | None,
+    candidate_count: int,
+    consecutive_heartbeats: int,
+) -> dict[str, str] | None:
+    expected_minimum = max(1, int(baseline_user_message_count or 0) + 1)
+    actual_count = max(0, int(page_health.get("user_message_count") or 0))
+    submitted_turn_present = actual_count >= expected_minimum
+    missing = bool(
+        page_health.get("conversation_ok")
+        and page_health.get("has_composer")
+        and not page_health.get("challenge_frame")
+        and not page_health.get("generation_active")
+        and candidate_count == 0
+        and not submitted_turn_present
+    )
+    page_health.update(
+        {
+            "expected_minimum_user_message_count": expected_minimum,
+            "submitted_turn_present": submitted_turn_present,
+            "submitted_turn_missing": missing,
+            "missing_submitted_turn_heartbeats": consecutive_heartbeats if missing else 0,
+        }
+    )
+    if not missing or consecutive_heartbeats < MISSING_SUBMITTED_TURN_HEARTBEATS:
+        return None
+    return {
+        "error_type": "chatgpt_submitted_turn_missing",
+        "matched_marker": "submitted_turn_missing",
+        "message": (
+            "The submitted ChatGPT turn disappeared from the expected conversation: "
+            f"expected at least {expected_minimum} user message(s), found {actual_count} "
+            f"for {consecutive_heartbeats} consecutive page-health heartbeats."
+        ),
     }
 
 
@@ -3849,6 +3889,7 @@ def _collect_generated_images_with_retries(
         last_candidate_growth_at: float | None = None
         last_generation_refresh_at: float | None = None
         best_candidate_count = 0
+        missing_submitted_turn_heartbeats = 0
         detected_generation_error: dict[str, str] | None = None
         while time.time() < deadline:
             conversation_guard = _ensure_expected_conversation(
@@ -3927,8 +3968,22 @@ def _collect_generated_images_with_retries(
                     active_expected_conversation_url,
                     page_text,
                 )
-                detected_generation_error = page_health.get("generation_error")
+                next_missing_heartbeat = missing_submitted_turn_heartbeats + 1
+                missing_turn_error = _missing_submitted_turn_error(
+                    page_health,
+                    baseline_user_message_count=baseline_user_message_count,
+                    candidate_count=len(candidates),
+                    consecutive_heartbeats=next_missing_heartbeat,
+                )
+                missing_submitted_turn_heartbeats = (
+                    next_missing_heartbeat if page_health["submitted_turn_missing"] else 0
+                )
+                detected_generation_error = (
+                    page_health.get("generation_error") or missing_turn_error
+                )
                 if detected_generation_error:
+                    page_health["status"] = "generation_error"
+                    page_health["generation_error"] = detected_generation_error
                     _emit_progress(
                         job,
                         label=label,
@@ -4312,7 +4367,9 @@ def _collect_generated_images_with_retries(
         if not retry_available or not _click_try_again(args, cwd):
             result = {
                 "status": "generation_failed",
-                "error_type": "chatgpt_generation_error",
+                "error_type": detected_generation_error.get(
+                    "error_type", "chatgpt_generation_error"
+                ),
                 "retryable": True,
                 "terminal": True,
                 "recommended_next_action": "submit_new_request",

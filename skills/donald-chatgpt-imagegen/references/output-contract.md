@@ -35,7 +35,9 @@ Important terminal or recoverable states include:
 - `policy_refused`: revise the prompt rather than retrying unchanged;
 - `timeout_no_images`: retain traces and session state for diagnosis or resume;
 - `generation_failed`: ChatGPT explicitly reported a generation-tool error; start a new request
-  instead of repeatedly collecting the failed conversation;
+  instead of repeatedly collecting the failed conversation. This also includes
+  `error_type=chatgpt_submitted_turn_missing` when the expected conversation remains blank across
+  two consecutive heartbeats after submission;
 - `download_failed`: ChatGPT produced candidates but the authenticated download stayed unavailable
   after bounded retries; preserve the conversation and retry with `collect-current`;
 - login/challenge states: require operator action in the visible browser.
