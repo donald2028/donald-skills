@@ -116,6 +116,18 @@ DEFAULT_SUBMIT_THROTTLE_MAX_SUBMITS_PER_HOUR = 40
 DEFAULT_SUBMIT_THROTTLE_MAX_EXPECTED_IMAGES_PER_HOUR = 0
 SUBMIT_THROTTLE_WINDOW_SECONDS = 3600
 SUBMIT_THROTTLE_LOCK_STALE_SECONDS = 300
+ROUTINE_TRACE_SCREENSHOT_NAMES = frozenset(
+    {
+        "01_open.png",
+        "01_resumed.png",
+        "01_conversation_followup.png",
+        "01_current_page.png",
+        "02_after_upload.png",
+        "03_after_prompt.png",
+        "04_after_submit.png",
+        "05_after_generated.png",
+    }
+)
 _WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 REFERENCE_LINE_RE = re.compile(r"^\s*(\d+)\.\s+`([^`]+)`\s*$", re.MULTILINE)
 SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
@@ -4429,6 +4441,112 @@ def _report_path_for_label(trace_dir: Path, label: int | str) -> Path:
     return trace_dir / f"{_variant_prefix(label)}_submit_report.json"
 
 
+def _fully_downloaded(result: dict[str, Any]) -> bool:
+    try:
+        image_count = int(result.get("image_count") or 0)
+        expected_count = int(result.get("expected_image_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        result.get("status") == "downloaded"
+        and expected_count > 0
+        and image_count >= expected_count
+    )
+
+
+def _prune_success_trace_screenshots(
+    job: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    mode: str,
+    start_variant: int,
+    end_variant: int | None,
+    keep_success_trace_screenshots: bool,
+) -> dict[str, Any]:
+    retention = {
+        "policy": (
+            "all"
+            if keep_success_trace_screenshots or mode == "dry-upload"
+            else "failures_only"
+        ),
+        "removed_count": 0,
+        "reclaimed_bytes": 0,
+        "preserved_failure_screenshots": True,
+    }
+    if keep_success_trace_screenshots or mode == "dry-upload":
+        return retention
+
+    output_dir = Path(job["download_dir"]).resolve()
+    successful_trace_dirs: set[Path] = set()
+    if mode == "collect-current":
+        if _fully_downloaded(report) and report.get("trace_dir"):
+            successful_trace_dirs.add(Path(str(report["trace_dir"])).resolve())
+    else:
+        request_mode = job.get("request_mode") or "independent_variants"
+        if request_mode == "independent_variants" and mode == "single-batch-submit":
+            last_variant = min(
+                int(end_variant or job.get("variant_count") or 1),
+                int(job.get("variant_count") or 1),
+            )
+            executed_labels: set[int | str] = set(
+                range(max(1, int(start_variant)), last_variant + 1)
+            )
+        else:
+            executed_labels = {"batch"}
+        for variant in report.get("variants") or []:
+            label = variant.get("variant_index")
+            if label not in executed_labels:
+                try:
+                    label = int(label)
+                except (TypeError, ValueError):
+                    pass
+            downloaded = variant.get("downloaded") or {}
+            if label not in executed_labels or not _fully_downloaded(downloaded):
+                continue
+            report_path = str(variant.get("report_path") or "")
+            trace_dir = (
+                Path(report_path).resolve().parent
+                if report_path
+                else _trace_dir_for_label(job, label).resolve()
+            )
+            successful_trace_dirs.add(trace_dir)
+
+    for trace_dir in successful_trace_dirs:
+        try:
+            trace_dir.relative_to(output_dir)
+        except ValueError:
+            continue
+        if not trace_dir.name.startswith("agent_browser_trace"):
+            continue
+        for name in ROUTINE_TRACE_SCREENSHOT_NAMES:
+            screenshot = trace_dir / name
+            try:
+                if not screenshot.is_file():
+                    continue
+                stat = screenshot.stat()
+                screenshot.unlink()
+            except OSError:
+                continue
+            retention["removed_count"] += 1
+            retention["reclaimed_bytes"] += getattr(stat, "st_blocks", 0) * 512
+    return retention
+
+
+def _persist_trace_retention(report: dict[str, Any], retention: dict[str, Any]) -> None:
+    report["trace_retention"] = retention
+    artifact_paths = {
+        str(report.get("summary_path") or ""),
+        str(report.get("report_path") or ""),
+    }
+    for artifact_path in artifact_paths - {""}:
+        path = Path(artifact_path)
+        artifact = _read_json_if_exists(path)
+        if artifact is None:
+            continue
+        artifact["trace_retention"] = retention
+        path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _write_summary(
     job: dict[str, Any],
     *,
@@ -5437,6 +5555,15 @@ def main() -> int:
     parser.add_argument("--end-variant", type=int)
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing session URLs and start fresh conversations.")
     parser.add_argument("--max-failure-retries", type=int, default=2)
+    parser.add_argument(
+        "--keep-success-trace-screenshots",
+        action="store_true",
+        help=(
+            "Keep routine browser screenshots after a fully downloaded result. By default, "
+            "successful runs retain reports and state but remove routine screenshots; failure "
+            "screenshots are always preserved."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -5509,6 +5636,16 @@ def main() -> int:
         exit_code = 2
     finally:
         _cleanup_agent_browser(args, cwd)
+    if report is not None:
+        retention = _prune_success_trace_screenshots(
+            job,
+            report,
+            mode=args.mode,
+            start_variant=args.start_variant,
+            end_variant=args.end_variant,
+            keep_success_trace_screenshots=args.keep_success_trace_screenshots,
+        )
+        _persist_trace_retention(report, retention)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return exit_code
 

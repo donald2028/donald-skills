@@ -34,6 +34,11 @@ class FocusSafetyTests(unittest.TestCase):
         self.assertEqual(command[:2], ["open", "-g"])
         self.assertNotIn("-j", command)
 
+    def test_launch_disables_the_unused_multi_gigabyte_on_device_model(self) -> None:
+        command = profile_config.chrome_launch_command(_config(), 9244)
+
+        self.assertIn("--disable-features=OptimizationGuideOnDeviceModel", command)
+
     def test_reveal_defocuses_chrome_before_visibility_changes_and_restores_conditionally(self) -> None:
         completed = subprocess.CompletedProcess(args=["osascript"], returncode=0, stdout="111\n")
         with (

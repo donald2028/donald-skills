@@ -9,7 +9,7 @@ A prepared and executed job uses:
 ├── variant_XX_chatgpt_session.json         # independent-variant sessions
 ├── chatgpt_web_run_summary.json
 ├── chatgpt_progress.jsonl
-├── agent_browser_trace*/                   # screenshots and reports
+├── agent_browser_trace*/                   # reports plus retained diagnostic screenshots
 └── *.png                                   # generated candidates
 ```
 
@@ -26,6 +26,14 @@ that it remained on the expected conversation and reports a compact latest-turn 
 current-turn error text, visible error surfaces, and Retry controls without waiting for the image
 timeout. Deep page-health inspection is performed on the heartbeat rather than the shorter
 candidate-collection loop.
+
+Routine browser checkpoints are temporary diagnostics. After a request reaches fully
+`downloaded`, the runner removes its routine trace screenshots and records
+`trace_retention.policy=failures_only` plus the removed count and reclaimed bytes in the run
+summary. Trace reports, session state, progress logs, generated PNGs, and failure-specific
+screenshots remain. Pass `--keep-success-trace-screenshots` for an explicit debugging run that
+must retain every checkpoint. Partial, failed, timed-out, login, and verification outcomes never
+trigger successful-trace cleanup.
 
 Important terminal or recoverable states include:
 

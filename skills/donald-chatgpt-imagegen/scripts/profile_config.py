@@ -970,6 +970,7 @@ def chrome_launch_command(config: dict[str, Any], port: int, url: str = "about:b
         "--no-first-run",
         "--no-default-browser-check",
         "--no-startup-window",
+        "--disable-features=OptimizationGuideOnDeviceModel",
     ]
     executable = str(chrome["executable"])
     if sys.platform == "darwin" and executable == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome":

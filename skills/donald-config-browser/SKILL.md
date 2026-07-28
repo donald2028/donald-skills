@@ -32,7 +32,10 @@ Keep bindings separate from browser state:
 - Runtime browser data: `~/Library/Application Support/Donald Skills/Chrome CDP/` on macOS,
   `%LOCALAPPDATA%\Donald Skills\Chrome CDP\` on Windows, and
   `${XDG_DATA_HOME:-~/.local/share}/donald-skills/chrome-cdp/` on Linux, with one directory per
-  Chrome Profile.
+  Chrome Profile. Donald launches these automation-only Profiles with Chrome's on-device
+  Optimization Guide model disabled because browser-side generative AI is not part of these
+  workflows; this prevents a multi-gigabyte model from being downloaded separately into every
+  Profile. Existing model caches are not deleted automatically.
 - Cross-skill lifecycle state: `~/Library/Application Support/Donald Skills/state/agent-browser/`
   on macOS, `%LOCALAPPDATA%\Donald Skills\state\agent-browser\` on Windows, and
   `${XDG_STATE_HOME:-~/.local/state}/donald-skills/agent-browser/` on Linux. Set
@@ -188,7 +191,8 @@ The preflight follows this exact sequence:
 
 1. Start real Chrome with `--remote-debugging-address=127.0.0.1`,
    `--remote-debugging-port`, `--user-data-dir`, `--profile-directory`, and
-   `--no-startup-window`. Do not add `--headless` unless the user explicitly requests it.
+   `--no-startup-window`, with `OptimizationGuideOnDeviceModel` disabled. Do not add `--headless`
+   unless the user explicitly requests it.
 2. Wait for `http://127.0.0.1:<port>/json/version`.
 3. Create the page through browser-level CDP with `Target.createTarget({background: true})`.
 4. Run `agent-browser --session <name> --cdp <port> get url` to prove agent-browser control.

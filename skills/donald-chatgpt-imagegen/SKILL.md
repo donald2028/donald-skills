@@ -129,6 +129,10 @@ If the expected conversation URL remains open but the submitted user turn is mis
 consecutive heartbeats, the runner reports `generation_failed` with
 `error_type=chatgpt_submitted_turn_missing`. This covers blank, unrecoverable conversation shells
 without treating a single slow page render as terminal.
+After a request is fully downloaded, routine browser checkpoint screenshots are removed by default
+while reports, session state, progress logs, generated PNGs, and failure-specific screenshots stay
+in place. Pass `--keep-success-trace-screenshots` only when a debugging run needs every successful
+checkpoint. Partial, failed, timed-out, login, and verification outcomes retain their screenshots.
 Generated-image downloads use the logged-in browser and retry transient failures four times. An
 authenticated ChatGPT URL must not fall back to an unauthenticated HTTP request. If all attempts
 fail, preserve the conversation and candidates and return structured `download_failed` with
@@ -153,7 +157,7 @@ prompt in the same conversation, prepare a separate `single_batch` job with
 - Confirm the requested candidate count and inspect every PNG.
 - Validate `chatgpt_web_run_summary.json`, session JSON, conversation URL, and trace reports.
 - Report `partial_downloaded`, `policy_refused`, timeout, or login-required states honestly.
-- Keep recoverable artifacts until the caller accepts the outputs; remove them only when the user
-  no longer needs resume or audit evidence.
+- Keep session state, progress logs, reports, and failure-specific screenshots until the caller
+  accepts the outputs; remove them only when the user no longer needs resume or audit evidence.
 
 See `references/output-contract.md` for the artifact layout and status semantics.
