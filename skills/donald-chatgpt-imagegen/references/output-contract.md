@@ -13,8 +13,9 @@ A prepared and executed job uses:
 └── *.png                                   # generated candidates
 ```
 
-`DONALD_SKILLS_OUTPUT_ROOT` replaces `<system Documents>/Donald Skills/Data`; command-level
-`--output-root` replaces the ChatGPT image root itself and has higher precedence.
+The persistent shared output setting replaces `<system Documents>/Donald Skills/Data`.
+`DONALD_SKILLS_OUTPUT_ROOT` remains a process-level compatibility override; command-level
+`--output-root` replaces the ChatGPT image root itself and has the highest precedence.
 
 CDP locks, submit-throttle counters, and timing metrics are stored in the platform-native Donald
 Skills application-state directory. They are not part of this user-facing output contract.

@@ -56,6 +56,9 @@ asks for them. Prefer the smallest structure that satisfies the current request.
 - `package.json` is the only hand-maintained source for shared plugin metadata and version. Run
   `npm run build` to project those fields into every committed channel manifest; preserve
   platform-specific fields such as `interface` in their native manifest.
+- Persistent configuration files must share the platform-native Donald Skills config root.
+  Output-producing skills must remain independently installable, resolve either a user-persisted
+  shared output root or the system Documents default, and carry their own required path resolver.
 - `.claude-plugin/` and `.codex-plugin/` describe the same aggregate plugin. Their shared metadata
   is generated from `package.json`.
 - `.cursor-plugin/plugin.json` and `.kimi-plugin/plugin.json` expose the same aggregate `skills/`

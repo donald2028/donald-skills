@@ -64,9 +64,11 @@ limits, or challenges. Return `needs_ops` when the visible session needs human a
 ## Collect An Account
 
 By default, account and post outputs are written under the system Documents folder at
-`Donald Skills/Data/x/`. Set `DONALD_SKILLS_OUTPUT_ROOT` to change the shared Data root for all
-Donald tools, or pass `--output-root <path>` to replace the X root for one command. The CLI override
-wins over the environment setting. `--output-root` must be the collection root, never
+`Donald Skills/Data/x/`. Persist a user-defined shared Data root with
+`python3 "$SKILL_DIR/scripts/output_paths.py" set "<shared-output-root>"`; use `show` or `reset` to
+inspect or remove it. This setting applies to all Donald output skills. `DONALD_SKILLS_OUTPUT_ROOT`
+remains a process-level compatibility override. Pass `--output-root <path>` to replace the X root
+for one command; it has the highest precedence. `--output-root` must be the collection root, never
 `<root>/<handle>` or `<root>/<handle>/_user`; account output is always canonicalized to
 `<output-root>/<handle>/_user/`. The collector rejects a handle/user directory before opening the
 browser and every result reports both `output_root` and `canonical_user_dir`. Never default to the

@@ -2,7 +2,9 @@
 
 Donald 常用 Agent Skills 的统一仓库，面向 Claude Code、Codex、Cursor、Gemini CLI、Kimi Code、OpenCode 和兼容 Agent Skills 规范的运行时。
 
-当前版本包含仓库维护、安全 Git 提交、GitHub 仓库调研、按工具独立绑定且按 Profile 共享登录状态的浏览器配置，以及微信公众号采集、X 内容采集和 ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发现并安装 `skills/<name>/SKILL.md` 中的内容。
+当前版本包含仓库维护、安全 Git 提交、统一存储约定、GitHub 仓库调研、按工具独立绑定且按
+Profile 共享登录状态的浏览器配置，以及微信公众号采集、X 内容采集和 ChatGPT Web 外部出图等
+通用 skill。下面的安装入口可以直接发现并安装 `skills/<name>/SKILL.md` 中的内容。
 
 当前工具 skills：
 
@@ -13,14 +15,19 @@ Donald 常用 Agent Skills 的统一仓库，面向 Claude Code、Codex、Cursor
 - `donald-collect-x`：采集 X 账号帖子、thread、Article 和媒体。
 - `donald-chatgpt-imagegen`：通过可恢复的 ChatGPT Web 浏览器任务外部出图。
 
-采集和出图结果默认保存在系统“文档”目录的 `Donald Skills/Data/` 下，不写入源码仓库或
-当前工作目录。可以用全局环境变量 `DONALD_SKILLS_OUTPUT_ROOT` 改写共享 Data 根目录，
-也可以在单次命令中传 `--output-root`；单次命令优先。Chrome Profile 绑定配置和 Cookie
-运行数据分别保存在系统原生应用配置、应用数据目录，不与用户内容混放。
+GitHub、采集和出图结果默认保存在系统“文档”目录的 `Donald Skills/Data/` 下，不写入源码
+仓库或当前工作目录。用户也可以把共享输出根目录一次写入统一配置根下的 `storage.json`；
+GitHub、X、微信和 ChatGPT 出图分别在其下使用 `github-research/`、`x/`、`wechat/` 和
+`chatgpt-images/`。单次命令仍可用 `--output-root` 指定精确工具目录，优先级最高。
+`DONALD_SKILLS_OUTPUT_ROOT` 和 `DONALD_GITHUB_RESEARCH_ROOT` 仅保留为进程级兼容覆盖，
+正常持久配置不需要修改 `.zshrc`。
 
-GitHub 调研优先使用当前请求指定的目录或 `DONALD_GITHUB_RESEARCH_ROOT`。如果两者都未
-提供，skill 会在获取仓库前提醒用户配置全局调研根目录；用户跳过时，本次使用系统
-“文档”目录下的 `Donald Skills/Data/github-research/<owner>/<repo>/`。
+所有配置文件共享同一个系统原生根目录：macOS 为
+`~/Library/Application Support/Donald Skills/config/`，Windows 为
+`%LOCALAPPDATA%\Donald Skills\config\`，Linux 为
+`${XDG_CONFIG_HOME:-~/.config}/donald-skills/`。`storage.json` 保存共享输出根；
+`agent-browser/<skill-name>.json` 保存浏览器 Profile 绑定。Cookie、锁、运行状态和用户产物
+分别留在应用数据、状态和 Documents/自定义输出目录，不与配置混放。
 
 ## 安装
 
@@ -145,6 +152,10 @@ runner 通过统一的 `BrowserSession` 启动 Chrome、认领本次 target、�
 并在 `finally` 中释放。普通结果关闭本次 target，最后一个活跃任务只关闭由 Donald 启动的
 Chrome；只有 `needs_ops` 明确保留页面并激活浏览器。attach 过程中新增的空白 target 也属于
 本次任务并会被清理，预先存在的用户页面不会被批量扫描或关闭。
+
+GitHub、X、微信和 ChatGPT 出图 skill 各自携带自包含的 `scripts/output_paths.py`，不依赖额外
+配置 skill，因此可以独立安装。四个 workflow 使用相同的“单次覆盖 → 兼容环境变量 → 持久配置
+→ Documents 默认值”规则，并把持久配置写入同一个系统原生 config 根。
 
 这个依赖写在 workflow 指令中，不依赖某个 Agent 专用的工具名；Claude Code、Codex 和其他兼容
 Agent Skills 的运行时都加载同一份正文。脚本、references 和 assets 仍保留在各自 skill 内，不

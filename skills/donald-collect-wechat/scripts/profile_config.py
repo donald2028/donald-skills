@@ -26,6 +26,7 @@ from typing import Any, Mapping
 
 SCHEMA_VERSION = 3
 CONFIG_ROOT_ENV = "DONALD_AGENT_BROWSER_CONFIG_DIR"
+SHARED_CONFIG_ROOT_ENV = "DONALD_SKILLS_CONFIG_ROOT"
 CONFIG_DIRECTORY = "Donald Skills"
 CONFIG_SUBDIRECTORY = "agent-browser"
 SCOPE_CONFIGS = {
@@ -95,6 +96,13 @@ def default_config_path(
     override = environment.get(CONFIG_ROOT_ENV)
     if override:
         return Path(override).expanduser() / f"{resolved_scope}.json"
+    shared_root = environment.get(SHARED_CONFIG_ROOT_ENV)
+    if shared_root:
+        return (
+            Path(shared_root).expanduser()
+            / CONFIG_SUBDIRECTORY
+            / f"{resolved_scope}.json"
+        )
 
     platform_value = sys.platform if platform_name is None else platform_name
     home_value = Path.home() if home is None else home

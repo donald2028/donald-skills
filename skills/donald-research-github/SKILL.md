@@ -11,33 +11,51 @@ explicitly provides an exact destination.
 
 ## Resolve The Destination
 
-Choose the research root in this order:
+Resolve `SKILL_DIR` to the directory containing this `SKILL.md`. If the current request names an
+exact destination, use it without changing the shared output setting. If it names a research root,
+pass that exact root as the one-operation override:
 
-1. Use the directory or exact destination stated in the current request.
-2. Otherwise inspect `DONALD_GITHUB_RESEARCH_ROOT`. When it is set and non-empty, use it as the
-   exact research root.
-3. When it is unset or empty, stop before cloning and tell the user that no global GitHub research
-   root is configured. Ask whether they want to configure one or skip configuration.
-4. If the user skips, use `<system Documents>/Donald Skills/Data/github-research` for this
-   operation.
+```bash
+python3 "$SKILL_DIR/scripts/output_paths.py" resolve github-research --root "<research-root>"
+```
 
-When the user chooses to configure a global root, ask for the directory, expand it to an absolute
-path, and show the exact value that will be assigned to `DONALD_GITHUB_RESEARCH_ROOT`. Explain that
-changing only the current process is not persistent. Before editing a shell startup file or an
-operating-system environment setting, show the exact target and change and obtain explicit
-approval. Update only this variable and do not rewrite unrelated configuration.
+Otherwise resolve the effective root without prompting:
 
-Treat skipping as a one-operation choice: do not set the environment variable and do not create a
-hidden marker file. Ask again on a later operation if the variable is still unconfigured.
+```bash
+python3 "$SKILL_DIR/scripts/output_paths.py" resolve github-research
+```
 
-Resolve the operating system's real Documents directory instead of assuming a particular home
-path. On Linux, honor the configured XDG Documents directory; on Windows, honor the system Known
-Folder location. Expand user-provided paths and environment variables, then use the resulting
-absolute path for all commands. Never write a locally resolved path back into this skill.
+The resolver chooses the root in this order:
+
+1. A `--root` value from the current request.
+2. `DONALD_GITHUB_RESEARCH_ROOT` when explicitly supplied as a process-level compatibility
+   override.
+3. `DONALD_SKILLS_OUTPUT_ROOT` as a shared process-level compatibility override.
+4. `<saved shared output root>/github-research`.
+5. `<system Documents>/Donald Skills/Data/github-research`.
+
+Use the returned absolute `output_root` as the research root and report its `source`. Do not ask the
+user to configure a root merely because no environment variable or saved config exists; the
+Documents default is a complete normal configuration.
+
+When the user asks to configure, inspect, change, or reset persistent output storage, explain that
+the saved root is shared by all Donald output skills, then use:
+
+```bash
+python3 "$SKILL_DIR/scripts/output_paths.py" show
+python3 "$SKILL_DIR/scripts/output_paths.py" set "<shared-output-root>"
+python3 "$SKILL_DIR/scripts/output_paths.py" reset
+```
+
+`set` stores the absolute shared root in `storage.json` under the unified Donald Skills config
+root. It does not edit `.zshrc`, another shell startup file, or an operating-system environment
+setting. A GitHub-only custom root remains a one-operation `--root`; persistent customization is
+shared by design.
 
 Interpret an explicitly named repository destination as exact. Interpret a directory described as
 a root or library as a root and append `<owner>/<repo>`. When that distinction is materially
-ambiguous, show the proposed target before cloning and ask the user to confirm it.
+ambiguous, show the proposed target before cloning and ask the user to confirm it. Expand every
+user-provided path and use its resulting absolute path for Git commands.
 
 ## Parse The Repository
 

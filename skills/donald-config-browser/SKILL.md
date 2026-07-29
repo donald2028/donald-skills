@@ -27,8 +27,9 @@ Keep bindings separate from browser state:
 - Config JSON directory: `~/Library/Application Support/Donald Skills/config/agent-browser/` on
   macOS, `%LOCALAPPDATA%\Donald Skills\config\agent-browser\` on Windows, and
   `${XDG_CONFIG_HOME:-~/.config}/donald-skills/agent-browser/` on Linux. It contains one JSON file
-  per configured skill. Set `DONALD_AGENT_BROWSER_CONFIG_DIR` only when an explicit config-root
-  override is required.
+  per configured skill. `DONALD_SKILLS_CONFIG_ROOT` changes the shared Donald Skills config root;
+  `DONALD_AGENT_BROWSER_CONFIG_DIR` remains an exact legacy override for the `agent-browser`
+  subdirectory.
 - Runtime browser data: `~/Library/Application Support/Donald Skills/Chrome CDP/` on macOS,
   `%LOCALAPPDATA%\Donald Skills\Chrome CDP\` on Windows, and
   `${XDG_DATA_HOME:-~/.local/share}/donald-skills/chrome-cdp/` on Linux, with one directory per

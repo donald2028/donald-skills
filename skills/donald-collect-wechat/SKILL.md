@@ -67,10 +67,12 @@ interaction is required.
 ## Collect Article Metadata
 
 By default, outputs are written under the system Documents folder at
-`Donald Skills/Data/wechat/<account-slug>/`. Set `DONALD_SKILLS_OUTPUT_ROOT` to change the shared
-Data root for all Donald tools, or pass `--output-root <path>` to replace the WeChat root for one
-capture. The CLI override wins over the environment setting. Never default to the installed skill
-or current working directory.
+`Donald Skills/Data/wechat/<account-slug>/`. Persist a user-defined shared Data root with
+`python3 "$SKILL_DIR/scripts/output_paths.py" set "<shared-output-root>"`; use `show` or `reset` to
+inspect or remove it. This setting applies to all Donald output skills. `DONALD_SKILLS_OUTPUT_ROOT`
+remains a process-level compatibility override. Pass `--output-root <path>` to replace the WeChat
+root for one capture; it has the highest precedence. Never default to the installed skill or
+current working directory.
 
 The collector starts from the backend home page and drives this visible UI flow in a background CDP
 target: open `文章`, open `超链接`, click `选择其他账号`, search the exact account nickname (or its

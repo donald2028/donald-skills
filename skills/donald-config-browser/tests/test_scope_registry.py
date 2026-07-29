@@ -29,6 +29,19 @@ class ScopeRegistryTests(unittest.TestCase):
         with self.assertRaises(profile_config.ProfileConfigError):
             profile_config.resolve_scope("../other-skill")
 
+    def test_shared_config_root_contains_the_agent_browser_namespace(self) -> None:
+        root = Path("/tmp/donald-config")
+
+        path = profile_config.default_config_path(
+            "donald-collect-x",
+            env={profile_config.SHARED_CONFIG_ROOT_ENV: str(root)},
+        )
+
+        self.assertEqual(
+            path,
+            root / "agent-browser" / "donald-collect-x.json",
+        )
+
     def test_discovers_saved_future_scopes_for_profile_sharing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config_root = Path(temporary)

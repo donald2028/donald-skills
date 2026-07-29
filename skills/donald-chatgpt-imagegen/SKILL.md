@@ -62,11 +62,13 @@ is active. `needs_ops` and explicit `--keep-browser-open` runs keep Chrome open.
 ## Prepare A Job
 
 By default, each job is written under the system Documents folder at
-`Donald Skills/Data/chatgpt-images/<job-name>/<UTC-timestamp>/`. Set
-`DONALD_SKILLS_OUTPUT_ROOT` to change the shared Data root for all Donald tools, or pass
-`--output-root <path>` to replace the ChatGPT image root for one job. The CLI override wins over
-the environment setting. Never default beside the prompt file, inside the installed skill, or in
-the current working directory.
+`Donald Skills/Data/chatgpt-images/<job-name>/<UTC-timestamp>/`. Persist a user-defined shared Data
+root with `python3 "$SKILL_DIR/scripts/output_paths.py" set "<shared-output-root>"`; use `show` or
+`reset` to inspect or remove it. This setting applies to all Donald output skills.
+`DONALD_SKILLS_OUTPUT_ROOT` remains a process-level compatibility override. Pass
+`--output-root <path>` to replace the ChatGPT image root for one job; it has the highest precedence.
+Never default beside the prompt file, inside the installed skill, or in the current working
+directory.
 
 Runner locks, submit throttling, and timing metrics are machine state rather than user output. They
 live under `~/Library/Application Support/Donald Skills/state/chatgpt-web/` on macOS,

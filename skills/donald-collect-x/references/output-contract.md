@@ -18,9 +18,10 @@ Account collection writes:
 Single-post collection writes under the same X root at `<handle>/<status-id>/`, including
 `thread.json`, `post.md`, `runs/`, and optional `media/`.
 
-`DONALD_SKILLS_OUTPUT_ROOT` replaces `<system Documents>/Donald Skills/Data`; command-level
-`--output-root` replaces the X collection root itself and has higher precedence. Passing a handle
-directory or `_user` directory is rejected; the canonical account directory is always
+The persistent shared output setting replaces `<system Documents>/Donald Skills/Data`.
+`DONALD_SKILLS_OUTPUT_ROOT` remains a process-level compatibility override; command-level
+`--output-root` replaces the X collection root itself and has the highest precedence. Passing a
+handle directory or `_user` directory is rejected; the canonical account directory is always
 `<output-root>/<handle>/_user/`.
 
 Account commands print one JSON object with `schema_version`, `status`, `reason`, `hint`, `handle`,

@@ -14,8 +14,9 @@ The default account archive is:
 └── runs/<timestamp>/               # raw network and browser evidence
 ```
 
-`DONALD_SKILLS_OUTPUT_ROOT` replaces `<system Documents>/Donald Skills/Data`; command-level
-`--output-root` replaces the WeChat root itself and has higher precedence.
+The persistent shared output setting replaces `<system Documents>/Donald Skills/Data`.
+`DONALD_SKILLS_OUTPUT_ROOT` remains a process-level compatibility override; command-level
+`--output-root` replaces the WeChat root itself and has the highest precedence.
 
 `index.json` contains only account-level metadata, total count, coverage status, warnings, and a
 catalog of monthly shards. It must not contain an all-article array. Each monthly JSONL row contains
