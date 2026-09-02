@@ -96,6 +96,9 @@ npx skills add donald2028/donald-skills -g
 build 会把这些共享字段同步到所有 channel manifest 和 marketplace，把 canonical 浏览器
 运行时 vendoring 到各浏览器业务 skill，并刷新 Claude/Codex runtime mirrors：
 
+构建命令会自动选择可用的 Python 3：macOS/Linux 优先 `python3`，Windows 优先 `python`
+（其次为 `py -3`）。需要使用非默认解释器时，可设置 `PYTHON` 环境变量。
+
 ```bash
 npm run build
 ```

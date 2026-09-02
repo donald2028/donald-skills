@@ -23,7 +23,7 @@ from typing import Any
 import capture_user_timeline
 import download_media
 import extract_user_timeline
-from browser_runtime import BrowserSession
+from browser_runtime import BrowserSession, process_is_alive
 from profile_config import ProfileConfigError
 from output_paths import resolve_tool_output_root
 from research_post import (
@@ -39,11 +39,7 @@ def _lock_path(post_dir: Path) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return process_is_alive(pid)
 
 
 def acquire_session_lock(post_dir: Path, pid: int | None = None) -> int | None:

@@ -9,6 +9,9 @@ Acquire GitHub repositories into a predictable research library without tying th
 person's filesystem. Keep each repository under `<research-root>/<owner>/<repo>` unless the user
 explicitly provides an exact destination.
 
+Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
+substituting it for `python3` in the command examples below.
+
 ## Resolve The Destination
 
 Resolve `SKILL_DIR` to the directory containing this `SKILL.md`. If the current request names an

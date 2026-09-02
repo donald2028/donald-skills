@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,19 @@ from archive_store import write_archive
 
 
 WECHAT_TZ = timezone(timedelta(hours=8))
+
+
+def _configure_utf8_console() -> None:
+    """Avoid Windows console encoding failures for Unicode output paths."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_utf8_console()
 
 
 def _response_body(payload: dict[str, Any]) -> str:

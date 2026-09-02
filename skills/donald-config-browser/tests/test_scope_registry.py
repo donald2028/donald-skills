@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,55 @@ class ScopeRegistryTests(unittest.TestCase):
             path,
             root / "agent-browser" / "donald-collect-x.json",
         )
+
+    def test_windows_npm_shim_uses_the_native_agent_browser_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim = root / "agent-browser.CMD"
+            binary = root / "node_modules" / "agent-browser" / "bin" / "agent-browser-win32-x64.exe"
+            binary.parent.mkdir(parents=True)
+            shim.touch()
+            binary.touch()
+
+            with mock.patch.object(profile_config.sys, "platform", "win32"):
+                resolved = profile_config._agent_browser_execution_path(str(shim))
+
+        self.assertEqual(resolved, str(binary))
+
+    def test_windows_agent_browser_command_sets_helper_idle_timeout(self) -> None:
+        completed = subprocess.CompletedProcess(args=["agent-browser"], returncode=0, stdout="ok")
+        with (
+            mock.patch.object(profile_config.sys, "platform", "win32"),
+            mock.patch.object(profile_config.subprocess, "run", return_value=completed) as run,
+        ):
+            result = profile_config.run_agent_browser(["agent-browser", "get", "url"], timeout=15)
+
+        self.assertEqual(result, completed)
+        self.assertEqual(run.call_args.kwargs["env"]["AGENT_BROWSER_IDLE_TIMEOUT_MS"], "1000")
+
+    def test_windows_initialization_creates_a_fresh_profile_without_copying_login_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source_profile = source / "Profile 14"
+            source_profile.mkdir(parents=True)
+            (source_profile / "Cookies").write_text("encrypted-login-state", encoding="utf-8")
+            (source / "Local State").write_text("{}", encoding="utf-8")
+            destination = root / "runtime"
+            profile = {"directory": "Profile 14", "name": "Zane", "email": ""}
+
+            with mock.patch.object(profile_config.sys, "platform", "win32"):
+                result = profile_config.prepare_cdp_user_data_dir(source, profile, destination, 9236)
+
+            local_state_exists = (destination / "Local State").is_file()
+            profile_exists = (destination / "Profile 14").is_dir()
+            copied_cookie_exists = (destination / "Profile 14" / "Cookies").exists()
+
+        self.assertEqual(result["status"], "fresh_windows_profile")
+        self.assertEqual(result["copied_files"], 0)
+        self.assertTrue(local_state_exists)
+        self.assertTrue(profile_exists)
+        self.assertFalse(copied_cookie_exists)
 
     def test_discovers_saved_future_scopes_for_profile_sharing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

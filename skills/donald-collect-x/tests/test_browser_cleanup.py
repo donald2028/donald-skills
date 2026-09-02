@@ -15,6 +15,15 @@ import research_post  # noqa: E402
 
 
 class XBrowserCleanupTests(unittest.TestCase):
+    def test_legacy_chrome_lookup_uses_shared_platform_discovery(self) -> None:
+        expected = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        with mock.patch.object(
+            research_post,
+            "chrome_environment",
+            return_value={"executable": expected},
+        ):
+            self.assertEqual(research_post.chrome_executable(), expected)
+
     def test_post_runner_uses_owned_target_and_closes_it(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temporary,

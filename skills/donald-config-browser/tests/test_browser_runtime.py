@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -32,6 +33,12 @@ class BrowserRuntimeTests(unittest.TestCase):
         frontmost = mock.patch.object(runtime, "frontmost_process_id", return_value=None)
         frontmost.start()
         self.addCleanup(frontmost.stop)
+        file_lock = mock.patch.object(runtime, "_file_lock", return_value=contextlib.nullcontext())
+        file_lock.start()
+        self.addCleanup(file_lock.stop)
+
+    def test_current_process_is_alive_without_signaling_it(self) -> None:
+        self.assertTrue(runtime.process_is_alive(os.getpid()))
 
     def _open_session(self, temporary: str) -> runtime.BrowserSession:
         session = runtime.BrowserSession(
@@ -229,8 +236,8 @@ class BrowserRuntimeTests(unittest.TestCase):
                     return_value={"executable": "agent-browser"},
                 ),
                 mock.patch.object(
-                    runtime.subprocess,
-                    "run",
+                    runtime,
+                    "run_agent_browser",
                     return_value=mock.Mock(returncode=0, stdout="https://example.com"),
                 ),
                 mock.patch.object(runtime, "list_cdp_targets", side_effect=targets),

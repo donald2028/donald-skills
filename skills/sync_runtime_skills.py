@@ -87,7 +87,17 @@ def sync_target(target_dir: Path, skills: dict[str, Path], *, check: bool, copy:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="verify only")
-    parser.add_argument("--copy", action="store_true", help="copy directories instead of symlinking")
+    mirror_mode = parser.add_mutually_exclusive_group()
+    mirror_mode.add_argument(
+        "--copy",
+        action="store_true",
+        help="copy directories instead of symlinking (the default for cross-platform checkouts)",
+    )
+    mirror_mode.add_argument(
+        "--symlink",
+        action="store_true",
+        help="create symlinks instead of the default directory copies",
+    )
     parser.add_argument("--replace-existing", action="store_true", help="replace existing non-symlink mirrors")
     parser.add_argument("--target", action="append", help="mirror target directory; may be repeated")
     args = parser.parse_args()
@@ -101,7 +111,7 @@ def main() -> int:
                 target,
                 skills,
                 check=args.check,
-                copy=args.copy,
+                copy=not args.symlink,
                 replace_existing=args.replace_existing,
             )
         )

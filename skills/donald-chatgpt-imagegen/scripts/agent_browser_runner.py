@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -23,32 +22,43 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageChops, ImageStat
+try:
+    from PIL import Image, ImageChops, ImageStat
+except ImportError as error:  # pragma: no cover - depends on the local Python environment
+    Image = ImageChops = ImageStat = None  # type: ignore[assignment]
+    PIL_IMPORT_ERROR = error
+else:
+    PIL_IMPORT_ERROR = None
 
-from browser_runtime import BrowserSession
+from browser_runtime import BrowserSession, process_is_alive
 from output_paths import resolve_tool_state_root
 from profile_config import (
     ProfileConfigError,
     activate_browser,
+    chrome_environment,
     configured_browser,
     ensure_agent_browser,
     restore_frontmost_process,
+    run_agent_browser,
     show_browser_without_focus,
 )
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX path
+    msvcrt = None  # type: ignore[assignment]
 
 
 def _default_chrome_executable() -> str:
     explicit = os.environ.get("CHATGPT_WEB_CHROME_EXECUTABLE")
     if explicit:
         return explicit
-    candidates = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-    ]
-    return next((str(path) for path in candidates if path and Path(path).exists()), "google-chrome")
+    return chrome_environment()["executable"]
 
 
 DEFAULT_CHROME = _default_chrome_executable()
@@ -61,6 +71,31 @@ TARGET_CHATGPT_ACCOUNT_SIGNAL = os.environ.get(
     "CHATGPT_WEB_ACCOUNT_LABEL",
     "the ChatGPT account logged into the configured Chrome profile",
 )
+
+
+def _try_file_lock(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is not None:  # pragma: no cover - Windows fallback
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write("\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    raise RuntimeError("No supported file-lock implementation is available")
+
+
+def _unlock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:  # pragma: no cover - Windows fallback
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 BUSY_MARKERS = (
     "Stop answering",
     "Stop generating",
@@ -183,6 +218,8 @@ def _profile_label(args: argparse.Namespace) -> str:
 
 
 def _run(command: list[str], *, cwd: Path, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    if command and Path(command[0]).name.lower().startswith("agent-browser"):
+        return run_agent_browser(command, cwd=cwd, timeout=timeout)
     return subprocess.run(
         command,
         cwd=cwd,
@@ -449,7 +486,8 @@ def _agent_browser_session_record(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _agent_browser_base(args: argparse.Namespace) -> list[str]:
-    command = ["agent-browser", "--session", _agent_browser_transport_session(args)]
+    executable = ensure_agent_browser(auto_install=True)["executable"]
+    command = [executable, "--session", _agent_browser_transport_session(args)]
     if args.download_path:
         command.extend(["--download-path", str(args.download_path)])
     if args.cdp:
@@ -635,16 +673,16 @@ def _cdp_command_lock(args: argparse.Namespace, timeout_s: int = 180):
     with lock_path.open("a+", encoding="utf-8") as handle:
         while True:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _try_file_lock(handle)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 if time.time() >= deadline:
                     raise TimeoutError(f"Timed out waiting for ChatGPT Web CDP command lock: {lock_path}")
                 time.sleep(0.2)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
 
 
 def _should_select_owned_tab(args: argparse.Namespace, subcommand: list[str]) -> bool:
@@ -781,30 +819,74 @@ def _close_cdp_browser(args: argparse.Namespace, cwd: Path) -> None:
         _terminate_owned_cdp_chrome(args, cwd)
 
 
-def _terminate_owned_cdp_chrome(args: argparse.Namespace, cwd: Path) -> None:
-    if not shutil.which("lsof"):
-        return
-    port = _cdp_launch_port(args)
-    user_data_dir = str(Path(args.user_data_dir).expanduser())
-    result = _run(["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], cwd=cwd, timeout=10)
+def _listening_process_ids(port: str, cwd: Path) -> list[int]:
+    if sys.platform == "win32":
+        result = _run(["netstat", "-ano", "-p", "tcp"], cwd=cwd, timeout=10)
+        process_ids: list[int] = []
+        for line in result.stdout.splitlines():
+            columns = line.split()
+            if len(columns) >= 5 and f"127.0.0.1:{port}" in columns[1] and columns[3].upper() == "LISTENING":
+                try:
+                    process_ids.append(int(columns[-1]))
+                except ValueError:
+                    continue
+        return process_ids
+
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return []
+    result = _run([lsof, f"-tiTCP:{port}", "-sTCP:LISTEN"], cwd=cwd, timeout=10)
     if result.returncode != 0:
-        return
+        return []
+    process_ids = []
     for pid_text in result.stdout.splitlines():
         try:
-            pid = int(pid_text.strip())
+            process_ids.append(int(pid_text.strip()))
         except ValueError:
             continue
-        command = _run(["ps", "-p", str(pid), "-o", "command="], cwd=cwd, timeout=10).stdout
+    return process_ids
+
+
+def _process_command(pid: int, cwd: Path) -> str:
+    if sys.platform == "win32":
+        powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+        if not powershell:
+            return ""
+        return _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+            ],
+            cwd=cwd,
+            timeout=10,
+        ).stdout
+    return _run(["ps", "-p", str(pid), "-o", "command="], cwd=cwd, timeout=10).stdout
+
+
+def _terminate_process(pid: int, cwd: Path) -> None:
+    if sys.platform == "win32":
+        _run(["taskkill", "/PID", str(pid), "/T", "/F"], cwd=cwd, timeout=10)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(20):
+        if _run(["ps", "-p", str(pid)], cwd=cwd, timeout=5).returncode != 0:
+            break
+        time.sleep(0.25)
+
+
+def _terminate_owned_cdp_chrome(args: argparse.Namespace, cwd: Path) -> None:
+    port = _cdp_launch_port(args)
+    user_data_dir = str(Path(args.user_data_dir).expanduser())
+    for pid in _listening_process_ids(port, cwd):
+        command = _process_command(pid, cwd)
         if f"--remote-debugging-port={port}" not in command or f"--user-data-dir={user_data_dir}" not in command:
             continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            continue
-        for _ in range(20):
-            if _run(["ps", "-p", str(pid)], cwd=cwd, timeout=5).returncode != 0:
-                break
-            time.sleep(0.25)
+        _terminate_process(pid, cwd)
 
 
 def _cleanup_agent_browser(args: argparse.Namespace, cwd: Path) -> None:
@@ -948,9 +1030,9 @@ def _cdp_state_lock(args: argparse.Namespace, timeout_s: int):
     with lock_path.open("a+", encoding="utf-8") as handle:
         while True:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _try_file_lock(handle)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 if time.time() >= deadline:
                     raise TimeoutError(f"Timed out waiting for ChatGPT Web CDP lane lock: {lock_path}")
                 print(
@@ -971,7 +1053,7 @@ def _cdp_state_lock(args: argparse.Namespace, timeout_s: int):
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
 
 
 def _cdp_state_path(args: argparse.Namespace) -> Path:
@@ -980,13 +1062,7 @@ def _cdp_state_path(args: argparse.Namespace) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return process_is_alive(pid)
 
 
 def _read_cdp_state_locked(args: argparse.Namespace) -> dict[str, Any]:
@@ -4528,7 +4604,7 @@ def _prune_success_trace_screenshots(
             except OSError:
                 continue
             retention["removed_count"] += 1
-            retention["reclaimed_bytes"] += getattr(stat, "st_blocks", 0) * 512
+            retention["reclaimed_bytes"] += getattr(stat, "st_blocks", 0) * 512 or stat.st_size
     return retention
 
 
@@ -5565,6 +5641,23 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    if PIL_IMPORT_ERROR is not None:
+        print(
+            json.dumps(
+                {
+                    "status": "needs_ops",
+                    "reason": "pillow_unavailable",
+                    "hint": (
+                        "Install Pillow for the Python interpreter running this skill: "
+                        f"{sys.executable} -m pip install Pillow"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
 
     try:
         _resolve_browser_profile(args)

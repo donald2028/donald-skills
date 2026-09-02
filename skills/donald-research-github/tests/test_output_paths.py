@@ -54,19 +54,20 @@ class OutputPathsTests(unittest.TestCase):
         self.assertEqual(resolved["output_root"], str((shared_root / "x").resolve()))
 
     def test_unconfigured_tool_uses_documents_default(self) -> None:
+        home = Path("/Users/tester")
         with tempfile.TemporaryDirectory() as temporary:
             resolved = output_paths.describe_output_root(
                 "wechat",
                 config_path=Path(temporary) / "missing.json",
                 platform_name="darwin",
-                home=Path("/Users/tester"),
+                home=home,
                 env={},
             )
 
         self.assertEqual(resolved["source"], "default")
         self.assertEqual(
-            resolved["output_root"],
-            "/Users/tester/Documents/Donald Skills/Data/wechat",
+            Path(resolved["output_root"]),
+            (home / "Documents" / "Donald Skills" / "Data" / "wechat").resolve(),
         )
 
     def test_explicit_and_compatibility_overrides_beat_saved_config(self) -> None:
@@ -94,11 +95,20 @@ class OutputPathsTests(unittest.TestCase):
             )
 
         self.assertEqual(environment_resolved["source"], "environment")
-        self.assertTrue(environment_resolved["output_root"].endswith("/environment/x"))
+        self.assertEqual(
+            Path(environment_resolved["output_root"]),
+            (Path(temporary) / "environment" / "x").resolve(),
+        )
         self.assertEqual(legacy_resolved["source"], "environment")
-        self.assertTrue(legacy_resolved["output_root"].endswith("/legacy"))
+        self.assertEqual(
+            Path(legacy_resolved["output_root"]),
+            (Path(temporary) / "legacy").resolve(),
+        )
         self.assertEqual(explicit_resolved["source"], "explicit")
-        self.assertTrue(explicit_resolved["output_root"].endswith("/explicit"))
+        self.assertEqual(
+            Path(explicit_resolved["output_root"]),
+            (Path(temporary) / "explicit").resolve(),
+        )
 
     def test_save_config_writes_only_version_and_absolute_output_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

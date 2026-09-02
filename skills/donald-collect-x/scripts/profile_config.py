@@ -24,6 +24,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+
+def _configure_windows_console_output() -> None:
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+
+_configure_windows_console_output()
+
+
 SCHEMA_VERSION = 3
 CONFIG_ROOT_ENV = "DONALD_AGENT_BROWSER_CONFIG_DIR"
 SHARED_CONFIG_ROOT_ENV = "DONALD_SKILLS_CONFIG_ROOT"
@@ -204,6 +221,64 @@ def _run(command: list[str], timeout: int = 120) -> subprocess.CompletedProcess[
     )
 
 
+def _agent_browser_execution_path(executable: str) -> str:
+    """Prefer agent-browser's native executable over its Windows .CMD shim.
+
+    Python starts batch files through ``cmd.exe``. That wrapper can detach the
+    native agent-browser process, which prevents ``subprocess`` timeouts from
+    reliably stopping an unresponsive CDP attach. The npm package places its
+    platform-native executable beside the shim, so use it when available.
+    """
+    launcher = Path(executable)
+    if sys.platform != "win32" or launcher.suffix.lower() not in {".cmd", ".bat"}:
+        return executable
+    candidates = sorted(
+        (launcher.parent / "node_modules" / "agent-browser" / "bin").glob(
+            "agent-browser-win32-*.exe"
+        )
+    )
+    if len(candidates) == 1:
+        return str(candidates[0])
+    return executable
+
+
+def agent_browser_environment() -> dict[str, str] | None:
+    """Return child-only settings that make agent-browser safe on Windows.
+
+    agent-browser keeps a helper process alive for each CDP session. On
+    Windows that helper inherits captured stdout/stderr handles, so Python can
+    wait forever for EOF after the command itself has exited. A short idle
+    lifetime releases those handles while keeping the browser's CDP session
+    intact for the next command.
+    """
+    if sys.platform != "win32":
+        return None
+    environment = os.environ.copy()
+    environment["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = "1000"
+    return environment
+
+
+def run_agent_browser(
+    command: list[str],
+    *,
+    timeout: int = 120,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, Any] = {
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "timeout": timeout,
+        "check": False,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    environment = agent_browser_environment()
+    if environment is not None:
+        kwargs["env"] = environment
+    return subprocess.run(command, **kwargs)
+
+
 def _agent_browser_version(executable: str) -> str:
     result = _run([executable, "--version"], timeout=30)
     if result.returncode != 0:
@@ -247,6 +322,8 @@ def ensure_agent_browser(auto_install: bool = True) -> dict[str, Any]:
                 f"agent-browser installed, but browser setup failed: {browser_install.stdout.strip()}"
             )
         installed_now = True
+
+    executable = _agent_browser_execution_path(executable)
 
     return {
         "executable": executable,
@@ -368,6 +445,11 @@ def _runtime_directory_for_profile(profile_directory: str) -> Path:
     return default_runtime_root() / f"{slug}-{suffix}"
 
 
+def _fresh_runtime_directory_for_profile(profile_directory: str) -> Path:
+    runtime = _runtime_directory_for_profile(profile_directory)
+    return runtime.with_name(f"{runtime.name}-fresh")
+
+
 def default_cdp_port_for_profile(profile_directory: str) -> int:
     if profile_directory == "Default":
         return 9222
@@ -409,6 +491,60 @@ def _windows_chrome_is_running() -> bool:
         return False
     result = _run([tasklist, "/FI", "IMAGENAME eq chrome.exe"], timeout=20)
     return "chrome.exe" in result.stdout.casefold()
+
+
+def _initialize_fresh_windows_profile(
+    destination: Path,
+    source_user_data_dir: Path,
+    profile: dict[str, str],
+    cdp_port: int,
+) -> dict[str, Any]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".{destination.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        temporary.mkdir(parents=True)
+        (temporary / profile["directory"]).mkdir()
+        local_state = {
+            "profile": {
+                "info_cache": {
+                    profile["directory"]: {
+                        "name": profile.get("name") or profile["directory"],
+                        "user_name": "",
+                    }
+                }
+            }
+        }
+        (temporary / "Local State").write_text(
+            json.dumps(local_state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        metadata = {
+            "schema_version": 3,
+            "source_user_data_dir": str(source_user_data_dir),
+            "profile": profile,
+            "cdp_port": cdp_port,
+            "initialization": "fresh_windows_profile",
+            "initialized_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (temporary / ".donald-cdp-profile.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+    return {
+        "status": "fresh_windows_profile",
+        "user_data_dir": str(destination),
+        "profile_directory": profile["directory"],
+        "cdp_port": cdp_port,
+        "copied_files": 0,
+        "warnings": [
+            "Windows Chrome login state is not copied. Sign in once in this dedicated CDP Profile; "
+            "it will be reused by every skill bound to this Profile."
+        ],
+    }
 
 
 def prepare_cdp_user_data_dir(
@@ -457,6 +593,14 @@ def prepare_cdp_user_data_dir(
         )
     if destination.exists():
         destination.rmdir()
+
+    if sys.platform == "win32":
+        return _initialize_fresh_windows_profile(
+            destination,
+            source_user_data_dir,
+            profile,
+            cdp_port,
+        )
 
     if _windows_chrome_is_running():
         raise ProfileConfigError(
@@ -619,6 +763,7 @@ def initialize_config(
     profile_value: str,
     cdp_port: int | None,
     user_data_dir: Path | None,
+    fresh: bool,
     auto_install: bool,
 ) -> dict[str, Any]:
     environment, profiles = list_profiles(auto_install=auto_install)
@@ -627,7 +772,7 @@ def initialize_config(
     if not 1 <= requested_port <= 65535:
         raise ProfileConfigError("CDP port must be between 1 and 65535")
     source = Path(environment["chrome"]["source_user_data_dir"])
-    existing_binding = _existing_profile_binding(profile["directory"], source)
+    existing_binding = None if fresh else _existing_profile_binding(profile["directory"], source)
     if existing_binding:
         existing_scope, existing_config = existing_binding
         shared_runtime = Path(existing_config["chrome"]["cdp_user_data_dir"]).expanduser()
@@ -646,7 +791,12 @@ def initialize_config(
         requested_port = shared_port
     else:
         existing_scope = ""
-        runtime = (user_data_dir or _runtime_directory_for_profile(profile["directory"])).expanduser()
+        default_runtime = (
+            _fresh_runtime_directory_for_profile(profile["directory"])
+            if fresh
+            else _runtime_directory_for_profile(profile["directory"])
+        )
+        runtime = (user_data_dir or default_runtime).expanduser()
     preparation = prepare_cdp_user_data_dir(source, profile, runtime, requested_port)
     if existing_scope:
         preparation["shared_from_scope"] = existing_scope
@@ -1325,7 +1475,7 @@ def preflight_browser(
             "get",
             "url",
         ]
-        attach = _run(attach_command, timeout=60)
+        attach = run_agent_browser(attach_command, timeout=60)
         if attach.returncode != 0:
             raise ProfileConfigError(
                 "Chrome CDP is reachable, but agent-browser could not attach: "
@@ -1336,7 +1486,7 @@ def preflight_browser(
             deadline = time.time() + 5
             while time.time() < deadline and agent_browser_url == "about:blank":
                 time.sleep(0.2)
-                attach = _run(attach_command, timeout=30)
+                attach = run_agent_browser(attach_command, timeout=30)
                 if attach.returncode != 0:
                     raise ProfileConfigError(
                         "agent-browser attached but could not reread the background page URL: "
@@ -1479,6 +1629,11 @@ def _parser() -> argparse.ArgumentParser:
     set_parser.add_argument("--profile", required=True, help="Exact directory or unique display name.")
     set_parser.add_argument("--user-data-dir", type=Path)
     set_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Use a new dedicated runtime directory instead of an existing shared binding.",
+    )
+    set_parser.add_argument(
         "--cdp-port",
         type=int,
         default=None,
@@ -1539,6 +1694,7 @@ def main() -> int:
                     args.profile,
                     args.cdp_port,
                     args.user_data_dir,
+                    args.fresh,
                     auto_install,
                 )
             )

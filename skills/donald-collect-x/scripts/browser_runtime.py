@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ from profile_config import (
     frontmost_process_id,
     list_cdp_targets,
     restore_frontmost_process_if_browser_active,
+    run_agent_browser,
     show_browser_without_focus,
     start_cdp_browser,
     wait_for_background_page_url,
@@ -74,7 +76,20 @@ def default_browser_state_root(
     return base / "donald-skills" / "agent-browser"
 
 
-def _pid_alive(pid: int) -> bool:
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not process:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259
+        finally:
+            ctypes.windll.kernel32.CloseHandle(process)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -82,6 +97,10 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _pid_alive(pid: int) -> bool:
+    return process_is_alive(pid)
 
 
 def _target_ids(port: int) -> set[str]:
@@ -108,6 +127,10 @@ def _file_lock(path: Path, timeout: int) -> Iterator[None]:
                 if fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 elif msvcrt is not None:  # pragma: no cover - Windows fallback
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 break
@@ -265,7 +288,7 @@ class BrowserSession:
     def _verify_attach(self, own_new_blank_targets: bool) -> None:
         executable = ensure_agent_browser(auto_install=True)["executable"]
         before = _target_ids(self.port)
-        result = subprocess.run(
+        result = run_agent_browser(
             [
                 executable,
                 "--session",
@@ -275,11 +298,7 @@ class BrowserSession:
                 "get",
                 "url",
             ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             timeout=60,
-            check=False,
         )
         poll_count = 20 if own_new_blank_targets else 1
         for poll_index in range(poll_count):

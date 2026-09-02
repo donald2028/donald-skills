@@ -38,6 +38,9 @@ def _tweet(status_id: str) -> dict[str, object]:
 
 
 class _CaptureBrowser:
+    def __init__(self) -> None:
+        self.request_filters: list[str] = []
+
     def open(self, _url: str) -> None:
         return None
 
@@ -47,7 +50,8 @@ class _CaptureBrowser:
     def enter_page(self) -> None:
         return None
 
-    def list_request_ids(self, _filter_name: str) -> list[str]:
+    def list_request_ids(self, filter_name: str) -> list[str]:
+        self.request_filters.append(filter_name)
         return ["current-request"]
 
     def save_response(self, _request_id: str, path: Path) -> None:
@@ -129,6 +133,23 @@ class ResearchUserContractTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "max_scrolls_reached")
         self.assertEqual(result["capture_new_posts"], 1)
         self.assertEqual(result["capture_known_overlap_posts"], 0)
+
+    def test_posts_capture_supports_current_and_legacy_timeline_operations(self) -> None:
+        browser = _CaptureBrowser()
+        with tempfile.TemporaryDirectory() as temporary:
+            capture_user_timeline.capture(
+                "example",
+                Path(temporary),
+                browser=browser,
+                sleep=lambda: None,
+                max_scrolls=1,
+                include_articles=False,
+            )
+
+        self.assertEqual(
+            browser.request_filters,
+            list(capture_user_timeline.POST_TIMELINE_OPERATIONS),
+        )
 
     def test_articles_phase_has_an_independent_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

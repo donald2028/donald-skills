@@ -8,6 +8,9 @@ description: Generate and download images through an external ChatGPT Web sessio
 Prepare a deterministic job manifest, run it through a headed ChatGPT Web session, and preserve
 enough session evidence to resume or recover downloads without resubmitting the prompt.
 
+Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
+substituting it for `python3` in the command examples below.
+
 ## Prerequisites
 
 - **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a
@@ -30,9 +33,10 @@ enough session evidence to resume or recover downloads without resubmitting the 
   configuration. If the runtime has no native skill-invocation action, use its normal Agent Skills
   discovery/read fallback. The dependency owns first-time environment setup, Profile confirmation,
   shared Cookie state, recommendation rules, and repair; do not reproduce those steps here.
-- Runtime requirements are `agent-browser`, Python Pillow, and Google Chrome/Chromium on macOS or
-  Linux. Do not probe them separately on the normal path; run the bundled command and handle only
-  the missing layer it reports. Invoke browser setup or repair only for browser-specific failures.
+- Runtime requirements are `agent-browser`, Python Pillow, and Google Chrome/Chromium on macOS,
+  Windows, or Linux. Do not probe them separately on the normal path; run the bundled command and
+  handle only the missing layer it reports. Invoke browser setup or repair only for browser-specific
+  failures.
 - Resolve `SKILL_DIR` to the directory containing this `SKILL.md`.
 - After setup, the image runner starts and owns the generation browser lifecycle. Do not run a
   separate configuration preflight before it. Startup, target ownership, cross-skill active-run

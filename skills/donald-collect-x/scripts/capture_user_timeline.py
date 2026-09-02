@@ -34,6 +34,7 @@ ARTICLE_MAX_SCROLLS = 20
 ARTICLE_TIMEOUT_SECONDS = 90
 MAX_ERROR_PAGE_RETRIES = 3
 BOTTOM_REMAINING_PX = 1200
+POST_TIMELINE_OPERATIONS = ("UserTweets", "UserOriginalsTimeline")
 
 
 def _safe(value: str) -> str:
@@ -326,6 +327,18 @@ def _near_bottom(scroll_marker: str | None) -> bool:
     return y > 0 and height > 0 and height - y <= BOTTOM_REMAINING_PX
 
 
+def _post_timeline_request_ids(browser: Browser) -> list[str]:
+    """Return completed ids for X's current or legacy Posts feed."""
+    seen: set[str] = set()
+    request_ids: list[str] = []
+    for operation in POST_TIMELINE_OPERATIONS:
+        for request_id in browser.list_request_ids(operation):
+            if request_id not in seen:
+                seen.add(request_id)
+                request_ids.append(request_id)
+    return request_ids
+
+
 def _click_retry(browser: Browser) -> bool:
     retry = getattr(browser, "click_retry", None)
     if callable(retry):
@@ -405,7 +418,7 @@ def capture(
         if block:
             return capture_result("needs_ops", reason=block)
         round_had_timeline_response = False
-        request_ids = browser.list_request_ids("UserTweets")
+        request_ids = _post_timeline_request_ids(browser)
         new_ids = [rid for rid in request_ids if rid not in saved]
         round_valid = 0
         round_rejected = 0

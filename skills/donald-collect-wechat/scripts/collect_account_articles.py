@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -29,6 +30,12 @@ from profile_config import (
 
 WECHAT_HOME = "https://mp.weixin.qq.com/"
 ACCOUNT_SEARCH_PLACEHOLDER_MARKER = "输入文章来源的账号名称"
+EDITOR_TIP_ACKNOWLEDGEMENTS = ("我知道了", "知道了")
+ARTICLE_PICKER_LABELS = ("选择账号文章",)
+
+
+class ExternalAccountPickerUnavailable(RuntimeError):
+    """The authenticated account does not expose the external article picker."""
 
 
 def _safe_path_part(value: str) -> str:
@@ -105,6 +112,64 @@ def _click_exact_text(connection: Any, text: str, selectors: str = "a,button,li,
     expected = json.dumps(text)
     predicate = f'const text = (el.innerText || el.textContent || "").trim(); return text === {expected};'
     return _click_expression(connection, _element_rect_expression(predicate, selectors))
+
+
+def _click_exact_text_if_visible(
+    connection: Any,
+    text: str,
+    selectors: str = "a,button,li,[role=button],div,span",
+) -> bool:
+    """Click an exact visible label only when it is rendered."""
+    expected = json.dumps(text)
+    predicate = f'const text = (el.innerText || el.textContent || "").trim(); return text === {expected};'
+    rect = _runtime_value(connection, _element_rect_expression(predicate, selectors))
+    if not isinstance(rect, dict):
+        return False
+    x = float(rect["x"])
+    y = float(rect["y"])
+    connection.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    connection.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+    )
+    connection.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+    )
+    return True
+
+
+def _prepare_interactive_target(connection: Any) -> None:
+    """Make this runner-owned tab interactive without activating Chrome's window.
+
+    Recent WeChat editor builds ignore trusted CDP pointer events until their
+    page target is the selected Chrome tab. ``Page.bringToFront`` switches
+    only that owned tab; the caller still restores the foreground app, so it
+    does not steal operating-system focus.
+    """
+    connection.call("Page.bringToFront", {})
+    connection.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+
+
+def _dismiss_editor_tips(connection: Any) -> None:
+    for label in EDITOR_TIP_ACKNOWLEDGEMENTS:
+        if _click_exact_text_if_visible(connection, label):
+            time.sleep(0.3)
+            return
+
+
+def _current_account_name(connection: Any) -> str:
+    """Return the nickname shown for the authenticated backend account."""
+    value = _runtime_value(
+        connection,
+        """
+(() => {
+  const element = document.querySelector(".mp_account_box, .weui-desktop-account__info");
+  return (element?.innerText || element?.textContent || "").replace(/\\s+/g, " ").trim();
+})()
+""".strip(),
+    )
+    return str(value or "").strip()
 
 
 def _set_search_query(connection: Any, account: str) -> None:
@@ -311,7 +376,7 @@ def main() -> int:
     browser_cleanup: dict[str, Any] = {"status": "not_closed"}
     try:
         home_connection = connect_cdp_target(args.cdp, home_target_id)
-        home_connection.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        _prepare_interactive_target(home_connection)
         state = _wait_value(
             home_connection,
             '(() => document.readyState === "complete" && location.href !== "about:blank" '
@@ -333,24 +398,58 @@ def main() -> int:
             home_url=str(state.get("url") or ""),
         )
         editor_connection = connect_cdp_target(args.cdp, editor_target_id)
-        editor_connection.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        _prepare_interactive_target(editor_connection)
         editor_connection.call("Network.enable")
         _wait_value(editor_connection, 'location.href.includes("cgi-bin/appmsg") && document.body?.innerText.includes("超链接")', timeout=12)
+        _dismiss_editor_tips(editor_connection)
+        editor_connection.events.clear()
         _click_exact_text(editor_connection, "超链接")
-        _wait_value(editor_connection, 'document.body?.innerText.includes("编辑超链接")', timeout=8)
-        _click_exact_text(editor_connection, "选择其他账号", "button,[role=button],div,span")
-        marker_json = json.dumps(ACCOUNT_SEARCH_PLACEHOLDER_MARKER)
+        seen_begins: set[str] = set()
         _wait_value(
             editor_connection,
-            f'[...document.querySelectorAll("input")].some(el => (el.placeholder || "").includes({marker_json}))',
+            'document.body?.innerText.includes("编辑超链接")',
             timeout=8,
         )
-        _set_search_query(editor_connection, args.account)
-        _wait_value(editor_connection, _account_result_expression(args.account, args.wechat_id), timeout=8)
+        opened_article_picker = False
+        for label in ARTICLE_PICKER_LABELS:
+            if _click_exact_text_if_visible(editor_connection, label):
+                opened_article_picker = True
+                break
+        if opened_article_picker:
+            marker_json = json.dumps(ACCOUNT_SEARCH_PLACEHOLDER_MARKER)
+            _wait_value(
+                editor_connection,
+                'document.body?.innerText.includes("选择其他账号") || '
+                f'[...document.querySelectorAll("input")].some(el => (el.placeholder || "").includes({marker_json}))',
+                timeout=8,
+            )
+        has_external_picker = bool(
+            _runtime_value(editor_connection, 'document.body?.innerText.includes("选择其他账号")')
+        )
+        if has_external_picker:
+            _click_exact_text(editor_connection, "选择其他账号", "button,[role=button],div,span")
+            marker_json = json.dumps(ACCOUNT_SEARCH_PLACEHOLDER_MARKER)
+            _wait_value(
+                editor_connection,
+                f'[...document.querySelectorAll("input")].some(el => (el.placeholder || "").includes({marker_json}))',
+                timeout=8,
+            )
+            _set_search_query(editor_connection, args.account)
+            _wait_value(editor_connection, _account_result_expression(args.account, args.wechat_id), timeout=8)
+            editor_connection.events.clear()
+            _click_expression(editor_connection, _account_result_expression(args.account, args.wechat_id))
+        else:
+            current_account = _current_account_name(home_connection)
+            if not current_account:
+                raise ExternalAccountPickerUnavailable(
+                    "The current account's article-link dialog does not expose an external-account picker"
+                )
+            if args.account != current_account:
+                raise ExternalAccountPickerUnavailable(
+                    "The current account's article-link dialog does not expose an external-account picker; "
+                    f"it can only collect the authenticated account ({current_account!r}), not {args.account!r}"
+                )
 
-        seen_begins: set[str] = set()
-        editor_connection.events.clear()
-        _click_expression(editor_connection, _account_result_expression(args.account, args.wechat_id))
         first = _wait_appmsgpublish(editor_connection, seen_begins)
         seen_begins.add(first["begin"])
         responses.append(first)
@@ -383,12 +482,13 @@ def main() -> int:
         cleanup = browser_cleanup["status"]
 
     if business_error is not None:
+        external_picker_unavailable = isinstance(business_error, ExternalAccountPickerUnavailable)
         print(
             json.dumps(
                 {
-                    "status": "error",
-                    "reason": "wechat_ui_flow_failed",
-                    "retryable": True,
+                    "status": "needs_ops" if external_picker_unavailable else "error",
+                    "reason": "external_account_picker_unavailable" if external_picker_unavailable else "wechat_ui_flow_failed",
+                    "retryable": not external_picker_unavailable,
                     "error_type": type(business_error).__name__,
                     "hint": str(business_error),
                     "run_dir": str(run_dir),
@@ -402,10 +502,28 @@ def main() -> int:
 
     parse = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("parse_appmsgpublish.py")), str(account_root)],
-        check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONUTF8": "1"},
     )
+    if parse.returncode != 0:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "reason": "wechat_parse_failed",
+                    "retryable": True,
+                    "hint": (parse.stderr or parse.stdout).strip() or "The WeChat archive parser exited without diagnostics",
+                    "run_dir": str(run_dir),
+                    "browser_cleanup": browser_cleanup,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 1
     print(
         json.dumps(
             {

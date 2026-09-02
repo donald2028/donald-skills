@@ -8,6 +8,9 @@ description: Collect, refresh, or backfill an X/Twitter account's original posts
 Collect an account's own content from browser-produced X GraphQL responses. Use a visible Chrome
 session over CDP, preserve raw response runs, and compile deterministic JSONL/Markdown outputs.
 
+Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
+substituting it for `python3` in the command examples below.
+
 ## Prerequisites
 
 - **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a

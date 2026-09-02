@@ -27,11 +27,11 @@ from output_paths import resolve_tool_output_root
 from profile_config import (
     ProfileConfigError,
     activate_browser,
+    chrome_environment,
     configured_browser,
     default_runtime_root,
 )
 
-MACOS_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_DATA_DIR = os.environ.get("X_COLLECTOR_CHROME_DATA_DIR", "")
 
 LEGACY_DEFAULT_CDP_PORT = 9222
@@ -50,16 +50,9 @@ def chrome_executable() -> str:
     explicit = os.environ.get("X_COLLECTOR_CHROME_EXECUTABLE")
     if explicit:
         return explicit
-    candidates = [
-        MACOS_CHROME,
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return str(candidate)
+    executable = chrome_environment()["executable"]
+    if Path(executable).is_file():
+        return executable
     raise FileNotFoundError(
         "Google Chrome/Chromium not found; set X_COLLECTOR_CHROME_EXECUTABLE"
     )

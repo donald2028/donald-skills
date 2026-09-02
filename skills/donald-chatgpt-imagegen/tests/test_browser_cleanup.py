@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,44 @@ import agent_browser_runner as runner  # noqa: E402
 
 
 class BrowserCleanupTests(unittest.TestCase):
+    def test_default_chrome_uses_shared_platform_discovery(self) -> None:
+        with mock.patch.object(
+            runner,
+            "chrome_environment",
+            return_value={"executable": r"C:\Program Files\Google\Chrome\Application\chrome.exe"},
+        ):
+            executable = runner._default_chrome_executable()
+
+        self.assertEqual(executable, r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+
+    def test_cdp_locks_work_with_the_current_platform_lock_implementation(self) -> None:
+        args = argparse.Namespace(cdp=None, cdp_port=9333, user_data_dir="/tmp/chrome")
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            runner,
+            "resolve_tool_state_root",
+            return_value=Path(temporary),
+        ):
+            with runner._cdp_command_lock(args, timeout_s=1):
+                self.assertTrue(runner._command_lock_path_for_cdp(args).exists())
+            with runner._cdp_state_lock(args, timeout_s=1):
+                self.assertTrue(runner._lock_path_for_cdp(args).exists())
+
+    def test_windows_cleanup_terminates_only_the_confirmed_cdp_process(self) -> None:
+        args = argparse.Namespace(cdp=None, cdp_port=9333, user_data_dir=r"C:\Donald Chrome")
+        with (
+            mock.patch.object(runner.sys, "platform", "win32"),
+            mock.patch.object(runner, "_listening_process_ids", return_value=[1234]),
+            mock.patch.object(
+                runner,
+                "_process_command",
+                return_value=r"chrome.exe --remote-debugging-port=9333 --user-data-dir=C:\Donald Chrome",
+            ),
+            mock.patch.object(runner, "_terminate_process") as terminate,
+        ):
+            runner._terminate_owned_cdp_chrome(args, Path.cwd())
+
+        terminate.assert_called_once_with(1234, Path.cwd())
+
     def test_runner_prepares_the_shared_browser_runtime(self) -> None:
         args = argparse.Namespace(
             session="chatgpt-test",

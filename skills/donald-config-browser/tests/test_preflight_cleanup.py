@@ -60,7 +60,7 @@ class PreflightCleanupTests(unittest.TestCase):
                     "hide_browser_without_focus",
                     return_value={"status": "hidden_headed"},
                 ),
-                mock.patch.object(profile_config, "_run", return_value=attach),
+                mock.patch.object(profile_config, "run_agent_browser", return_value=attach),
                 mock.patch.object(
                     profile_config,
                     "close_cdp_browser",
@@ -103,7 +103,7 @@ class PreflightCleanupTests(unittest.TestCase):
             mock.patch.object(profile_config, "create_background_page", return_value="target"),
             mock.patch.object(profile_config, "wait_for_background_page_url", return_value="about:blank"),
             mock.patch.object(profile_config, "hide_browser_without_focus", return_value={"status": "hidden"}),
-            mock.patch.object(profile_config, "_run", return_value=attach),
+            mock.patch.object(profile_config, "run_agent_browser", return_value=attach),
             mock.patch.object(profile_config, "close_background_page") as close_target,
         ):
             result = profile_config.preflight_browser(

@@ -10,6 +10,9 @@ means the skill has its own Profile binding and a real headed Chrome launched fr
 persistent `user-data-dir` has passed an `agent-browser --cdp` control check. The binding remains
 valid for later tasks until the user changes it or a runner reports a configuration failure.
 
+Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
+substituting it for `python3` in the command examples below.
+
 Other Donald browser workflows invoke this skill only for first-time setup or repair. When invoked
 that way, use the caller's skill name as `--scope`. Do not duplicate the caller's business workflow
 or import files from its skill directory.
@@ -33,7 +36,9 @@ Keep bindings separate from browser state:
 - Runtime browser data: `~/Library/Application Support/Donald Skills/Chrome CDP/` on macOS,
   `%LOCALAPPDATA%\Donald Skills\Chrome CDP\` on Windows, and
   `${XDG_DATA_HOME:-~/.local/share}/donald-skills/chrome-cdp/` on Linux, with one directory per
-  Chrome Profile. Donald launches these automation-only Profiles with Chrome's on-device
+  Chrome Profile. On Windows, initialization starts an empty dedicated CDP Profile rather than
+  copying encrypted login data from Chrome's normal Profile; sign in once there and every bound
+  skill will reuse that session. Donald launches these automation-only Profiles with Chrome's on-device
   Optimization Guide model disabled because browser-side generative AI is not part of these
   workflows; this prevents a multi-gigabyte model from being downloaded separately into every
   Profile. Existing model caches are not deleted automatically.
@@ -147,8 +152,8 @@ python3 "$SKILL_DIR/scripts/profile_config.py" \
 
 Present each `directory`, `name`, and login `email` to the user. Show `not available` when Chrome's
 local Profile metadata has no email. **Do not initialize or write config until the user explicitly
-confirms one.** On Windows, ask the user to close Chrome before the first Profile copy so locked
-files do not omit login state.
+confirms one.** On Windows, normal initialization does not copy the selected Profile, so Chrome
+does not need to be closed; the user must sign in once in the dedicated CDP Profile instead.
 
 Do not label a Profile as recommended based on its name, email, directory, list order, or prior
 guess. A recommendation is allowed only after that exact Profile's login state for the caller's
@@ -165,10 +170,16 @@ python3 "$SKILL_DIR/scripts/profile_config.py" \
   set --profile "<directory-or-unique-name>"
 ```
 
-Initialization copies the selected Chrome Profile and `Local State` into a persistent, non-default
-CDP User Data directory. It follows agent-browser's own Profile snapshot exclusions for caches and
-other large non-auth data. Existing valid runtime data for that Profile is reused instead of
+On macOS and Linux, initialization copies the selected Chrome Profile and `Local State` into a
+persistent, non-default CDP User Data directory. It follows agent-browser's own Profile snapshot
+exclusions for caches and other large non-auth data. On Windows, Chrome encrypts login data for the
+normal data directory, so initialization creates a small empty CDP Profile instead; log in once in
+that dedicated profile. Existing valid runtime data for that Profile is reused instead of
 overwritten, including its shared CDP port. Only the selected skill's config binding is written.
+
+To repair an existing Windows snapshot binding without deleting it, pass `--fresh` to `set`. It
+creates or reuses a separate empty dedicated directory; bind every skill that should share it with
+the same flag, then sign in once after the preflight activates Chrome.
 
 To migrate a known dedicated CDP directory, pass `--user-data-dir <path>`. It must contain the
 selected Profile directory and must not be Chrome's normal User Data root. If another target is

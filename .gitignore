@@ -52,6 +52,10 @@ outputs/
 .claude/settings.local.json
 .codex-tmp/
 
+# Generated runtime skill mirrors (rebuilt from canonical skills/)
+.claude/skills/
+.agents/skills/
+
 # Editors and operating systems
 .DS_Store
 ._*

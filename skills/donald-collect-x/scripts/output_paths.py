@@ -14,6 +14,22 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+def _configure_windows_console_output() -> None:
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
+
+_configure_windows_console_output()
+
+
 SCHEMA_VERSION = 1
 CONFIG_ROOT_ENV = "DONALD_SKILLS_CONFIG_ROOT"
 OUTPUT_ROOT_ENV = "DONALD_SKILLS_OUTPUT_ROOT"

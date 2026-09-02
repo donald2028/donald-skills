@@ -9,6 +9,9 @@ Collect article metadata from the WeChat Official Account backend's visible arti
 optionally fetch public `mp.weixin.qq.com` article bodies. Keep the workflow read-only and preserve
 the captured network responses as evidence.
 
+Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
+substituting it for `python3` in the command examples below.
+
 ## Prerequisites
 
 - **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a
@@ -75,9 +78,14 @@ root for one capture; it has the highest precedence. Never default to the instal
 current working directory.
 
 The collector starts from the backend home page and drives this visible UI flow in a background CDP
-target: open `文章`, open `超链接`, click `选择其他账号`, search the exact account nickname (or its
-WeChat ID when supplied), and select the exact result. It then captures the browser-produced
-`appmsgpublish` responses while paging. It never replays that endpoint itself.
+target: open `文章`, open `超链接`, then use `选择账号文章` (when that intermediate control is
+rendered), click `选择其他账号`, search the exact account nickname (or its WeChat ID when supplied),
+and select the exact result. It then captures the browser-produced `appmsgpublish` responses while
+paging. It never replays that endpoint itself. `账号名片` is a separate insertion feature: it can
+search and insert a profile card but does not expose an account's article list, so never use it as
+a collection fallback. If the authenticated account's link dialog does not expose the external
+account picker, return `needs_ops` with `external_account_picker_unavailable`; do not label the
+authenticated account's own articles as the requested external account.
 
 The command creates a unique UTC run directory, merges prior runs by URL, writes a small
 `index.json`, monthly JSONL indexes, and one `article.json` per article, then returns the run as
