@@ -9,7 +9,8 @@ ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发�
 
 当前工具 skills：
 
-- `donald-agent-infrastructure`：初始化、迁移和审计项目级 Agent/Skill 基础设施。
+- `donald-agent-infrastructure`：初始化、迁移和审计项目级 Agent/Skill 基础设施；生成
+  Claude/Codex/WorkBuddy 技能镜像和规则入口，Kimi Code/OpenCode 复用共享目录。
 - `donald-manage-skills`：维护、验证、打包和发布可复用的多运行时 Skill 仓库。
 - `donald-safe-commit`：审查并安全提交 Git 变更，仅在用户要求时推送。
 - `donald-research-github`：把 GitHub 仓库获取到可配置的调研目录并按需分析。

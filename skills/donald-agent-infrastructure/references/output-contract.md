@@ -18,6 +18,7 @@ When using this skill, return one of these deliverables.
 - mirror targets configured
 - audit result summary
 - sync check result summary
+- runtime coverage: configured discovery paths versus actual in-app checks; subagent support separately
 - any skipped work and why
 
 Do not claim the infrastructure is ready until the audit and sync check have run or you clearly say

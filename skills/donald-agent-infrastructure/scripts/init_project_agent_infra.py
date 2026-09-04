@@ -55,14 +55,16 @@ def agents_md(title: str, *, has_entry: bool, governance: bool, has_subagents: b
         ## Project Skills
 
         - Treat root `skills/` as the canonical project skill source.
-        - Treat `.claude/skills/` and `.agents/skills/` as generated runtime output.
+        - Treat `.claude/skills/`, `.agents/skills/`, and `.codebuddy/skills/` as generated runtime output.
+        - Kimi Code uses `AGENTS.md` and the shared `.agents/skills/` mirror.
+        - WorkBuddy / CodeBuddy Code uses `CODEBUDDY.md` and `.codebuddy/skills/`.
         - Keep a skill self-contained and add references, scripts, assets, evaluations, or
           runtime-specific metadata only when the workflow needs them.
 
         ## Repo Boundaries
 
         - Work from the repo root.
-        - Do not hand-edit generated runtime mirrors under `.claude/skills/` or `.agents/skills/`.
+        - Do not hand-edit generated runtime skill mirrors.
         - Do not commit runtime data as source; promote small stable examples into tests or fixtures.
         """
     )
@@ -113,6 +115,18 @@ def claude_md() -> str:
     )
 
 
+def codebuddy_md() -> str:
+    return textwrap.dedent(
+        """\
+        # WorkBuddy / CodeBuddy Code Instructions
+
+        Read and follow `AGENTS.md`; it is the canonical project operating contract.
+
+        Keep only CodeBuddy-specific additions in this file. Do not duplicate shared project rules.
+        """
+    )
+
+
 def skills_readme(title: str) -> str:
     return textwrap.dedent(
         f"""\
@@ -143,8 +157,9 @@ def skills_readme(title: str) -> str:
 
         ## Runtime Mirrors
 
-        `.claude/skills/` and `.agents/skills/` are generated mirrors. Change canonical skills under
-        `skills/`, then run:
+        `.claude/skills/` (Claude Code), `.agents/skills/` (Codex, Kimi Code, OpenCode), and
+        `.codebuddy/skills/` (WorkBuddy / CodeBuddy Code) are generated mirrors.
+        Change canonical skills under `skills/`, then run:
 
         ```bash
         python3 skills/sync_runtime_skills.py
@@ -333,7 +348,11 @@ def sync_runtime_skills_script() -> str:
 
         REPO = Path(__file__).resolve().parents[1]
         SKILLS_ROOT = REPO / "skills"
-        DEFAULT_TARGETS = [REPO / ".claude" / "skills", REPO / ".agents" / "skills"]
+        DEFAULT_TARGETS = [
+            REPO / ".claude" / "skills",
+            REPO / ".agents" / "skills",  # Shared by Codex, Kimi Code, and OpenCode.
+            REPO / ".codebuddy" / "skills",  # WorkBuddy / CodeBuddy Code.
+        ]
 
 
         def discover_skills() -> dict[str, Path]:
@@ -673,6 +692,7 @@ def main() -> int:
         )
     )
     writes.append(write_file(repo / "CLAUDE.md", claude_md(), force=args.force, dry_run=args.dry_run))
+    writes.append(write_file(repo / "CODEBUDDY.md", codebuddy_md(), force=args.force, dry_run=args.dry_run))
 
     if args.profile in {"categorized", "pipeline", "subagents"}:
         writes.append(

@@ -4,8 +4,9 @@ Use this process when a repo already has skills or runtime-specific copies.
 
 ## Read-Only Inventory
 
-1. List `AGENTS.md`, `CLAUDE.md`, `skills/`, `.claude/skills/`, `.agents/skills/`,
-   `.codex/agents/`, and `agents/`.
+1. List `AGENTS.md`, `CLAUDE.md`, `CODEBUDDY.md`, `skills/`, `.claude/skills/`, `.agents/skills/`,
+   `.codebuddy/skills/`, `.kimi-code/skills/`, legacy `.kimi/skills/`, `.codex/agents/`, and `agents/`.
+   Include other runtime-specific directories already in use.
 2. Compare skill names and file contents across canonical and mirror folders.
 3. Identify whether the repo is flat, categorized, mixed, or already generated.
 4. Check git status and treat uncommitted changes as user-owned.
@@ -15,13 +16,24 @@ Use this process when a repo already has skills or runtime-specific copies.
 Pick one canonical source:
 
 - Prefer root `skills/` for project-local skills.
-- Treat `.claude/skills/` and `.agents/skills/` as generated mirrors.
+- Treat `.claude/skills/`, `.agents/skills/`, and `.codebuddy/skills/` as generated mirrors.
 - If only a runtime mirror exists, copy the best version into root `skills/` before replacing the
   mirror with symlinks.
 
 Do not delete divergent files until you have either preserved them in canonical `skills/` or shown
 the user the divergence. After ownership is established, runtime mirrors are disposable generated
 output and may be replaced on every sync.
+
+## Upgrade Existing Scaffolds
+
+The initializer skips existing files, including `skills/sync_runtime_skills.py`. To add WorkBuddy
+to an older project, merge `.codebuddy/skills/` into that helper's `DEFAULT_TARGETS`, create the
+missing `CODEBUDDY.md` adapter, and update its canonical contract's mirror inventory. Preserve
+existing adapters and custom sync behavior; do not use blanket `--force` for a runtime upgrade.
+
+Kimi reuses `.agents/skills/` and `AGENTS.md`. Compare any existing Kimi-specific skills against
+canonical skills before relying on the shared mirror, since runtime-specific copies can take
+precedence. Keep platform-only project rules in adapters instead of duplicating shared rules.
 
 ## Introduce Governance
 
