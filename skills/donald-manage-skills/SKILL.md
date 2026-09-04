@@ -1,6 +1,6 @@
 ---
 name: donald-manage-skills
-description: Use when adding, updating, removing, auditing, validating, packaging, versioning, or publishing skills in a reusable multi-runtime Agent Skills repository.
+description: "Maintain a dedicated reusable multi-runtime Agent Skills distribution such as Donald Skills. Use for collection-level changes that require synchronizing plugin manifests or runtime mirrors, validating installer discovery, versioning, or publishing. Do not use for standalone or project-local skill authoring, skill installation, ordinary repository work, project Agent-infrastructure setup, or commit/push-only requests."
 ---
 
 # Manage Skill Repository

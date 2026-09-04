@@ -1,4 +1,7 @@
 interface:
-  display_name: "Prepare Chrome Over CDP"
-  short_description: "Set up or repair a reusable Chrome Profile binding"
-  default_prompt: "Use $donald-config-browser for first-time setup or repair: choose a target skill, bind its Chrome Profile, reuse shared per-Profile login state, and verify agent-browser over CDP."
+  display_name: "Configure Donald Browser Binding"
+  short_description: "Internal binding setup for Donald browser skills"
+  default_prompt: "Use $donald-config-browser to configure, inspect, change, reset, or repair the Chrome Profile binding for a specific Donald browser skill."
+
+policy:
+  allow_implicit_invocation: false

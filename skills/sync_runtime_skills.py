@@ -21,6 +21,7 @@ DEFAULT_TARGETS = [
     REPO / ".claude" / "skills",
     REPO / ".agents" / "skills",
     REPO / ".codebuddy" / "skills",
+    REPO / ".workbuddy" / "skills",
 ]
 
 

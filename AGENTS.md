@@ -51,7 +51,8 @@ asks for them. Prefer the smallest structure that satisfies the current request.
   the dependency and continue the original request. Report `needs_dependency` with exact
   install/retry guidance only when the user declines, installation fails, or the runtime cannot
   load the installed dependency.
-- `.claude/skills/` and `.agents/skills/` are generated runtime mirrors. Never hand-edit them;
+- `.claude/skills/`, `.agents/skills/`, `.codebuddy/skills/`, and `.workbuddy/skills/` are generated
+  runtime mirrors. Never hand-edit them;
   run `npm run build` after adding, renaming, moving, or removing a skill.
 - `package.json` is the only hand-maintained source for shared plugin metadata and version. Run
   `npm run build` to project those fields into every committed channel manifest; preserve

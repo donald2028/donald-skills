@@ -1,6 +1,6 @@
 ---
 name: donald-config-browser
-description: "Perform first-time setup or repair for Donald browser skills: install and verify agent-browser, select a local Chrome Profile, persist a per-skill binding, initialize shared per-Profile Chrome user-data-dirs, and prove headed Chrome control over CDP. Use when no binding exists, the user asks to inspect, change, or reset a binding, or a browser runner reports a configuration or environment failure; do not use as a gate before every routine browser task."
+description: "Internal configuration workflow for Donald browser business skills. Use only when a caller Skill invokes it, or an operator explicitly invokes it for that caller, to create, inspect, change, reset, or repair the caller's saved Chrome Profile binding, including after a reported configuration failure. Do not use for ordinary browsing, generic Chrome/Profile help, unrelated browser automation, or routine runs with a ready binding."
 ---
 
 # Configure Agent Browser Profile
@@ -13,9 +13,10 @@ valid for later tasks until the user changes it or a runner reports a configurat
 Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
 substituting it for `python3` in the command examples below.
 
-Other Donald browser workflows invoke this skill only for first-time setup or repair. When invoked
-that way, use the caller's skill name as `--scope`. Do not duplicate the caller's business workflow
-or import files from its skill directory.
+Donald browser workflows invoke this skill only to create, inspect, change, reset, or repair the
+caller's binding, including after a runner reports missing, stale, or incomplete configuration.
+When invoked by a caller, use its skill name as `--scope`. Do not duplicate the caller's business
+workflow or import files from its skill directory.
 
 Keep bindings separate from browser state:
 
@@ -75,6 +76,10 @@ performs the ordinary cleanup.
 
 ## Invocation Policy
 
+This is an internal dependency, not a general browser tool. Enter it only from a Donald browser
+business skill for that caller's exact scope, or through an operator's explicit invocation for one
+of those scopes.
+
 Routine browser tasks take the fast path: the caller runs its bundled business runner directly.
 That runner reads the saved binding and owns the live Chrome/CDP/agent-browser startup check. Do
 not invoke this skill, enumerate Profiles, or run a separate preflight merely because a new task
@@ -107,8 +112,8 @@ Profile for these known renames.
 
 ## Phase 1: Check The Environment For Setup Or Repair
 
-When this skill is used standalone and the target is unknown, list the independently configurable
-targets:
+When an operator explicitly invokes this skill and the target is unknown, list the independently
+configurable targets:
 
 ```bash
 python3 "$SKILL_DIR/scripts/profile_config.py" targets

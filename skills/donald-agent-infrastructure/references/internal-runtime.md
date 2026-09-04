@@ -1,34 +1,33 @@
 # Internal Runtime
 
-Run these commands from the `donald-agent-infrastructure` skill directory. Keep every skill-local
-path relative to that directory so the checks work regardless of the user name or installation
-root.
+Run these checks from the `donald-agent-infrastructure` Skill directory:
 
 ```bash
-python3 scripts/audit_project_skills.py --skills-root . --strict
-python3 scripts/test_init_project_agent_infra.py
-
-python3 -m py_compile \
-  scripts/audit_project_skills.py \
-  scripts/init_project_agent_infra.py
-
-DONALD_INFRA_SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/donald-agent-infra-smoke.XXXXXX")"
-python3 scripts/init_project_agent_infra.py \
-  "$DONALD_INFRA_SMOKE_ROOT" \
-  --project-name SmokeProject \
-  --profile pipeline \
-  --with-governance
-
-cd "$DONALD_INFRA_SMOKE_ROOT"
-python3 skills/development/review-skill-best-practices/scripts/audit_project_skills.py \
-  --skills-root skills \
-  --strict
-python3 skills/sync_runtime_skills.py
-python3 skills/sync_runtime_skills.py --check
+python scripts/audit_project_skills.py --skills-root .. --strict
+python scripts/test_audit_project_skills.py
+python scripts/test_init_project_agent_infra.py
+python -m py_compile scripts/*.py assets/templates/*.py
 ```
 
-The regression tests exercise all four profiles, shared Kimi discovery through `.agents/skills/`,
-WorkBuddy adapters and mirrors, supporting-file resolution, drift detection, dry-run behavior,
-and preservation of existing project files and WorkBuddy skills. They verify filesystem contracts,
-not live agent sessions. For Windows without symlink privileges, sync and check with `--copy`;
-preserve existing mirror edits before choosing copy mode, which replaces existing directories.
+The Subagent integration tests require PyYAML. Install it in an isolated test environment before
+claiming the complete Subagent path passed.
+
+Smoke-test a generated categorized project:
+
+```bash
+python scripts/init_project_agent_infra.py <temporary-repo> \
+  --project-name SmokeProject \
+  --layout categorized \
+  --with-entry \
+  --with-governance \
+  --with-subagents
+
+python <temporary-repo>/scripts/agent-skills/sync_runtime_skills.py
+python <temporary-repo>/scripts/agent-skills/sync_runtime_skills.py --check
+python <temporary-repo>/agents/sync_agents.py
+python <temporary-repo>/agents/sync_agents.py --check
+```
+
+Tests cover the two layouts, independent feature switches, removed profile CLI, mirror drift and
+ownership, Windows junction-first fallback order, forced modes, and Claude/Codex/CodeBuddy
+Subagent generation and safe cleanup. They verify filesystem contracts, not live agent sessions.

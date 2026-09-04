@@ -1,26 +1,25 @@
-# Agent-Led Skill Infrastructure
+# Agent-Led Multi-Skill Infrastructure
 
-Use this reference to design a project-local skill management structure that can scale from a
-small repo to a multi-stage agent pipeline.
+This architecture separates repository layout from optional workflow capabilities. Agent Skills
+standardizes each `SKILL.md` package; the repository taxonomy, entry routing, mirrors, governance,
+and subagent registry below are Donald project-management conventions.
 
-## Universal Pieces
+## Independent Layers
 
-An agent-led project has five separable layers:
+1. Project contract: `AGENTS.md`, with thin `CLAUDE.md` and `CODEBUDDY.md` adapters.
+2. Canonical skills: one flat or categorized root `skills/` tree.
+3. Runtime mirrors: generated `.claude/skills/`, `.agents/skills/`, `.codebuddy/skills/`, and
+   `.workbuddy/skills/`.
+4. Entry routing: an optional single `enter-project` Skill.
+5. Governance: an optional review Skill and structural audit.
+6. Subagents: an optional registry and Claude/Codex/CodeBuddy generator.
 
-1. Project contract: `AGENTS.md` is the canonical cross-runtime contract. `CLAUDE.md` and
-   `CODEBUDDY.md` are thin runtime adapters or contain only runtime-specific additions.
-2. Canonical skills: `skills/` contains the source of truth for project-local workflows.
-3. Runtime mirrors: `.claude/skills/`, `.agents/skills/`, and `.codebuddy/skills/` expose the same
-   skills to different runtimes without duplicate hand maintenance.
-4. Governance: an optional project-local review skill and audit script provide quality gates.
-5. Subagents: an optional canonical registry generates runtime-specific agent definitions.
+The layers are independent. Categorization does not imply routing; routing does not imply
+governance; subagents do not require either.
 
-Keep these layers independent. A simple repo may use only the first three. A complex pipeline may
-use all five.
+## Canonical Skill Layout
 
-## Supported Skill Layouts
-
-Flat layout:
+Flat, the default:
 
 ```text
 skills/
@@ -28,184 +27,147 @@ skills/
     SKILL.md
 ```
 
-Use flat layout for small projects with a few user-facing workflows.
-
-Categorized layout:
+Categorized, for genuine families:
 
 ```text
 skills/
   application/run-workflow/SKILL.md
   collection/collect-source/SKILL.md
-  distillation/build-package/SKILL.md
   review/review-package/SKILL.md
 ```
 
-Use categorized layout when the repo has internal skill families, modes, or multi-step pipelines.
+New projects use exactly one shape. Category and Skill directories use kebab-case, Skill names are
+globally unique, and no Skill may import or read a sibling by repository-relative path. Mixed or
+deeper trees are invalid for new scaffolds; mixed layout is recognized only while planning a
+non-destructive migration.
 
-Mixed layout is allowed during migration. Discovery scripts should treat every directory with a
-`SKILL.md` below `skills/` as a skill, then fail on duplicate skill names.
+A Skill requires only `SKILL.md`. Add `references/`, `scripts/`, `assets/`, `evals/`, or
+`agents/openai.yaml` only when needed.
 
-## Entry Skill Pattern
+## Optional Entry And Governance
 
-Use an entry skill when a repo has any of these:
-
-- user mode vs builder mode
-- published/current capability inventory
-- workflow routing
-- project-specific safety or evidence boundaries
-- generic skills that should not bypass project rules
-
-The entry skill should:
-
-1. classify the request
-2. read only the lightweight runtime observations needed
-3. route to the narrowest downstream skill
-4. answer with outcomes, not raw commands
-5. explain capability gaps honestly
-
-Do not make every skill an entry skill. Keep exactly one default entry point unless a runtime
-forces another shape.
-
-## Skill Anatomy
-
-Base project skill structure:
+Use one entry Skill when requests require capability discovery, user/builder mode selection,
+project safety boundaries, or cross-Skill routing. Its path depends on layout:
 
 ```text
-skill-name/
-  SKILL.md
+flat:         skills/enter-project/
+categorized:  skills/application/enter-project/
 ```
 
-Add supporting resources only when they improve the workflow:
+The entry classifies the request, reads only lightweight observations, routes to the narrowest
+Skill, and explains unsupported work. It is not a workflow engine.
+
+Governance is independently enabled at:
 
 ```text
-skill-name/
-  SKILL.md                    required
-  references/                 optional detailed guidance
-  scripts/                    optional deterministic helpers
-  assets/                     optional output templates or resources
-  evals/                      optional behavioral evaluations
-  agents/openai.yaml          optional OpenAI UI metadata
+flat:         skills/review-skill-best-practices/
+categorized:  skills/development/review-skill-best-practices/
 ```
 
-Keep short commands and output expectations in `SKILL.md`. Use focused reference files when the
-detail is conditional or substantial; names such as `internal-runtime.md` and
-`output-contract.md` are conventions, not requirements.
+Its audit checks structure and repository conventions; the main agent still judges workflow
+quality and semantics.
 
-## Runtime Mirror Pattern
+## Runtime Skill Mirrors
 
 Canonical source:
 
 ```text
-skills/<maybe-category>/<skill-name>/
+skills/<skill>/
+skills/<category>/<skill>/
 ```
 
-Disposable generated mirrors:
+Generated flat runtime views:
 
 ```text
-.claude/skills/<skill-name> -> ../../skills/<maybe-category>/<skill-name>
-.agents/skills/<skill-name> -> ../../skills/<maybe-category>/<skill-name>
-.codebuddy/skills/<skill-name> -> ../../skills/<maybe-category>/<skill-name>
+.claude/skills/<skill-name>
+.agents/skills/<skill-name>
+.codebuddy/skills/<skill-name>
+.workbuddy/skills/<skill-name>
 ```
 
-Prefer relative directory symlinks so references and scripts resolve the same way from the skill
-root. Use copy mode only for environments that cannot use symlinks. After adoption, runtime
-mirrors are compiler output: regenerate them from `skills/` and never maintain them by hand.
+The generated `scripts/agent-skills/sync_runtime_skills.py` embeds the layout selected during
+initialization, rejects later layout drift, flattens the canonical tree by globally unique Skill
+name, and records managed output in
+`.agent-infra/runtime-skill-mirrors.json`.
 
-## Runtime Coverage
+Default modes:
 
-The scaffold configures project rules and skill discovery, independently of plugin packaging.
+- Windows: NTFS junction, then directory symlink, then copy.
+- Linux/macOS: relative directory symlink, then copy.
 
-| Runtime | Project contract | Default skill mirror |
+Junctions are preferred on Windows because mirrors are local disposable output and junctions do
+not normally require elevated symlink privileges. Forced `--junction`, `--symlink`, and `--copy`
+modes never fall back. Copy mode hashes the full tree so `--check` detects drift.
+
+Only manifest-managed orphans are removed. Unknown runtime paths are preserved unless the user
+explicitly passes `--replace-existing` after preserving hand edits.
+
+| Runtime | Project contract | Skill mirror |
 |---|---|---|
 | Claude Code | `CLAUDE.md` reads `AGENTS.md` | `.claude/skills/` |
 | Codex | `AGENTS.md` | `.agents/skills/` |
-| WorkBuddy / CodeBuddy Code | `CODEBUDDY.md` reads `AGENTS.md` | `.codebuddy/skills/` |
+| CodeBuddy Code / CodeBuddy IDE | `CODEBUDDY.md` reads `AGENTS.md` | `.codebuddy/skills/` |
+| Tencent WorkBuddy | No generated rule adapter | `.workbuddy/skills/` |
 | Kimi Code | `AGENTS.md` | `.agents/skills/` |
-| OpenCode | `AGENTS.md` | `.agents/skills/` (also supports `.claude/skills/`) |
+| OpenCode | `AGENTS.md` | `.agents/skills/` and compatible `.claude/skills/` |
 
-Kimi needs no separate mirror or plugin manifest for project-local skills. Existing Kimi-specific
-directories may override shared skills; preserve and reconcile divergent copies during migration.
-For another runtime, verify its current official project-rule and skill-discovery paths first,
-then extend the generated helper's `DEFAULT_TARGETS` and add a thin rule adapter only if needed.
-For one-off syncing, repeat `--target` for every desired directory; it replaces the default target
-list and is not persisted. Do not infer a directory from the product name.
+## Subagent Registry
 
-Sources checked on 2026-09-04:
+Enable subagents only for recurring isolated roles such as workers, reviewers, or synthesizers.
+The initializer creates infrastructure, not fictional roles:
 
-- [CodeBuddy Code Skills](https://www.codebuddy.cn/docs/cli/skills) documents `.codebuddy/skills/`.
-- [CodeBuddy project memory](https://www.codebuddy.ai/docs/cli/memory) documents `CODEBUDDY.md`.
-- [WorkBuddy Skills](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Skills-Market)
-  documents local skill import. The scaffold targets its CodeBuddy Code project runtime; verify
-  discovery in the installed WorkBuddy version before claiming an end-to-end runtime check.
-- [Kimi Code Skills](https://moonshotai.github.io/kimi-code/zh/customization/skills.html) documents
-  the shared `.agents/skills/` and runtime-specific `.kimi-code/skills/` paths.
-- [Kimi Code agents](https://moonshotai.github.io/kimi-code/en/customization/agents) documents
-  project-level `AGENTS.md`.
+```text
+agents/
+  README.md
+  registry.yaml
+  sync_agents.py
+```
 
-## Subagent Registry Pattern
-
-Use a subagent registry only when a project has recurring isolated roles, such as cleaners,
-reviewers, synthesizers, or data workers.
-
-Single source:
+Canonical sources:
 
 ```text
 agents/registry.yaml
-skills/<owner>/<skill>/references/<agent-spec>.md
+skills/<skill>/references/<role>-agent.md
+skills/<category>/<skill>/references/<role>-agent.md
 ```
 
-Generated runtime files:
+Generated output:
 
 ```text
 .claude/agents/<id>.md
 .codex/agents/<id>.toml
+.codebuddy/agents/<id>.md
 agents/INDEX.md
 ```
 
-Keep behavior in the spec file, wiring in the registry, and generated runtime files disposable.
-This generator targets Claude/Codex only. WorkBuddy/Kimi subagent adapters are not included.
+The registry owns metadata and runtime wiring; the Skill-owned spec owns behavior. An empty
+registry is valid. `sync_agents.py --check` detects missing, changed, and stale generated files.
+Synchronization removes only files carrying its generated notice, preserves unknown files, and
+requires `--replace-existing` for a same-path user file. The generator targets Claude, Codex, and
+CodeBuddy Code. CodeBuddy definitions default to `model: inherit`; a model tier
+may set `codebuddy` and `codebuddy_effort`, and an agent may set `codebuddy_tools` when its
+CodeBuddy tool allowlist differs from Claude's.
 
-## Profiles
+WorkBuddy project Skills use their own `.workbuddy/skills/` mirror. WorkBuddy marketplace Skills,
+Experts, and Expert Teams remain installed product-level artifacts, so the initializer neither
+fabricates their package metadata nor writes into WorkBuddy's user-level state.
 
-`minimal`:
+## CLI Composition
 
-- canonical `AGENTS.md`
-- thin `CLAUDE.md` adapter
-- thin `CODEBUDDY.md` adapter
-- `skills/`
-- `skills/sync_runtime_skills.py`
+```text
+--layout flat|categorized
+--with-entry
+--with-governance
+--with-subagents
+```
 
-`categorized`:
-
-- minimal profile
-- `skills/README.md`
-- categorized canonical skill tree
-
-`pipeline`:
-
-- categorized profile
-- `skills/application/enter-project/`
-- explicit user/builder modes
-- runtime observation references
-
-`subagents`:
-
-- pipeline profile
-- `agents/registry.yaml`
-- `agents/sync_agents.py`
-- generated `.claude/agents` and `.codex/agents`
-
-Choose the smallest profile that keeps the project understandable.
-
-Governance is an independent optional layer available with `--with-governance`. It adds
-`skills/development/review-skill-best-practices/` and its audit helper without forcing the project
-to adopt pipeline routing or subagents.
+The switches map one-to-one to output and may be combined independently. There are no cumulative
+profiles or implicit capability bundles.
 
 ## Red Lines
 
-- Do not let runtime output choose semantic routing by itself.
-- Do not hand-edit generated mirrors once a sync script owns them.
-- Do not duplicate shared project rules between `AGENTS.md` and its runtime adapters, or workflow
-  behavior between contract files and `SKILL.md`.
-- Do not commit runtime data as source. Promote small fixtures into tests instead.
-- Do not hide mutable state behind stale hard-coded capability claims.
+- Do not hand-edit generated mirrors or agent definitions.
+- Do not let runtime observations choose semantic routing by themselves.
+- Do not duplicate shared rules across contract adapters or workflow behavior across files.
+- Do not commit runtime state as canonical source.
+- Do not hard-code mutable capability claims.

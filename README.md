@@ -14,7 +14,7 @@ ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发�
 - `donald-manage-skills`：维护、验证、打包和发布可复用的多运行时 Skill 仓库。
 - `donald-safe-commit`：审查并安全提交 Git 变更，仅在用户要求时推送。
 - `donald-research-github`：把 GitHub 仓库获取到可配置的调研目录并按需分析。
-- `donald-config-browser`：为每个工具单独选择 Chrome Profile；相同 Profile 复用同一份 CDP User Data 和 Cookie。
+- `donald-config-browser`：供 Donald 浏览器业务 skill 内部管理各自的 Chrome Profile 绑定；相同 Profile 复用同一份 CDP User Data 和 Cookie。
 - `donald-collect-wechat`：采集公众号文章列表和公开正文。
 - `donald-collect-x`：采集 X 账号帖子、thread、Article 和媒体。
 - `donald-chatgpt-imagegen`：通过可恢复的 ChatGPT Web 浏览器任务外部出图。
@@ -96,9 +96,9 @@ npx skills add donald2028/donald-skills -g
 
 ### WorkBuddy
 
-WorkBuddy 内置的 CodeBuddy Code runtime 会原生发现项目级
-`.codebuddy/skills/<name>/SKILL.md`。本仓库的同步脚本会维护该镜像；在仓库目录中打开
-WorkBuddy 即可使用，不需要额外的 plugin manifest。
+WorkBuddy 会原生发现项目级 `.workbuddy/skills/<name>/SKILL.md`。本仓库的同步脚本会维护
+该独立镜像；在仓库目录中打开 WorkBuddy 即可使用，不需要借用 `.codebuddy/skills/`，也不
+需要额外的 plugin manifest。`.codebuddy/skills/` 继续专供 CodeBuddy Code 和 CodeBuddy IDE。
 
 ## 构建与版本同步
 
@@ -137,7 +137,8 @@ donald-skills/
 ├── skills/                         # 唯一的 skill 源码目录
 ├── .claude/skills/                 # 生成的 Claude Code 项目级镜像
 ├── .agents/skills/                 # 生成的 Codex 项目级镜像
-├── .codebuddy/skills/               # 生成的 WorkBuddy 项目级镜像
+├── .codebuddy/skills/               # 生成的 CodeBuddy 项目级镜像
+├── .workbuddy/skills/               # 生成的 WorkBuddy 项目级镜像
 ├── .claude-plugin/
 │   ├── marketplace.json            # Claude marketplace
 │   └── plugin.json                 # Claude plugin manifest
@@ -152,9 +153,10 @@ donald-skills/
 ```
 
 `skills/` 是唯一需要手工维护的 skill 源。`.claude/skills/`、`.agents/skills/` 和
-`.codebuddy/skills/` 由同步脚本生成，避免维护多份副本；OpenCode 会直接利用前两份兼容目录，
-WorkBuddy 会利用 `.codebuddy/skills/`。Claude、Codex、Cursor、Kimi Code 和 Gemini CLI 的
-plugin/extension manifest 也都指向根目录的 `skills/`，避免运行时之间出现内容漂移。
+`.codebuddy/skills/` 和 `.workbuddy/skills/` 由同步脚本分别生成，避免维护多份源码；OpenCode
+会直接利用 `.claude/skills/` 和 `.agents/skills/` 兼容目录。Claude、Codex、Cursor、Kimi Code
+和 Gemini CLI 的 plugin/extension manifest 也都指向根目录的 `skills/`，避免运行时之间出现
+内容漂移。
 
 浏览器业务 skill 把 `donald-config-browser` 声明为首次配置和故障修复用的 `REQUIRED SUB-SKILL`。
 第一次使用时，由它完成环境、Profile 绑定和一次 CDP 验证；绑定成功后，后续任务直接进入各自

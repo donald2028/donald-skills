@@ -1,69 +1,53 @@
 # Migration Process
 
-Use this process when a repo already has skills or runtime-specific copies.
+Use this process for an existing repository. The initializer is designed for new scaffolds and does
+not migrate old generated projects or accept the removed `--profile` interface.
 
 ## Read-Only Inventory
 
-1. List `AGENTS.md`, `CLAUDE.md`, `CODEBUDDY.md`, `skills/`, `.claude/skills/`, `.agents/skills/`,
-   `.codebuddy/skills/`, `.kimi-code/skills/`, legacy `.kimi/skills/`, `.codex/agents/`, and `agents/`.
-   Include other runtime-specific directories already in use.
-2. Compare skill names and file contents across canonical and mirror folders.
-3. Identify whether the repo is flat, categorized, mixed, or already generated.
-4. Check git status and treat uncommitted changes as user-owned.
+1. Inventory project contracts, root `skills/`, runtime Skill mirrors including
+   `.workbuddy/skills/`, `agents/`, and generated Claude/Codex/CodeBuddy agent directories.
+2. Compare names and content across canonical and runtime-specific copies.
+3. Identify the actual layout as flat, categorized, mixed, or invalid.
+4. Read Git status and treat uncommitted changes as user-owned.
 
-## Decide Ownership
+## Establish Ownership
 
-Pick one canonical source:
+- Prefer root `skills/` as canonical.
+- Preserve divergent runtime content before replacing any mirror.
+- Choose flat or categorized as the target; mixed layout is only an intermediate migration state.
+- Keep Skill resources self-contained and replace repository-relative sibling imports with
+  explicit workflow invocation where appropriate.
+- Validate required sub-skills for missing targets, self-reference, and cycles.
 
-- Prefer root `skills/` for project-local skills.
-- Treat `.claude/skills/`, `.agents/skills/`, and `.codebuddy/skills/` as generated mirrors.
-- If only a runtime mirror exists, copy the best version into root `skills/` before replacing the
-  mirror with symlinks.
+## Adopt Generated Mirrors
 
-Do not delete divergent files until you have either preserved them in canonical `skills/` or shown
-the user the divergence. After ownership is established, runtime mirrors are disposable generated
-output and may be replaced on every sync.
+Place the new helper at `scripts/agent-skills/sync_runtime_skills.py`. Before its first run, treat
+all existing runtime paths as unknown and preserve them. Use `--replace-existing` only after
+canonical content is complete and divergent files have been saved.
 
-## Upgrade Existing Scaffolds
+The first successful sync writes `.agent-infra/runtime-skill-mirrors.json`; later cleanup is limited
+to entries recorded there. Do not fabricate manifest ownership for directories you did not verify.
 
-The initializer skips existing files, including `skills/sync_runtime_skills.py`. To add WorkBuddy
-to an older project, merge `.codebuddy/skills/` into that helper's `DEFAULT_TARGETS`, create the
-missing `CODEBUDDY.md` adapter, and update its canonical contract's mirror inventory. Preserve
-existing adapters and custom sync behavior; do not use blanket `--force` for a runtime upgrade.
+## Add Optional Layers
 
-Kimi reuses `.agents/skills/` and `AGENTS.md`. Compare any existing Kimi-specific skills against
-canonical skills before relying on the shared mirror, since runtime-specific copies can take
-precedence. Keep platform-only project rules in adapters instead of duplicating shared rules.
+- Add one layout-appropriate `enter-project` Skill only for real routing or mode selection.
+- Add the layout-appropriate governance Skill only when the project adopts local quality gates.
+- Add `agents/registry.yaml` only for recurring isolated roles. Keep role behavior in an owning
+  Skill's references and generate Claude/Codex/CodeBuddy adapters.
+- Do not infer that enabling one optional layer requires another.
 
-## Introduce Governance
+## Verify
 
-1. Add `skills/sync_runtime_skills.py`.
-2. Add `skills/development/review-skill-best-practices/` only when the project adopts the optional
-   governance layer.
-3. Run the audit script when governance is present and fix hard errors.
-4. Run the sync script in `--check` mode before replacing mirrors.
-5. Convert mirrors to generated links or copies only after the canonical source is correct.
-
-## Add Entry Routing
-
-Add `skills/application/enter-project/` only when the project needs routing or modes. Categorizing
-skills alone does not require an entry skill. The entry skill
-should read the live state it needs and route internally. It should not duplicate every downstream
-skill.
-
-## Optional Subagents
-
-Add `agents/registry.yaml` only if the repo needs generated subagent definitions. Do not create a
-registry just because one exists in a reference project.
-
-## Verification
-
-Run these from the target repo when available:
+From the target repository, run the applicable checks:
 
 ```bash
-python3 skills/sync_runtime_skills.py --check
-python3 skills/development/review-skill-best-practices/scripts/audit_project_skills.py --skills-root skills
+python <governance-skill>/scripts/audit_project_skills.py --skills-root skills --strict
+python scripts/agent-skills/sync_runtime_skills.py
+python scripts/agent-skills/sync_runtime_skills.py --check
+python agents/sync_agents.py
+python agents/sync_agents.py --check
 ```
 
-Then run the repo's normal tests or at least a smoke command that proves the generated scripts can
-execute.
+Run the project's normal tests afterward. Report any runtime whose discovery or subagent format was
+not actually validated.
