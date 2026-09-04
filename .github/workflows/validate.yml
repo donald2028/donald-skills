@@ -29,4 +29,7 @@ jobs:
           python3 -m json.tool .agents/plugins/marketplace.json >/dev/null
 
       - name: Validate generated manifests and runtime mirrors
-        run: python3 scripts/build.py --check
+        run: |
+          python3 scripts/build.py
+          git diff --exit-code
+          python3 scripts/build.py --check
