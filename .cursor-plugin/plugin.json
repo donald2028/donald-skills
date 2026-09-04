@@ -1,8 +1,8 @@
 {
   "name": "donald-skills",
   "displayName": "Donald Skills",
-  "version": "0.2.5",
-  "description": "A reusable skill collection for Claude Code, Codex, Cursor, Gemini CLI, Kimi Code, OpenCode, and compatible agents.",
+  "version": "0.3.0",
+  "description": "A reusable skill collection for Claude Code, Codex, Cursor, Gemini CLI, Kimi Code, OpenCode, WorkBuddy, and compatible agents.",
   "author": {
     "name": "donald2028",
     "email": "donald202401@gmail.com",
@@ -19,7 +19,8 @@
     "cursor",
     "gemini-cli",
     "kimi",
-    "opencode"
+    "opencode",
+    "workbuddy"
   ],
   "skills": "./skills/"
 }

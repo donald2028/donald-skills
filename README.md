@@ -1,13 +1,16 @@
 # Donald Skills
 
-Donald 常用 Agent Skills 的统一仓库，面向 Claude Code、Codex、Cursor、Gemini CLI、Kimi Code、OpenCode 和兼容 Agent Skills 规范的运行时。
+Donald 常用 Agent Skills 的统一仓库，面向 Claude Code、Codex、Cursor、Gemini CLI、Kimi Code、OpenCode、WorkBuddy 和兼容 Agent Skills 规范的运行时。
 
-当前版本包含仓库维护、安全 Git 提交、统一存储约定、GitHub 仓库调研、按工具独立绑定且按
-Profile 共享登录状态的浏览器配置，以及微信公众号采集、X 内容采集和 ChatGPT Web 外部出图等
-通用 skill。下面的安装入口可以直接发现并安装 `skills/<name>/SKILL.md` 中的内容。
+当前版本包含 Agent 项目基础设施、仓库维护、安全 Git 提交、统一存储约定、GitHub 仓库调研、
+按工具独立绑定且按 Profile 共享登录状态的浏览器配置，以及微信公众号采集、X 内容采集和
+ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发现并安装
+`skills/<name>/SKILL.md` 中的内容。
 
 当前工具 skills：
 
+- `donald-agent-infrastructure`：初始化、迁移和审计项目级 Agent/Skill 基础设施。
+- `donald-manage-skills`：维护、验证、打包和发布可复用的多运行时 Skill 仓库。
 - `donald-safe-commit`：审查并安全提交 Git 变更，仅在用户要求时推送。
 - `donald-research-github`：把 GitHub 仓库获取到可配置的调研目录并按需分析。
 - `donald-config-browser`：为每个工具单独选择 Chrome Profile；相同 Profile 复用同一份 CDP User Data 和 Cookie。
@@ -90,11 +93,17 @@ npx skills add donald2028/donald-skills -g
 
 不需要额外的 OpenCode 插件或 `opencode.json` 配置。
 
+### WorkBuddy
+
+WorkBuddy 内置的 CodeBuddy Code runtime 会原生发现项目级
+`.codebuddy/skills/<name>/SKILL.md`。本仓库的同步脚本会维护该镜像；在仓库目录中打开
+WorkBuddy 即可使用，不需要额外的 plugin manifest。
+
 ## 构建与版本同步
 
 `package.json` 是插件名称、版本、描述、作者、仓库地址和关键词的唯一维护入口。普通
 build 会把这些共享字段同步到所有 channel manifest 和 marketplace，把 canonical 浏览器
-运行时 vendoring 到各浏览器业务 skill，并刷新 Claude/Codex runtime mirrors：
+运行时 vendoring 到各浏览器业务 skill，并刷新 Claude/Codex/WorkBuddy runtime mirrors：
 
 构建命令会自动选择可用的 Python 3：macOS/Linux 优先 `python3`，Windows 优先 `python`
 （其次为 `py -3`）。需要使用非默认解释器时，可设置 `PYTHON` 环境变量。
@@ -127,6 +136,7 @@ donald-skills/
 ├── skills/                         # 唯一的 skill 源码目录
 ├── .claude/skills/                 # 生成的 Claude Code 项目级镜像
 ├── .agents/skills/                 # 生成的 Codex 项目级镜像
+├── .codebuddy/skills/               # 生成的 WorkBuddy 项目级镜像
 ├── .claude-plugin/
 │   ├── marketplace.json            # Claude marketplace
 │   └── plugin.json                 # Claude plugin manifest
@@ -140,7 +150,10 @@ donald-skills/
 └── CLAUDE.md -> AGENTS.md          # Claude Code 共享同一份约定
 ```
 
-`skills/` 是唯一需要手工维护的 skill 源。`.claude/skills/` 和 `.agents/skills/` 由同步脚本生成，避免维护多份副本；OpenCode 会直接利用这两份官方支持的兼容目录。Claude、Codex、Cursor、Kimi Code 和 Gemini CLI 的 plugin/extension manifest 也都指向根目录的 `skills/`，避免运行时之间出现内容漂移。
+`skills/` 是唯一需要手工维护的 skill 源。`.claude/skills/`、`.agents/skills/` 和
+`.codebuddy/skills/` 由同步脚本生成，避免维护多份副本；OpenCode 会直接利用前两份兼容目录，
+WorkBuddy 会利用 `.codebuddy/skills/`。Claude、Codex、Cursor、Kimi Code 和 Gemini CLI 的
+plugin/extension manifest 也都指向根目录的 `skills/`，避免运行时之间出现内容漂移。
 
 浏览器业务 skill 把 `donald-config-browser` 声明为首次配置和故障修复用的 `REQUIRED SUB-SKILL`。
 第一次使用时，由它完成环境、Profile 绑定和一次 CDP 验证；绑定成功后，后续任务直接进入各自

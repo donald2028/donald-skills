@@ -55,6 +55,7 @@ outputs/
 # Generated runtime skill mirrors (rebuilt from canonical skills/)
 .claude/skills/
 .agents/skills/
+.codebuddy/skills/
 
 # Editors and operating systems
 .DS_Store

@@ -16,7 +16,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = REPO / "skills"
-DEFAULT_TARGETS = [REPO / ".claude" / "skills", REPO / ".agents" / "skills"]
+DEFAULT_TARGETS = [
+    REPO / ".claude" / "skills",
+    REPO / ".agents" / "skills",
+    REPO / ".codebuddy" / "skills",
+]
 
 
 def discover_skills() -> dict[str, Path]:
