@@ -9,7 +9,6 @@ import stat
 import textwrap
 from pathlib import Path
 
-
 NAME_RE = re.compile(r"^(?=.{1,64}$)[a-z0-9]+(?:-[a-z0-9]+)*$")
 GITIGNORE_BEGIN = "# BEGIN donald-agent-infrastructure generated"
 GITIGNORE_END = "# END donald-agent-infrastructure generated"
@@ -70,18 +69,14 @@ def validate_existing_layout(skills_root: Path, expected_layout: str) -> None:
 
 
 def managed_gitignore(has_subagents: bool) -> str:
-    lines = [
-        GITIGNORE_BEGIN,
-        ".claude/skills/",
-        ".agents/skills/",
-        ".codebuddy/skills/",
-        ".workbuddy/skills/",
-        ".agent-infra/",
-    ]
-    if has_subagents:
-        lines.extend([".claude/agents/", ".codex/agents/", ".codebuddy/agents/", "agents/INDEX.md"])
-    lines.append(GITIGNORE_END)
-    return "\n".join(lines)
+    if not has_subagents:
+        return ""
+    return f"""{GITIGNORE_BEGIN}
+.claude/agents/
+.codex/agents/
+.codebuddy/agents/
+agents/INDEX.md
+{GITIGNORE_END}"""
 
 
 def update_gitignore(repo: Path, *, has_subagents: bool, dry_run: bool) -> str:
@@ -93,7 +88,17 @@ def update_gitignore(repo: Path, *, has_subagents: bool, dry_run: bool) -> str:
     if GITIGNORE_BEGIN in current:
         start = current.index(GITIGNORE_BEGIN)
         end = current.index(GITIGNORE_END, start) + len(GITIGNORE_END)
-        updated = current[:start] + block + current[end:]
+        if block:
+            updated = current[:start] + block + current[end:]
+        else:
+            before = current[:start].rstrip("\n")
+            after = current[end:].lstrip("\n")
+            separator = "\n\n" if before and after else ""
+            updated = before + separator + after
+            if updated and not updated.endswith("\n"):
+                updated += "\n"
+    elif not block:
+        return f"unchanged {path}"
     else:
         separator = "" if not current else ("\n" if current.endswith("\n") else "\n\n")
         updated = current + separator + block + "\n"
@@ -113,11 +118,29 @@ def agents_md(
     title: str,
     *,
     layout: str,
+    skills_root: Path,
     entry_path: Path | None,
     governance_path: Path | None,
     has_subagents: bool,
 ) -> str:
-    expected = "skills/<skill>/SKILL.md" if layout == "flat" else "skills/<category>/<skill>/SKILL.md"
+    source = skills_root.as_posix()
+    expected = f"{source}/<skill>/SKILL.md" if layout == "flat" else f"{source}/<category>/<skill>/SKILL.md"
+    if skills_root == Path("skills"):
+        source_contract = textwrap.dedent(
+            f"""\
+            - Treat `{source}/` as the canonical project Skill authoring source.
+            - This authoring tree is not a runtime discovery path. Do not link or copy it into
+              `.claude/skills/`, `.agents/skills/`, `.codebuddy/skills/`, or `.workbuddy/skills/`
+              during normal editing.
+            """
+        )
+    else:
+        source_contract = textwrap.dedent(
+            f"""\
+            - Treat `{source}/` as the only hand-maintained, explicitly selected repository Skill source.
+            - Do not maintain a second `skills/` source or mirror this tree into other runtime paths.
+            """
+        )
     content = textwrap.dedent(
         f"""\
         # Agent Instructions
@@ -127,21 +150,20 @@ def agents_md(
 
         ## Project Skills
 
-        - Treat root `skills/` as the canonical project skill source.
+        """
+    )
+    content += source_contract
+    content += textwrap.dedent(
+        f"""\
         - This project uses the `{layout}` layout: `{expected}`.
         - Do not introduce mixed layouts or duplicate skill names.
-        - Treat `.claude/skills/`, `.agents/skills/`, `.codebuddy/skills/`, and
-          `.workbuddy/skills/` as generated output.
-        - Kimi Code and OpenCode reuse `.agents/skills/`; CodeBuddy uses `.codebuddy/skills/`;
-          Tencent WorkBuddy uses `.workbuddy/skills/`.
         - Keep every skill self-contained. Do not import or read a sibling skill by repository path.
 
         ## Repo Boundaries
 
         - Work from the repo root.
-        - Do not hand-edit generated runtime mirrors.
-        - After changing canonical skills, run
-          `python scripts/agent-skills/sync_runtime_skills.py` and then its `--check` mode.
+        - Treat runtime installation and cross-runtime distribution as separate, explicit operations
+          for a named consumer; do not create compatibility directories speculatively.
         - Do not commit runtime data as source; promote small stable examples into tests or fixtures.
         """
     )
@@ -162,8 +184,8 @@ def agents_md(
 
             ## Skill Governance
 
-            Use `{governance_path.as_posix()}/SKILL.md` after changing canonical skills or runtime
-            mirrors. Treat audit output as evidence for agent judgment, not semantic routing.
+            Use `{governance_path.as_posix()}/SKILL.md` after changing canonical skills. Treat audit
+            output as evidence for agent judgment, not semantic routing.
             """
         )
     if has_subagents:
@@ -205,26 +227,26 @@ def codebuddy_md() -> str:
     )
 
 
-def skills_readme(title: str) -> str:
+def skills_readme(title: str, skills_root: Path) -> str:
+    source = skills_root.as_posix()
+    registration = (
+        "This authoring tree is not installed into any runtime discovery path."
+        if skills_root == Path("skills")
+        else "This explicitly selected repository directory is the only Skill source."
+    )
     return textwrap.dedent(
         f"""\
         # Project Skills
 
-        Root `skills/` is the canonical source for {title}'s categorized agent workflows. Every
-        skill uses `skills/<category>/<skill>/SKILL.md`; mixed and deeper layouts are invalid.
+        `{source}/` is the canonical source for {title}'s categorized agent workflows. Every
+        skill uses `{source}/<category>/<skill>/SKILL.md`; mixed and deeper layouts are invalid.
+        {registration}
 
         Categories are project-defined. Common examples include `application/`, `collection/`,
         `distillation/`, `review/`, `orchestration/`, and `development/`.
 
         A skill requires only `SKILL.md`. Add `references/`, `scripts/`, `assets/`, `evals/`, or
         `agents/openai.yaml` only when the workflow needs them. Keep every skill self-contained.
-
-        Synchronize and verify runtime mirrors from the repository root:
-
-        ```bash
-        python scripts/agent-skills/sync_runtime_skills.py
-        python scripts/agent-skills/sync_runtime_skills.py --check
-        ```
         """
     )
 
@@ -259,7 +281,7 @@ def enter_skill(title: str) -> str:
     )
 
 
-def enter_internal_runtime() -> str:
+def enter_internal_runtime(skills_root: Path) -> str:
     return textwrap.dedent(
         """\
         # Internal Runtime
@@ -268,8 +290,7 @@ def enter_internal_runtime() -> str:
 
         ```bash
         git status --short
-        find skills -name SKILL.md -print | sort
-        python scripts/agent-skills/sync_runtime_skills.py --check
+        find {skills_root.as_posix()} -name SKILL.md -print | sort
         ```
         """
     )
@@ -288,7 +309,7 @@ def enter_output_contract() -> str:
     )
 
 
-def review_skill() -> str:
+def review_skill(skills_root: Path) -> str:
     return textwrap.dedent(
         """\
         ---
@@ -298,9 +319,8 @@ def review_skill() -> str:
 
         # Review Skill Best Practices
 
-        Review canonical project skills under root `skills/`. Confirm valid frontmatter, concise
-        instructions, self-contained resources, valid required sub-skill dependencies, and generated
-        runtime mirrors.
+        Review canonical project skills under `{skills_root.as_posix()}/`. Confirm valid frontmatter,
+        concise instructions, self-contained resources, and valid required sub-skill dependencies.
 
         Read `references/internal-runtime.md` for exact checks and
         `references/output-contract.md` for the review result.
@@ -308,7 +328,7 @@ def review_skill() -> str:
     )
 
 
-def review_internal_runtime(review_path: Path, layout: str) -> str:
+def review_internal_runtime(review_path: Path, skills_root: Path, layout: str) -> str:
     audit = review_path / "scripts" / "audit_project_skills.py"
     return textwrap.dedent(
         f"""\
@@ -317,8 +337,7 @@ def review_internal_runtime(review_path: Path, layout: str) -> str:
         Run from the repository root:
 
         ```bash
-        python {audit.as_posix()} --skills-root skills --layout {layout} --strict
-        python scripts/agent-skills/sync_runtime_skills.py --check
+        python {audit.as_posix()} --skills-root {skills_root.as_posix()} --layout {layout} --strict
         ```
 
         The audit checks the project layout and repository conventions. It does not replace agent
@@ -332,8 +351,8 @@ def review_output_contract() -> str:
         """\
         # Review Output Contract
 
-        Return status, skills checked, blocking issues, warnings, runtime mirror status, and the
-        verification commands that ran.
+        Return status, skills checked, blocking issues, warnings, runtime-registration observations,
+        and the verification commands that ran.
         """
     )
 
@@ -391,6 +410,11 @@ def main() -> int:
         default="flat",
         help="Canonical skill directory layout (default: flat).",
     )
+    parser.add_argument(
+        "--skills-root",
+        default="skills",
+        help="Single canonical Skill source relative to the repository (default: skills).",
+    )
     parser.add_argument("--with-entry", action="store_true", help="Scaffold the project entry skill.")
     parser.add_argument(
         "--with-governance",
@@ -409,7 +433,10 @@ def main() -> int:
     repo = Path(args.repo).expanduser().resolve()
     if not repo.exists():
         raise SystemExit(f"repo does not exist: {repo}")
-    validate_existing_layout(repo / "skills", args.layout)
+    skills_root = Path(args.skills_root)
+    if skills_root.is_absolute() or ".." in skills_root.parts or skills_root == Path("."):
+        raise SystemExit("--skills-root must be a non-empty repository-relative path without '..'")
+    validate_existing_layout(repo / skills_root, args.layout)
 
     title = project_title(repo, args.project_name)
     entry_relative = skill_path(args.layout, "enter-project", "application") if args.with_entry else None
@@ -418,8 +445,8 @@ def main() -> int:
         if args.with_governance
         else None
     )
-    entry_project_path = Path("skills") / entry_relative if entry_relative else None
-    governance_project_path = Path("skills") / governance_relative if governance_relative else None
+    entry_project_path = skills_root / entry_relative if entry_relative else None
+    governance_project_path = skills_root / governance_relative if governance_relative else None
 
     writes = [
         write_file(
@@ -427,6 +454,7 @@ def main() -> int:
             agents_md(
                 title,
                 layout=args.layout,
+                skills_root=skills_root,
                 entry_path=entry_project_path,
                 governance_path=governance_project_path,
                 has_subagents=args.with_subagents,
@@ -440,17 +468,22 @@ def main() -> int:
 
     if args.layout == "categorized":
         writes.append(
-            write_file(repo / "skills" / "README.md", skills_readme(title), force=args.force, dry_run=args.dry_run)
+            write_file(
+                repo / skills_root / "README.md",
+                skills_readme(title, skills_root),
+                force=args.force,
+                dry_run=args.dry_run,
+            )
         )
 
     if entry_relative:
-        entry_dir = repo / "skills" / entry_relative
+        entry_dir = repo / skills_root / entry_relative
         writes.extend(
             [
                 write_file(entry_dir / "SKILL.md", enter_skill(title), force=args.force, dry_run=args.dry_run),
                 write_file(
                     entry_dir / "references" / "internal-runtime.md",
-                    enter_internal_runtime(),
+                    enter_internal_runtime(skills_root),
                     force=args.force,
                     dry_run=args.dry_run,
                 ),
@@ -464,14 +497,19 @@ def main() -> int:
         )
 
     if governance_relative:
-        review_dir = repo / "skills" / governance_relative
+        review_dir = repo / skills_root / governance_relative
         audit_source = Path(__file__).with_name("audit_project_skills.py").read_text(encoding="utf-8")
         writes.extend(
             [
-                write_file(review_dir / "SKILL.md", review_skill(), force=args.force, dry_run=args.dry_run),
+                write_file(
+                    review_dir / "SKILL.md",
+                    review_skill(skills_root),
+                    force=args.force,
+                    dry_run=args.dry_run,
+                ),
                 write_file(
                     review_dir / "references" / "internal-runtime.md",
-                    review_internal_runtime(Path("skills") / governance_relative, args.layout),
+                    review_internal_runtime(skills_root / governance_relative, skills_root, args.layout),
                     force=args.force,
                     dry_run=args.dry_run,
                 ),
@@ -491,16 +529,6 @@ def main() -> int:
             ]
         )
 
-    writes.append(
-        write_file(
-            repo / "scripts" / "agent-skills" / "sync_runtime_skills.py",
-            template_text("sync_runtime_skills.py").replace("__SKILL_LAYOUT__", args.layout),
-            force=args.force,
-            dry_run=args.dry_run,
-            executable=True,
-        )
-    )
-
     if args.with_subagents:
         writes.extend(
             [
@@ -513,7 +541,7 @@ def main() -> int:
                 ),
                 write_file(
                     repo / "agents" / "sync_agents.py",
-                    template_text("sync_agents.py"),
+                    template_text("sync_agents.py").replace("__SKILLS_ROOT__", skills_root.as_posix()),
                     force=args.force,
                     dry_run=args.dry_run,
                     executable=True,
@@ -524,13 +552,14 @@ def main() -> int:
     writes.append(update_gitignore(repo, has_subagents=args.with_subagents, dry_run=args.dry_run))
     print("\n".join(writes))
     print(
-        f"Initialized layout={args.layout} entry={'enabled' if args.with_entry else 'disabled'} "
+        f"Initialized layout={args.layout} skills_root={skills_root.as_posix()} "
+        f"entry={'enabled' if args.with_entry else 'disabled'} "
         f"governance={'enabled' if args.with_governance else 'disabled'} "
         f"subagents={'enabled' if args.with_subagents else 'disabled'} for {repo}"
     )
     print(
-        "Next: customize generated contracts and skills, run "
-        "scripts/agent-skills/sync_runtime_skills.py, then verify it with --check."
+        "Next: customize the generated contracts and canonical Skills, then run the project's "
+        "normal tests and any enabled governance audit."
     )
     if args.with_subagents:
         print("Define project roles in agents/registry.yaml, then run agents/sync_agents.py --check.")

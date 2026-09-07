@@ -9,7 +9,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 NAME_RE = re.compile(r"^(?=.{1,64}$)[a-z0-9]+(?:-[a-z0-9]+)*$")
 DEPENDENCY_RE = re.compile(
     r"\*\*REQUIRED SUB-SKILL:\*\*\s*Invoke\s+`?([a-z0-9]+(?:-[a-z0-9]+)*)`?"
@@ -127,7 +126,7 @@ def discover_skills(
                     name,
                     rel(skill_md, repo_root),
                     "layout.depth",
-                    "Use skills/<skill>/SKILL.md or skills/<category>/<skill>/SKILL.md.",
+                    "Use <skills-root>/<skill>/SKILL.md or <skills-root>/<category>/<skill>/SKILL.md.",
                 )
             )
         if depth == 2:
@@ -305,36 +304,6 @@ def dependency_issues(
     return issues
 
 
-def mirror_state(repo_root: Path) -> tuple[dict, list[Issue]]:
-    manifest = repo_root / ".agent-infra" / "runtime-skill-mirrors.json"
-    if not manifest.exists():
-        return {"status": "not_initialized", "manifest": rel(manifest, repo_root), "entries": 0}, []
-    try:
-        data = json.loads(manifest.read_text(encoding="utf-8"))
-        entries = data.get("mirrors", [])
-        if not isinstance(entries, list):
-            raise ValueError("mirrors must be a list")
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        issue = Issue(
-            "error",
-            "<project>",
-            rel(manifest, repo_root),
-            "mirror.manifest",
-            f"Invalid runtime mirror manifest: {exc}",
-        )
-        return {"status": "invalid", "manifest": rel(manifest, repo_root), "entries": 0}, [issue]
-    return (
-        {
-            "status": "recorded",
-            "manifest": rel(manifest, repo_root),
-            "entries": len(entries),
-            "modes": sorted({entry.get("mode", "unknown") for entry in entries if isinstance(entry, dict)}),
-            "targets": sorted({entry.get("target", "") for entry in entries if isinstance(entry, dict)}),
-        },
-        [],
-    )
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit project-local skills and layout conventions.")
     parser.add_argument("--skills-root", default="skills", help="Path to canonical skills root.")
@@ -357,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
 
     skills_root = Path(args.skills_root).expanduser().resolve()
     repo_root = skills_root.parent
+    if skills_root.parent.name in {".claude", ".agents", ".codebuddy", ".workbuddy"}:
+        repo_root = skills_root.parent.parent
     if not skills_root.exists():
         print(
             json.dumps(
@@ -388,8 +359,6 @@ def main(argv: list[str] | None = None) -> int:
         issues.extend(skill_issues)
         graph.setdefault(skill_name, dependencies)
     issues.extend(dependency_issues(graph, skill_paths, repo_root))
-    mirrors, mirror_issues = mirror_state(repo_root)
-    issues.extend(mirror_issues)
 
     errors = [issue for issue in issues if issue.severity == "error"]
     warnings = [issue for issue in issues if issue.severity == "warning"]
@@ -401,7 +370,6 @@ def main(argv: list[str] | None = None) -> int:
         "categories": categories,
         "skills_checked": len(skill_files),
         "dependency_graph": graph,
-        "mirror_state": mirrors,
         "skipped_directory_names": sorted(skip_dirs),
         "errors": [issue.as_dict() for issue in errors],
         "warnings": [issue.as_dict() for issue in warnings],

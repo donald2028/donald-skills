@@ -1,4 +1,4 @@
 interface:
   display_name: "Donald Agent Infrastructure"
   short_description: "Initialize agent-led skill infrastructure"
-  default_prompt: "Use $donald-agent-infrastructure to initialize or migrate a project to agent-led skill management with canonical skills, runtime mirrors, audits, and optional subagent registry."
+  default_prompt: "Use $donald-agent-infrastructure to initialize or migrate project Agent infrastructure with one canonical Skill source, no implicit runtime mirrors, audits, and an optional subagent registry."

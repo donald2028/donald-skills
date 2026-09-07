@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synchronize channel manifests and runtime mirrors from package.json."""
+"""Synchronize channel manifests and vendored runtime files from package.json."""
 
 from __future__ import annotations
 
@@ -7,11 +7,8 @@ import argparse
 import copy
 import json
 import re
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
-
 
 REPO = Path(__file__).resolve().parents[1]
 PACKAGE_PATH = REPO / "package.json"
@@ -21,6 +18,12 @@ BROWSER_RUNTIME_CONSUMERS = (
     "donald-chatgpt-imagegen",
     "donald-collect-wechat",
     "donald-collect-x",
+)
+LEGACY_RUNTIME_SKILL_DIRS = (
+    Path(".claude/skills"),
+    Path(".agents/skills"),
+    Path(".codebuddy/skills"),
+    Path(".workbuddy/skills"),
 )
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -197,13 +200,6 @@ def sync_browser_runtime(*, check: bool) -> int:
     return 0
 
 
-def sync_runtime_mirrors(*, check: bool) -> int:
-    command = [sys.executable, str(REPO / "skills/sync_runtime_skills.py")]
-    if check:
-        command.append("--check")
-    return subprocess.run(command, cwd=REPO, check=False).returncode
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="verify generated files without writing")
@@ -212,6 +208,13 @@ def main() -> int:
 
     if args.check and args.version:
         parser.error("--check and --version cannot be used together")
+
+    legacy_dirs = [path for path in LEGACY_RUNTIME_SKILL_DIRS if (REPO / path).exists()]
+    if legacy_dirs:
+        raise SystemExit(
+            "remove repository-local runtime skill mirrors: "
+            + ", ".join(path.as_posix() for path in legacy_dirs)
+        )
 
     package = load_json(PACKAGE_PATH)
     require_fields(
@@ -242,7 +245,7 @@ def main() -> int:
     status = sync_browser_runtime(check=args.check)
     if status:
         return status
-    return sync_runtime_mirrors(check=args.check)
+    return 0
 
 
 if __name__ == "__main__":

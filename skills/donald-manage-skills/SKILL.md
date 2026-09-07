@@ -1,6 +1,6 @@
 ---
 name: donald-manage-skills
-description: "Maintain a dedicated reusable multi-runtime Agent Skills distribution such as Donald Skills. Use for collection-level changes that require synchronizing plugin manifests or runtime mirrors, validating installer discovery, versioning, or publishing. Do not use for standalone or project-local skill authoring, skill installation, ordinary repository work, project Agent-infrastructure setup, or commit/push-only requests."
+description: "Maintain a dedicated reusable multi-runtime Agent Skills distribution such as Donald Skills. Use for collection-level changes that require synchronizing plugin manifests, validating installer discovery, versioning, or publishing. Do not use for standalone or project-local skill authoring, skill installation, ordinary repository work, project Agent-infrastructure setup, or commit/push-only requests."
 ---
 
 # Manage Skill Repository
@@ -11,10 +11,10 @@ runtimes.
 ## Workflow
 
 1. Read the repository contract files, installation documentation, plugin manifests, canonical
-   `skills/` tree, runtime mirrors, and Git status.
+   `skills/` tree, and Git status.
 2. State the requested outcome and the checks that will prove it.
 3. Change only canonical skill files and the minimum repository metadata required by the request.
-4. Run the repository build to synchronize channel manifests and runtime mirrors.
+4. Run the repository build to synchronize channel manifests and required vendored files.
 5. Run the available skill, plugin, and repository validators.
 6. Review the diff and sensitive-file status before any requested commit or push.
 
@@ -27,7 +27,8 @@ runtimes.
   `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and keep the instruction runtime-neutral.
 - Put only required instructions in `SKILL.md`; add `scripts/`, `references/`, `assets/`, or
   `agents/` only when they support the workflow.
-- Treat `.claude/skills/` and `.agents/skills/` as generated mirrors when a sync script owns them.
+- Do not create repository-local runtime mirrors, junctions, symlinks, or copies of canonical
+  Skills. Point aggregate manifests at `skills/`; use explicit installation for other runtimes.
 - Treat `package.json` as the canonical source for shared channel metadata and version when the
   repository build owns those fields.
 - Do not add subagents, hooks, MCP servers, categories, or release tooling without a concrete need.
@@ -49,8 +50,8 @@ installation surface.
 
 ### Remove Or Rename
 
-Search manifests, documentation, mirrors, and scripts for references. Update only real consumers,
-regenerate mirrors, and verify that no stale symlink or duplicate skill name remains.
+Search manifests, documentation, and scripts for references. Update only real consumers, rebuild
+generated metadata, and verify that no stale runtime copy or duplicate skill name remains.
 
 ### Release Or Publish
 

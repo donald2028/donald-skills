@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 AUDITOR = Path(__file__).with_name("audit_project_skills.py")
 
 
@@ -27,6 +26,7 @@ class SkillAuditTests(unittest.TestCase):
     def audit(self, root: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], dict]:
         result = subprocess.run(
             [sys.executable, str(AUDITOR), "--skills-root", str(root), *args],
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -114,35 +114,6 @@ class SkillAuditTests(unittest.TestCase):
             self.assertIn("dependency.missing", rules)
             self.assertIn("dependency.self", rules)
             self.assertIn("dependency.cycle", rules)
-
-    def test_mirror_manifest_summary_and_invalid_manifest(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            root = repo / "skills"
-            self.write_skill(root, "one")
-            state = repo / ".agent-infra"
-            state.mkdir()
-            manifest = state / "runtime-skill-mirrors.json"
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "mirrors": [
-                            {"target": ".agents/skills/one", "source": "skills/one", "mode": "junction"}
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            result, report = self.audit(root, "--strict")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(report["mirror_state"]["entries"], 1)
-            self.assertEqual(report["mirror_state"]["modes"], ["junction"])
-            manifest.write_text("{not-json", encoding="utf-8")
-            result, report = self.audit(root, "--strict")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("mirror.manifest", {issue["rule"] for issue in report["errors"]})
-
 
 if __name__ == "__main__":
     unittest.main()

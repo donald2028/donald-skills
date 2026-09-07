@@ -1,53 +1,48 @@
-# Migration Process
+# Migration
 
-Use this process for an existing repository. The initializer is designed for new scaffolds and does
-not migrate old generated projects or accept the removed `--profile` interface.
+## Inventory
 
-## Read-Only Inventory
+Before editing, inspect Git status, root `skills/`, runtime Skill directories,
+`scripts/agent-skills/sync_runtime_skills.py`, `.agent-infra/runtime-skill-mirrors.json`, and
+AGENTS.md/.gitignore sync rules. Treat uncommitted and divergent runtime content as user-owned.
 
-1. Inventory project contracts, root `skills/`, runtime Skill mirrors including
-   `.workbuddy/skills/`, `agents/`, and generated Claude/Codex/CodeBuddy agent directories.
-2. Compare names and content across canonical and runtime-specific copies.
-3. Identify the actual layout as flat, categorized, mixed, or invalid.
-4. Read Git status and treat uncommitted changes as user-owned.
+For ordinary projects, preserve root `skills/` as the sole unregistered authoring source. If the
+user explicitly chooses a runtime-native source, reconcile content into that directory before
+removing any other source.
 
-## Establish Ownership
+## Cleanup
 
-- Prefer root `skills/` as canonical.
-- Preserve divergent runtime content before replacing any mirror.
-- Choose flat or categorized as the target; mixed layout is only an intermediate migration state.
-- Keep Skill resources self-contained and replace repository-relative sibling imports with
-  explicit workflow invocation where appropriate.
-- Validate required sub-skills for missing targets, self-reference, and cycles.
+Preview and then apply the bundled migration:
 
-## Adopt Generated Mirrors
+```bash
+python scripts/migrate_legacy_runtime_skills.py <repo>
+python scripts/migrate_legacy_runtime_skills.py <repo> --apply
+```
 
-Place the new helper at `scripts/agent-skills/sync_runtime_skills.py`. Before its first run, treat
-all existing runtime paths as unknown and preserve them. Use `--replace-existing` only after
-canonical content is complete and divergent files have been saved.
+The migration removes:
 
-The first successful sync writes `.agent-infra/runtime-skill-mirrors.json`; later cleanup is limited
-to entries recorded there. Do not fabricate manifest ownership for directories you did not verify.
+- the recognized generated sync script and ownership manifest;
+- manifest-owned junctions, symlinks, and unchanged copies in the four legacy runtime paths;
+- generated AGENTS.md sync instructions and managed `.gitignore` rules;
+- empty directories left by those removals.
 
-## Add Optional Layers
+It never deletes root `skills/`. If the manifest is invalid, a runtime copy changed, a link points
+elsewhere, or the sync script is unrecognized, it stops before deleting anything. Reconcile that
+content manually and rerun.
 
-- Add one layout-appropriate `enter-project` Skill only for real routing or mode selection.
-- Add the layout-appropriate governance Skill only when the project adopts local quality gates.
-- Add `agents/registry.yaml` only for recurring isolated roles. Keep role behavior in an owning
-  Skill's references and generate Claude/Codex/CodeBuddy adapters.
-- Do not infer that enabling one optional layer requires another.
+Customized AGENTS.md prose may not match the old generated text exactly. After migration, search for
+`sync_runtime_skills.py` and remove any remaining instruction that would recreate runtime links.
 
 ## Verify
 
-From the target repository, run the applicable checks:
+Run the audit and normal project tests. For default root authoring, confirm these paths are absent:
 
-```bash
-python <governance-skill>/scripts/audit_project_skills.py --skills-root skills --strict
-python scripts/agent-skills/sync_runtime_skills.py
-python scripts/agent-skills/sync_runtime_skills.py --check
-python agents/sync_agents.py
-python agents/sync_agents.py --check
+```text
+.agents/skills/
+.claude/skills/
+.codebuddy/skills/
+.workbuddy/skills/
 ```
 
-Run the project's normal tests afterward. Report any runtime whose discovery or subagent format was
-not actually validated.
+Edit a canonical Skill and repeat the check. The normal authoring workflow must not recreate those
+paths. Verify subagent generation separately when enabled.

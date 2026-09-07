@@ -51,9 +51,12 @@ asks for them. Prefer the smallest structure that satisfies the current request.
   the dependency and continue the original request. Report `needs_dependency` with exact
   install/retry guidance only when the user declines, installation fails, or the runtime cannot
   load the installed dependency.
-- `.claude/skills/`, `.agents/skills/`, `.codebuddy/skills/`, and `.workbuddy/skills/` are generated
-  runtime mirrors. Never hand-edit them;
-  run `npm run build` after adding, renaming, moving, or removing a skill.
+- Do not add repository-local runtime Skill mirrors under `.claude/skills/`, `.agents/skills/`,
+  `.codebuddy/skills/`, or `.workbuddy/skills/`. Channel manifests expose the canonical `skills/`
+  tree; runtimes without an aggregate plugin must install Skills explicitly outside this source
+  repository.
+- Run `npm run build` after adding, renaming, moving, or removing a skill to synchronize manifests
+  and required self-contained vendored files.
 - `package.json` is the only hand-maintained source for shared plugin metadata and version. Run
   `npm run build` to project those fields into every committed channel manifest; preserve
   platform-specific fields such as `interface` in their native manifest.
@@ -66,9 +69,8 @@ asks for them. Prefer the smallest structure that satisfies the current request.
   tree for Cursor and Kimi Code.
 - `gemini-extension.json` and `GEMINI.md` are the Gemini CLI extension entry points; keep the
   extension pointed at the canonical root `skills/` tree.
-- OpenCode natively discovers the generated `.claude/skills/` and `.agents/skills/` mirrors. Do
-  not add a second OpenCode skill copy or plugin bootstrap unless the user explicitly asks for
-  OpenCode-specific behavior.
+- OpenCode and WorkBuddy installation is explicit. Do not add project-local discovery copies or a
+  plugin bootstrap unless the user explicitly requests runtime-specific packaging.
 - `.agents/plugins/marketplace.json` and `.claude-plugin/marketplace.json` expose the same plugin
   from the repository root.
 - Keep secrets and runtime output out of Git. Commit examples as `.env.example`, never `.env`.

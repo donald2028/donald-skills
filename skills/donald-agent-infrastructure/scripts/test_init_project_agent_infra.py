@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from unittest import mock
 
-
-SKILL_ROOT = Path(__file__).resolve().parents[1]
 INITIALIZER = Path(__file__).with_name("init_project_agent_infra.py")
-MIRROR_TEMPLATE = SKILL_ROOT / "assets" / "templates" / "sync_runtime_skills.py"
-TARGETS = (".claude", ".agents", ".codebuddy", ".workbuddy")
+MIGRATOR = Path(__file__).with_name("migrate_legacy_runtime_skills.py")
+RUNTIME_SKILL_ROOTS = (".claude/skills", ".agents/skills", ".codebuddy/skills", ".workbuddy/skills")
 try:
-    import yaml  # noqa: F401
+    import yaml
 
     YAML_AVAILABLE = True
 except ImportError:
@@ -31,6 +26,7 @@ class RuntimeScaffoldTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(script), *map(str, args)],
             cwd=cwd,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -54,8 +50,19 @@ class RuntimeScaffoldTests(unittest.TestCase):
         (skill / "references" / "guide.md").write_text("original\n", encoding="utf-8")
         return skill
 
-    def mirror_script(self, repo: Path) -> Path:
-        return repo / "scripts" / "agent-skills" / "sync_runtime_skills.py"
+    def create_directory_link(self, target: Path, source: Path) -> str:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return "junction"
+        target.symlink_to(source, target_is_directory=True)
+        return "symlink"
 
     def test_layout_and_feature_switch_matrix(self):
         for layout in ("flat", "categorized"):
@@ -86,13 +93,20 @@ class RuntimeScaffoldTests(unittest.TestCase):
                                 governance,
                             )
                             self.assertEqual((repo / "agents" / "registry.yaml").exists(), subagents)
-                            self.assertTrue(self.mirror_script(repo).is_file())
+                            self.assertFalse(
+                                (repo / "scripts" / "agent-skills" / "sync_runtime_skills.py").exists()
+                            )
+                            for runtime_root in RUNTIME_SKILL_ROOTS:
+                                self.assertFalse((repo / runtime_root).exists())
                             self.assertEqual((repo / "skills" / "README.md").exists(), layout == "categorized")
                             contract = (repo / "AGENTS.md").read_text(encoding="utf-8")
+                            self.assertIn("not a runtime discovery path", contract)
+                            self.assertNotIn("sync_runtime_skills.py", contract)
                             self.assertEqual("## Entry Routing" in contract, entry)
                             self.assertEqual("## Skill Governance" in contract, governance)
                             self.assertEqual("## Project Subagents" in contract, subagents)
-                            ignored = (repo / ".gitignore").read_text(encoding="utf-8")
+                            gitignore = repo / ".gitignore"
+                            ignored = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
                             self.assertEqual(".claude/agents/" in ignored, subagents)
                             self.assertEqual(".codebuddy/agents/" in ignored, subagents)
                             self.assertEqual("agents/INDEX.md" in ignored, subagents)
@@ -112,7 +126,7 @@ class RuntimeScaffoldTests(unittest.TestCase):
                 self.assertTrue((repo / "AGENTS.md").is_file())
                 self.assertTrue((repo / "CLAUDE.md").is_file())
                 self.assertTrue((repo / "CODEBUDDY.md").is_file())
-                self.assertTrue(self.mirror_script(repo).is_file())
+                self.assertFalse((repo / "scripts" / "agent-skills" / "sync_runtime_skills.py").exists())
                 self.assertEqual(
                     (repo / "skills" / "application" / "enter-project" / "SKILL.md").exists(),
                     old_name in {"pipeline", "subagents"},
@@ -133,7 +147,7 @@ class RuntimeScaffoldTests(unittest.TestCase):
             self.assert_success(result)
             self.assertEqual(list(repo.iterdir()), [])
 
-            existing = ("AGENTS.md", "CODEBUDDY.md", "scripts/agent-skills/sync_runtime_skills.py")
+            existing = ("AGENTS.md", "CODEBUDDY.md")
             for relative in existing:
                 path = repo / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,8 +161,8 @@ class RuntimeScaffoldTests(unittest.TestCase):
                 self.assertEqual((repo / relative).read_text(encoding="utf-8"), "user-owned content")
             gitignore = (repo / ".gitignore").read_text(encoding="utf-8")
             self.assertIn("custom-rule/", gitignore)
-            self.assertIn("# BEGIN donald-agent-infrastructure generated", gitignore)
-            self.assertIn(".workbuddy/skills/", gitignore)
+            self.assertNotIn("# BEGIN donald-agent-infrastructure generated", gitignore)
+            self.assertNotIn(".workbuddy/skills/", gitignore)
             self.assertNotIn("\n.workbuddy/\n", gitignore)
             self.assertEqual(
                 workbuddy_memory.read_text(encoding="utf-8"), "user-owned runtime state\n"
@@ -169,150 +183,161 @@ class RuntimeScaffoldTests(unittest.TestCase):
             self.assertIn("does not match --layout flat", result.stderr)
             self.assertFalse((repo / "AGENTS.md").exists())
 
-    def test_runtime_mirrors_default_mode_and_live_content(self):
+    def test_explicit_native_skills_root_is_the_only_source(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            self.initialize(repo)
-            skill = self.add_skill(repo, "flat")
-            sync = self.mirror_script(repo)
-            self.assertNotEqual(self.run_script(sync, "--check", cwd=repo).returncode, 0)
-            result = self.run_script(sync, cwd=repo)
-            self.assert_success(result)
-            self.assert_success(self.run_script(sync, "--check", cwd=repo))
-
-            manifest = json.loads(
-                (repo / ".agent-infra" / "runtime-skill-mirrors.json").read_text(encoding="utf-8")
+            self.initialize(
+                repo,
+                "--skills-root",
+                ".agents/skills",
+                "--layout",
+                "categorized",
+                "--with-entry",
+                "--with-governance",
+                "--with-subagents",
             )
-            expected_mode = "junction" if sys.platform == "win32" else "symlink"
-            self.assertEqual({entry["mode"] for entry in manifest["mirrors"]}, {expected_mode})
-            (skill / "references" / "guide.md").write_text("updated\n", encoding="utf-8")
-            for target in TARGETS:
-                mirror = repo / target / "skills" / "example"
-                self.assertEqual(mirror.resolve(), skill.resolve())
-                self.assertEqual((mirror / "references" / "guide.md").read_text(encoding="utf-8"), "updated\n")
-            self.assertNotEqual(self.run_script(sync, "--check", cwd=repo).returncode, 0)
-            self.assert_success(self.run_script(sync, cwd=repo))
+            source = repo / ".agents" / "skills"
+            self.assertTrue((source / "application" / "enter-project" / "SKILL.md").is_file())
+            self.assertTrue(
+                (source / "development" / "review-skill-best-practices" / "SKILL.md").is_file()
+            )
+            self.assertFalse((repo / "skills").exists())
+            for runtime_root in (".claude/skills", ".codebuddy/skills", ".workbuddy/skills"):
+                self.assertFalse((repo / runtime_root).exists())
+            contract = (repo / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("explicitly selected repository Skill source", contract)
+            self.assertNotIn("sync_runtime_skills.py", contract)
+            subagent_sync = (repo / "agents" / "sync_agents.py").read_text(encoding="utf-8")
+            self.assertIn('REPO / ".agents/skills"', subagent_sync)
+            self.assertNotIn("__SKILLS_ROOT__", subagent_sync)
 
-    def test_categorized_runtime_mirrors_flatten_by_skill_name(self):
+    def test_legacy_migration_removes_generated_links_rules_and_regeneration_path(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            self.initialize(repo, "--layout", "categorized")
-            skill = self.add_skill(repo, "categorized")
-            sync = self.mirror_script(repo)
-            self.assert_success(self.run_script(sync, cwd=repo))
-            for target in TARGETS:
-                self.assertEqual((repo / target / "skills" / "example").resolve(), skill.resolve())
-            self.assert_success(self.run_script(sync, "--check", cwd=repo))
-
-    def test_empty_categorized_layout_remains_configured(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self.initialize(repo, "--layout", "categorized")
-            sync = self.mirror_script(repo)
-            self.assertNotEqual(self.run_script(sync, "--check", cwd=repo).returncode, 0)
-            result = self.run_script(sync, cwd=repo)
-            self.assert_success(result)
-            self.assertIn("layout=categorized", result.stdout)
-            self.assert_success(self.run_script(sync, "--check", cwd=repo))
-
-    def test_generated_sync_rejects_layout_drift(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self.initialize(repo, "--layout", "flat")
-            self.add_skill(repo, "categorized")
-            result = self.run_script(self.mirror_script(repo), cwd=repo)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("configured for flat", result.stderr)
-
-    def test_copy_mode_detects_drift_and_cleans_managed_orphans(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self.initialize(repo)
             skill = self.add_skill(repo, "flat")
-            sync = self.mirror_script(repo)
-            self.assert_success(self.run_script(sync, "--copy", cwd=repo))
-            self.assert_success(self.run_script(sync, "--copy", "--check", cwd=repo))
-            (skill / "references" / "guide.md").write_text("changed\n", encoding="utf-8")
-            self.assertNotEqual(self.run_script(sync, "--copy", "--check", cwd=repo).returncode, 0)
-            self.assert_success(self.run_script(sync, "--copy", cwd=repo))
-            shutil.rmtree(skill)
-            self.assertNotEqual(self.run_script(sync, "--copy", "--check", cwd=repo).returncode, 0)
-            self.assert_success(self.run_script(sync, "--copy", cwd=repo))
-            for target in TARGETS:
-                self.assertFalse((repo / target / "skills" / "example").exists())
+            entries = []
+            for runtime_root in RUNTIME_SKILL_ROOTS:
+                target = repo / runtime_root / "example"
+                mode = self.create_directory_link(target, skill)
+                entries.append(
+                    {
+                        "target": target.relative_to(repo).as_posix(),
+                        "source": skill.relative_to(repo).as_posix(),
+                        "mode": mode,
+                        "digest": "legacy-link-digest",
+                    }
+                )
+            manifest = repo / ".agent-infra" / "runtime-skill-mirrors.json"
+            manifest.parent.mkdir()
+            manifest.write_text(json.dumps({"version": 1, "mirrors": entries}), encoding="utf-8")
+            sync = repo / "scripts" / "agent-skills" / "sync_runtime_skills.py"
+            sync.parent.mkdir(parents=True)
+            sync.write_text(
+                '"""Generate runtime skill mirrors from canonical root skills/."""\n'
+                'MANIFEST = "runtime-skill-mirrors.json"\n'
+                'DEFAULT_TARGETS = []\n'
+                '# sync_runtime_skills.py\n',
+                encoding="utf-8",
+            )
+            (repo / "AGENTS.md").write_text(
+                textwrap.dedent(
+                    """\
+                    # Agent Instructions
 
-    def test_default_links_clean_managed_orphans_after_source_deletion(self):
+                    ## Project Skills
+
+                    - Treat root `skills/` as the canonical project skill source.
+                    - Treat `.claude/skills/`, `.agents/skills/`, `.codebuddy/skills/`, and
+                      `.workbuddy/skills/` as generated output.
+                    - Kimi Code and OpenCode reuse `.agents/skills/`; CodeBuddy uses `.codebuddy/skills/`;
+                      Tencent WorkBuddy uses `.workbuddy/skills/`.
+
+                    ## Repo Boundaries
+
+                    - Do not hand-edit generated runtime mirrors.
+                    - After changing canonical skills, run
+                      `python scripts/agent-skills/sync_runtime_skills.py` and then its `--check` mode.
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (repo / ".gitignore").write_text(
+                textwrap.dedent(
+                    """\
+                    custom-rule/
+
+                    # BEGIN donald-agent-infrastructure generated
+                    .claude/skills/
+                    .agents/skills/
+                    .codebuddy/skills/
+                    .workbuddy/skills/
+                    .agent-infra/
+                    # END donald-agent-infrastructure generated
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            preview = self.run_script(MIGRATOR, repo, cwd=repo)
+            self.assert_success(preview)
+            self.assertIn("would remove .agents", preview.stdout)
+            self.assertTrue(sync.is_file())
+            self.assertTrue(manifest.is_file())
+
+            applied = self.run_script(MIGRATOR, repo, "--apply", cwd=repo)
+            self.assert_success(applied)
+            self.assertTrue((skill / "SKILL.md").is_file())
+            self.assertFalse(sync.exists())
+            self.assertFalse(manifest.exists())
+            for runtime_root in RUNTIME_SKILL_ROOTS:
+                self.assertFalse((repo / runtime_root).exists())
+            contract = (repo / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("Do not register or mirror it", contract)
+            self.assertNotIn("sync_runtime_skills.py", contract)
+            gitignore = (repo / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn("custom-rule/", gitignore)
+            for ignored in RUNTIME_SKILL_ROOTS:
+                self.assertNotIn(f"{ignored}/", gitignore)
+
+            self.initialize(repo)
+            (skill / "references" / "guide.md").write_text("edited\n", encoding="utf-8")
+            for runtime_root in RUNTIME_SKILL_ROOTS:
+                self.assertFalse((repo / runtime_root).exists())
+            repeated = self.run_script(MIGRATOR, repo, cwd=repo)
+            self.assert_success(repeated)
+            self.assertIn("No legacy generated runtime Skill infrastructure found", repeated.stdout)
+
+    def test_legacy_migration_preserves_modified_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            self.initialize(repo)
             skill = self.add_skill(repo, "flat")
-            sync = self.mirror_script(repo)
-            self.assert_success(self.run_script(sync, cwd=repo))
-            shutil.rmtree(skill)
-            self.assertNotEqual(self.run_script(sync, "--check", cwd=repo).returncode, 0)
-            self.assert_success(self.run_script(sync, cwd=repo))
-            for target in TARGETS:
-                mirror = repo / target / "skills" / "example"
-                self.assertFalse(mirror.exists())
-                self.assertFalse(mirror.is_symlink())
-
-    def test_unmanaged_conflict_is_not_replaced(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self.initialize(repo)
-            self.add_skill(repo, "flat")
-            existing = repo / ".codebuddy" / "skills" / "example" / "SKILL.md"
-            existing.parent.mkdir(parents=True)
-            existing.write_text("user-owned skill", encoding="utf-8")
-            result = self.run_script(self.mirror_script(repo), cwd=repo)
+            copied = repo / ".agents" / "skills" / "example"
+            copied.mkdir(parents=True)
+            (copied / "SKILL.md").write_text("user-modified\n", encoding="utf-8")
+            manifest = repo / ".agent-infra" / "runtime-skill-mirrors.json"
+            manifest.parent.mkdir()
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "mirrors": [
+                            {
+                                "target": ".agents/skills/example",
+                                "source": "skills/example",
+                                "mode": "copy",
+                                "digest": "different",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_script(MIGRATOR, repo, "--apply", cwd=repo)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("exists and is not managed", result.stderr)
-            self.assertEqual(existing.read_text(encoding="utf-8"), "user-owned skill")
-            self.assertFalse((repo / ".claude" / "skills" / "example").exists())
-            self.assertFalse((repo / ".agent-infra" / "runtime-skill-mirrors.json").exists())
-            self.assert_success(self.run_script(self.mirror_script(repo), "--replace-existing", cwd=repo))
-            self.assertNotEqual(existing.read_text(encoding="utf-8"), "user-owned skill")
-            self.assert_success(self.run_script(self.mirror_script(repo), "--check", cwd=repo))
-
-    def test_forced_modes_do_not_fallback(self):
-        spec = importlib.util.spec_from_file_location("runtime_mirror_template", MIRROR_TEMPLATE)
-        self.assertIsNotNone(spec)
-        module = importlib.util.module_from_spec(spec)
-        assert spec and spec.loader
-        spec.loader.exec_module(module)
-        calls: list[str] = []
-
-        def fail_junction(path, source):
-            calls.append("junction")
-            raise OSError("junction unavailable")
-
-        def fail_symlink(path, source):
-            calls.append("symlink")
-            raise OSError("symlink unavailable")
-
-        def copy(path, source):
-            calls.append("copy")
-
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(module.sys, "platform", "win32"), mock.patch.object(
-            module, "create_junction", fail_junction
-        ), mock.patch.object(module, "create_symlink", fail_symlink), mock.patch.object(module, "create_copy", copy):
-            root = Path(directory)
-            mode, failures = module.create_mirror(root / "mirror", root / "source", None)
-            self.assertEqual(mode, "copy")
-            self.assertEqual(calls, ["junction", "symlink", "copy"])
-            self.assertEqual(len(failures), 2)
-            calls.clear()
-            with self.assertRaises(OSError):
-                module.create_mirror(root / "forced", root / "source", "junction")
-            self.assertEqual(calls, ["junction"])
-            calls.clear()
-            with self.assertRaises(OSError):
-                module.create_mirror(root / "forced-symlink", root / "source", "symlink")
-            self.assertEqual(calls, ["symlink"])
-            calls.clear()
-            mode, failures = module.create_mirror(root / "forced-copy", root / "source", "copy")
-            self.assertEqual((mode, failures), ("copy", []))
-            self.assertEqual(calls, ["copy"])
+            self.assertIn("modified runtime path", result.stderr)
+            self.assertEqual((copied / "SKILL.md").read_text(encoding="utf-8"), "user-modified\n")
+            self.assertTrue((skill / "SKILL.md").is_file())
+            self.assertTrue(manifest.is_file())
 
     @unittest.skipUnless(YAML_AVAILABLE, "PyYAML is required for generated subagent tests")
     def test_subagents_generate_check_update_and_safe_cleanup(self):

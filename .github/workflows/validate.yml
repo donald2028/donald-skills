@@ -32,7 +32,7 @@ jobs:
           python skills/donald-agent-infrastructure/scripts/test_audit_project_skills.py
           python skills/donald-agent-infrastructure/scripts/test_init_project_agent_infra.py
 
-      - name: Validate generated manifests and runtime mirrors
+      - name: Validate generated manifests and vendored files
         run: |
           npm run build
           git diff --exit-code

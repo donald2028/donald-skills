@@ -18,7 +18,7 @@ files outside its own directory. Workflow-level composition is allowed when the 
 ships both skills: declare it in `SKILL.md` with `**REQUIRED SUB-SKILL:** Invoke <skill-name>` and
 let the agent invoke the dependency instead of importing its files.
 
-After changing this tree, rebuild the channel manifests and runtime mirrors:
+After changing this tree, rebuild the channel manifests and required vendored files:
 
 ```bash
 npm run build
@@ -26,5 +26,5 @@ npm run build:check
 ```
 
 The aggregate Claude, Codex, Cursor, Kimi Code, and Gemini CLI manifests discover skills directly
-from this directory. OpenCode discovers the generated `.claude/skills/` and `.agents/skills/`
-mirrors according to its native Agent Skills search paths.
+from this directory. Install the collection explicitly for runtimes without an aggregate plugin;
+do not create repository-local runtime mirrors.

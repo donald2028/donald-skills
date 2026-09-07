@@ -18,7 +18,7 @@ except ImportError:
 
 REPO = Path(__file__).resolve().parents[1]
 REGISTRY = REPO / "agents" / "registry.yaml"
-SKILLS_ROOT = REPO / "skills"
+SKILLS_ROOT = REPO / "__SKILLS_ROOT__"
 CLAUDE_DIR = REPO / ".claude" / "agents"
 CODEX_DIR = REPO / ".codex" / "agents"
 CODEBUDDY_DIR = REPO / ".codebuddy" / "agents"
@@ -45,7 +45,7 @@ def validate_spec(value: str, agent_id: str) -> str:
     try:
         relative = candidate.relative_to(SKILLS_ROOT.resolve())
     except ValueError:
-        fail(f"spec for {agent_id} must stay under skills/: {value}")
+        fail(f"spec for {agent_id} must stay under {SKILLS_ROOT.relative_to(REPO).as_posix()}/: {value}")
     if "references" not in relative.parts or not value.endswith(("-agent.md", "-prompt.md")):
         fail(f"spec for {agent_id} must be a skill-owned references/*-agent.md or *-prompt.md file")
     owner = candidate.parent
