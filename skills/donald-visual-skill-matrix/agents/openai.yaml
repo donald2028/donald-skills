@@ -1,0 +1,6 @@
+interface:
+  display_name: "Visual Skill Matrix"
+  short_description: "Explicitly compare isolated visual skill outputs"
+  default_prompt: "Use $donald-visual-skill-matrix to run these visual-design skills in isolated contexts and show their outputs in a neutral gallery."
+policy:
+  allow_implicit_invocation: false

@@ -18,6 +18,7 @@ ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发�
 - `donald-collect-wechat`：采集公众号文章列表和公开正文。
 - `donald-collect-x`：采集 X 账号帖子、thread、Article 和媒体。
 - `donald-chatgpt-imagegen`：通过可恢复的 ChatGPT Web 浏览器任务外部出图。
+- `donald-visual-skill-matrix`：仅在用户明确要求比较多个 Skill 时，在独立新上下文中逐个运行视觉设计 Skill，并把图片或网页截图整理成不评分的并排画廊。
 
 GitHub、采集和出图结果默认保存在系统“文档”目录的 `Donald Skills/Data/` 下，不写入源码
 仓库或当前工作目录。用户也可以把共享输出根目录一次写入统一配置根下的 `storage.json`；
