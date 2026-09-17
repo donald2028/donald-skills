@@ -20,8 +20,28 @@ The persistent shared output setting replaces `<system Documents>/Donald Skills/
 CDP locks, submit-throttle counters, and timing metrics are stored in the platform-native Donald
 Skills application-state directory. They are not part of this user-facing output contract.
 
-Session files record the conversation URL, reference mapping, attempts, resume state, and outputs.
-The run summary records request mode, variant results, image paths, and status.
+`chatgpt-job.json` keeps uploader metadata and model semantics separate:
+
+- `reference_images` and `ordered_upload_paths` contain the exact local attachment array in
+  `Reference Image 1..N` order;
+- `model_reference_map` contains per-image `model_role`, `spatial_map`, `use`, and `ignore` fields
+  without local paths or filenames; and
+- `compiled_model_reference_map` is the exact pure-numbered map inserted into every model-facing
+  message. It is empty when the job has no references.
+
+Session files record the conversation URL, attempts, resume state, outputs, and the same separated
+`reference_upload_order`, `ordered_upload_paths`, `model_reference_map`, and
+`compiled_model_reference_map` audit fields.
+They also record `submission_committed` at the submit boundary plus the latest `page_recovery` and
+accumulated `page_recoveries` evidence. Before that boundary, recovery replays the whole composer
+setup and reference upload. After that boundary, recovery is read-only with respect to submission:
+it may reopen the saved conversation to observe or collect, but it must never send the prompt again.
+The run summary records request mode, variant results, image paths, status, and the same reference
+audit fields so numbering can be checked against local inputs without exposing those identifiers to
+the model. Each fresh upload observation records `upload_sequence`, `order_verified`, and
+`order_verification_method`. It checks visible numbered attachment labels when available and always
+requires sequential file input with a monotonic attachment count; the runner refuses submission
+when this evidence does not match the manifest order.
 Fresh-submit reports and summaries also record the verified `chat_surface` (`Chat`, never `Work`),
 the verified `image_mode`, reference-upload evidence, requested aspect-ratio delivery
 (`ui_control_and_prompt_text` or `prompt_text`), and an actual-dimensions ratio check for every
@@ -53,6 +73,14 @@ Important terminal or recoverable states include:
   `error_type=chatgpt_submitted_turn_missing` when the expected conversation remains blank across
   two consecutive heartbeats after submission, and `error_type=chatgpt_chat_surface_unavailable`
   when the runner cannot prove that Chat rather than Work is selected before submission;
+- `generation_failed` with `error_type=chatgpt_page_recovery_exhausted`: the page or heartbeat
+  remained unusable after the bounded recovery attempts. The result includes phase, target URL,
+  attempt count, individual recovery events, and a retry recommendation instead of waiting forever;
+- `submission_state_unknown`: the submit action failed at its commit boundary, so the runner cannot
+  safely decide whether resubmission would duplicate the request. Inspect or use `collect-current`
+  before sending anything again;
 - `download_failed`: ChatGPT produced candidates but the authenticated download stayed unavailable
   after bounded retries; preserve the conversation and retry with `collect-current`;
-- login/challenge states: require operator action in the visible browser.
+- `needs_ops` with `error_type=human_attention_required`: login or human verification requires an
+  operator in the activated visible browser. The runner preserves that tab and never refreshes or
+  attempts the verification itself.

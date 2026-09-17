@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from PIL import Image, ImageChops, ImageStat
@@ -41,6 +41,11 @@ from profile_config import (
     restore_frontmost_process,
     run_agent_browser,
     show_browser_without_focus,
+)
+from reference_contract import (
+    reference_audit_fields,
+    validate_model_message,
+    validate_reference_contract,
 )
 
 try:
@@ -144,7 +149,10 @@ POLICY_REFUSAL_MARKERS = (
 )
 MAX_TIMING_SAMPLES = 50
 MAX_AGENT_BROWSER_TRANSPORT_SESSION_LENGTH = 40
-DEFAULT_STALE_GENERATION_REFRESH_SECONDS = 180
+DEFAULT_STALE_GENERATION_REFRESH_SECONDS = 0
+DEFAULT_PAGE_RECOVERY_ATTEMPTS = 3
+PAGE_STATE_FAILURES_BEFORE_RECOVERY = 3
+REFERENCE_UPLOAD_NO_EVIDENCE_RECOVERY_SECONDS = 15
 MISSING_SUBMITTED_TURN_HEARTBEATS = 2
 DEFAULT_SUBMIT_THROTTLE_MIN_INTERVAL_SECONDS = 90
 DEFAULT_SUBMIT_THROTTLE_MAX_SUBMITS_PER_HOUR = 40
@@ -187,6 +195,22 @@ class HumanAttentionRequired(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.activation = activation
+
+
+class RecoverablePageError(RuntimeError):
+    pass
+
+
+class PageRecoveryExhaustedError(RuntimeError):
+    def __init__(self, report: dict[str, Any]):
+        super().__init__(str(report.get("reason") or "ChatGPT page recovery was exhausted"))
+        self.report = report
+
+
+class SubmissionStateUnknownError(RuntimeError):
+    def __init__(self, report: dict[str, Any]):
+        super().__init__(str(report.get("reason") or "ChatGPT submission state is unknown"))
+        self.report = report
 
 
 def _resolve_browser_profile(args: argparse.Namespace) -> None:
@@ -266,73 +290,79 @@ def _job_reference_source(ref: dict[str, Any], reference_base_dir: Path | None) 
 
 def _validate_manifest_reference_mapping(job: dict[str, Any]) -> None:
     prompt_card = Path(str(job.get("prompt_card") or ""))
-    if not prompt_card.is_file():
-        return
-    reference_base_dir = (
-        Path(str(job["reference_base_dir"]))
-        if job.get("reference_base_dir")
-        else prompt_card.parent
-    )
-    reference_section = _sections(prompt_card.read_text(encoding="utf-8")).get(
-        "Required Reference Images",
-        "",
-    )
-    if not reference_section.strip():
-        return
-    prompt_refs = [
-        (int(index), source_path)
-        for index, source_path in REFERENCE_LINE_RE.findall(reference_section)
-    ]
-    job_refs = [
-        (int(ref.get("index")), _job_reference_source(ref, reference_base_dir))
-        for ref in job.get("reference_images", [])
-    ]
-    if prompt_refs != job_refs:
-        raise ValueError(
-            "ChatGPT job manifest reference_images are stale or out of sync with "
-            f"{prompt_card}. Re-run prepare_job.py before uploading references.\n"
-            f"prompt_card_refs={prompt_refs}\n"
-            f"manifest_refs={job_refs}"
+    if prompt_card.is_file():
+        reference_base_dir = (
+            Path(str(job["reference_base_dir"]))
+            if job.get("reference_base_dir")
+            else prompt_card.parent
         )
+        reference_section = _sections(prompt_card.read_text(encoding="utf-8")).get(
+            "Required Reference Images",
+            "",
+        )
+        if reference_section.strip():
+            prompt_refs = [
+                (int(index), source_path)
+                for index, source_path in REFERENCE_LINE_RE.findall(reference_section)
+            ]
+            job_refs = [
+                (int(ref.get("index")), _job_reference_source(ref, reference_base_dir))
+                for ref in job.get("reference_images", [])
+            ]
+            if prompt_refs != job_refs:
+                raise ValueError(
+                    "ChatGPT job manifest reference_images are stale or out of sync with "
+                    f"{prompt_card}. Re-run prepare_job.py before uploading references.\n"
+                    f"prompt_card_refs={prompt_refs}\n"
+                    f"manifest_refs={job_refs}"
+                )
 
-
-def _job_reference_mapping(job: dict[str, Any]) -> list[dict[str, Any]]:
-    mapping = job.get("reference_image_mapping")
-    if isinstance(mapping, list) and mapping:
-        return [
-            {
-                "index": int(ref.get("index")),
-                "source_path": str(ref.get("source_path") or ""),
-                "path": str(ref.get("path") or ""),
-                "role": str(ref.get("role") or ""),
-            }
-            for ref in mapping
-            if isinstance(ref, dict)
-        ]
-    return [
-        {
-            "index": int(ref.get("index")),
-            "source_path": str(ref.get("source_path") or ""),
-            "path": str(ref.get("path") or ""),
-            "role": str(ref.get("role") or ""),
-        }
-        for ref in job.get("reference_images", [])
-        if isinstance(ref, dict)
+    reference_images = [
+        dict(entry) for entry in job.get("reference_images", []) if isinstance(entry, dict)
     ]
+    model_reference_map = [
+        dict(entry) for entry in job.get("model_reference_map", []) if isinstance(entry, dict)
+    ]
+    ordered_upload_paths = [str(path) for path in job.get("ordered_upload_paths", [])]
+    compiled_model_reference_map = str(job.get("compiled_model_reference_map") or "")
+    validate_reference_contract(
+        reference_images=reference_images,
+        model_reference_map=model_reference_map,
+        ordered_upload_paths=ordered_upload_paths,
+        compiled_model_reference_map=compiled_model_reference_map,
+    )
+    messages = [
+        str(job.get("chatgpt_batch_message") or ""),
+        str(job.get("chatgpt_message") or ""),
+        *[
+            str(entry.get("message") or "")
+            for entry in job.get("chatgpt_messages", [])
+            if isinstance(entry, dict)
+        ],
+    ]
+    populated_messages = {message for message in messages if message}
+    if reference_images and not populated_messages:
+        raise ValueError("reference job has no model-facing message containing the compiled map")
+    for message in populated_messages:
+        validate_model_message(
+            message=message,
+            reference_images=reference_images,
+            compiled_model_reference_map=compiled_model_reference_map,
+        )
 
 
 def _validate_session_reference_mapping(job: dict[str, Any], session: dict[str, Any]) -> None:
-    expected = _job_reference_mapping(job)
-    if not expected:
+    expected = reference_audit_fields(job)
+    if not expected["reference_upload_order"]:
         return
-    actual = session.get("reference_image_mapping")
-    if actual != expected:
-        raise ValueError(
-            "Existing ChatGPT session reference mapping is missing or stale. "
-            "Start a fresh conversation with --no-resume so references are uploaded again.\n"
-            f"expected_reference_image_mapping={expected}\n"
-            f"session_reference_image_mapping={actual}"
-        )
+    for field, expected_value in expected.items():
+        actual = session.get(field)
+        if actual != expected_value:
+            raise ValueError(
+                "Existing ChatGPT session reference contract is missing or stale. "
+                "Start a fresh conversation with --no-resume so references are uploaded again.\n"
+                f"field={field}\nexpected={expected_value}\nactual={actual}"
+            )
 
 
 def _encode_ws_text_frame(payload: bytes) -> bytes:
@@ -537,6 +567,11 @@ def _remember_owned_cdp_target(args: argparse.Namespace, target: dict[str, Any])
     args._owned_tab_cdp_url = cdp_url
     args._owned_tab_cdp_target_id = str(target.get("id") or "")
     args._owned_tab_cdp_error = ""
+    browser_session = getattr(args, "_browser_session", None)
+    if browser_session is not None and args._owned_tab_cdp_target_id:
+        browser_session.owned_target_ids.add(args._owned_tab_cdp_target_id)
+        browser_session.target_id = args._owned_tab_cdp_target_id
+        browser_session.target_url = cdp_url
     return True
 
 
@@ -1438,6 +1473,16 @@ def _generation_button_state(args: argparse.Namespace, cwd: Path) -> dict[str, A
     return {"checked": False, "generationActive": True, "readyForNextPrompt": False}
 
 
+def _checked_generation_button_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    state = _generation_button_state(args, cwd)
+    if not state.get("checked") and state.get("error"):
+        raise RecoverablePageError(
+            "ChatGPT generation heartbeat could not read the composer controls: "
+            f"{state['error']}"
+        )
+    return state
+
+
 def _generation_active_from_button_state(state: dict[str, Any]) -> bool:
     if not state.get("checked"):
         return True
@@ -1557,7 +1602,10 @@ def _conversation_source_session(session_path: Path) -> dict[str, Any]:
         "conversation_id": _conversation_id_from_url(conversation_url),
         "conversation_url": conversation_url,
         "job_name": session.get("job_name"),
-        "reference_image_mapping": session.get("reference_image_mapping") or [],
+        "reference_upload_order": session.get("reference_upload_order") or [],
+        "ordered_upload_paths": session.get("ordered_upload_paths") or [],
+        "model_reference_map": session.get("model_reference_map") or [],
+        "compiled_model_reference_map": session.get("compiled_model_reference_map") or "",
         "chat_surface": session.get("chat_surface"),
     }
 
@@ -1873,7 +1921,14 @@ JSON.stringify((() => {
     .slice(0, 8);
   const hasComposer = Array.from(document.querySelectorAll('[contenteditable="true"]')).some(visible);
   const challengeFrame = Array.from(document.querySelectorAll('iframe'))
-    .some((frame) => /captcha|challenge|turnstile|verify/i.test(`${frame.src} ${frame.title}`));
+    .some((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
+  const pageText = (document.body?.innerText || "").slice(0, 6000).toLowerCase();
+  const challengeText = [
+    "verify you are human", "verifying you are human", "confirm you are human",
+    "checking your browser before accessing", "performing security verification",
+    "complete the security check", "complete the challenge", "cloudflare ray id",
+    "验证码", "安全验证", "人机验证", "验证您是真人"
+  ].some((marker) => pageText.includes(marker));
   return {
     href: window.location.href,
     userMessageCount: document.querySelectorAll('[data-message-author-role="user"]').length,
@@ -1885,6 +1940,7 @@ JSON.stringify((() => {
     errorSurfaceTexts,
     hasComposer,
     challengeFrame,
+    humanReason: challengeFrame || challengeText ? "anti_automation_verification" : "",
   };
 })())
 """.strip(),
@@ -1934,6 +1990,7 @@ JSON.stringify((() => {
         "conversation_ok": conversation_ok,
         "has_composer": bool(observation.get("hasComposer")),
         "challenge_frame": bool(observation.get("challengeFrame")),
+        "human_reason": str(observation.get("humanReason") or ""),
         "user_message_count": max(0, int(observation.get("userMessageCount") or 0)),
         "assistant_message_count": max(0, int(observation.get("assistantMessageCount") or 0)),
         "generation_active": _is_busy(page_text),
@@ -2965,10 +3022,17 @@ JSON.stringify((() => {
   const textFor = (el) => [
     el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent
   ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
-  const controls = Array.from(document.querySelectorAll(
-    "button,[role='button'],a,[role='menuitem'],[role='option'],[tabindex]"
-  )).filter(visible);
-  const control = controls.find((el) => /^Create (?:an )?image(?:\b|\s)/i.test(textFor(el)));
+  const menuOpen = Array.from(document.querySelectorAll("button,[role='button']"))
+    .filter(visible)
+    .some((el) => /Add files and more/i.test(textFor(el)) && el.getAttribute("aria-expanded") === "true");
+  const selector = menuOpen
+    ? "button,[role='button'],a,[role='menuitem'],[role='option'],[tabindex]"
+    : "button,[role='button'],a,[role='menuitem'],[role='option']";
+  const controls = Array.from(document.querySelectorAll(selector)).filter(visible);
+  const control = controls.find((el) => {
+    const label = textFor(el);
+    return label.length <= 160 && /^Create (?:an )?image(?:\b|\s)/i.test(label);
+  });
   if (!control) return {found: false};
   const label = textFor(control);
   const rect = control.getBoundingClientRect();
@@ -3147,15 +3211,7 @@ def _wait_for_conversation_history(args: argparse.Namespace, cwd: Path, timeout_
     )
 
 
-def _wait_for_prompt_box(args: argparse.Namespace, cwd: Path, timeout_s: int = 60) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if _owned_tab_cdp_url(args):
-            try:
-                state = _eval_json(
-                    args,
-                    cwd,
-                    r"""
+PAGE_ACCESS_STATE_JS = r"""
 JSON.stringify((() => {
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
@@ -3163,49 +3219,143 @@ JSON.stringify((() => {
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
   const hasPrompt = Array.from(document.querySelectorAll("[contenteditable='true']")).some(visible);
-  const text = (document.body?.innerText || "").slice(0, 2500).toLowerCase();
+  const rawText = (document.body?.innerText || "").slice(0, 6000);
+  const text = rawText.toLowerCase();
   const loginPath = /\/(auth\/)?(login|signin)(\/|$)/i.test(location.pathname);
   const loginControl = Array.from(document.querySelectorAll("a,button"))
     .filter(visible)
     .some((el) => /^(log in|sign in|continue with|登录|登入)/i.test((el.innerText || "").trim()));
   const challengeFrame = Array.from(document.querySelectorAll("iframe"))
-    .some((frame) => /captcha|challenge|turnstile|verify/i.test(`${frame.src} ${frame.title}`));
+    .some((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
   const challengeText = [
-    "verify you are human", "confirm you are human", "security check",
-    "unusual activity", "complete the challenge", "验证码", "安全验证"
+    "verify you are human", "verifying you are human", "confirm you are human",
+    "checking your browser before accessing", "performing security verification",
+    "complete the security check", "complete the challenge", "cloudflare ray id",
+    "验证码", "安全验证", "人机验证", "验证您是真人"
   ].some((marker) => text.includes(marker));
   let humanReason = "";
   if (challengeFrame || challengeText) humanReason = "anti_automation_verification";
   else if (loginPath || loginControl) humanReason = "login_required";
-  return {hasPrompt, humanReason};
+  const crashMarkers = [
+    "aw, snap!", "this page isn't working", "this page isn’t working",
+    "this site can't be reached", "this site can’t be reached", "page crashed",
+    "out of memory", "err_connection_", "err_internet_", "err_timed_out",
+    "err_failed", "err_http2_", "err_network_"
+  ];
+  const matchedCrashMarker = crashMarkers.find((marker) => text.includes(marker)) || "";
+  let crashReason = "";
+  if (location.href.startsWith("chrome-error://")) crashReason = "chrome_error_page";
+  else if (matchedCrashMarker) crashReason = matchedCrashMarker;
+  else if (document.readyState === "complete" && location.href === "about:blank") crashReason = "unexpected_blank_page";
+  return {
+    hasPrompt,
+    humanReason,
+    crashReason,
+    href: location.href,
+    title: document.title,
+    readyState: document.readyState,
+  };
 })())
-""".strip(),
-                    timeout=30,
-                )
-                if state.get("humanReason"):
-                    _activate_for_human_attention(args, str(state["humanReason"]))
-                if state.get("hasPrompt"):
-                    return
-            except HumanAttentionRequired:
-                raise
-            except Exception:
-                pass
-        else:
-            snapshot = _snapshot(args, cwd)
-            lowered = snapshot.lower()
-            if any(marker in lowered for marker in ("verify you are human", "captcha", "security check")):
-                _activate_for_human_attention(args, "anti_automation_verification")
-            if any(marker in lowered for marker in ("log in", "sign in", "登录")):
-                _activate_for_human_attention(args, "login_required")
-            if (
-                'role="textbox"' in snapshot
-                or 'aria-label="Chat with ChatGPT"' in snapshot
-                or "Chat with ChatGPT" in snapshot
-                or "Message ChatGPT" in snapshot
-            ):
-                return
+""".strip()
+
+
+def _page_access_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    if _owned_tab_cdp_url(args):
+        return _eval_json(args, cwd, PAGE_ACCESS_STATE_JS, timeout=30)
+    snapshot = _snapshot(args, cwd)
+    lowered = snapshot.lower()
+    human_reason = ""
+    if any(
+        marker in lowered
+        for marker in (
+            "verify you are human",
+            "verifying you are human",
+            "captcha",
+            "turnstile",
+            "security check",
+            "人机验证",
+            "安全验证",
+        )
+    ):
+        human_reason = "anti_automation_verification"
+    elif any(marker in lowered for marker in ("log in", "sign in", "登录", "登入")):
+        human_reason = "login_required"
+    crash_reason = next(
+        (
+            marker
+            for marker in (
+                "aw, snap!",
+                "this page isn't working",
+                "this page isn’t working",
+                "this site can't be reached",
+                "this site can’t be reached",
+                "page crashed",
+                "err_connection_",
+                "err_timed_out",
+            )
+            if marker in lowered
+        ),
+        "",
+    )
+    has_prompt = any(
+        marker in snapshot
+        for marker in (
+            'role="textbox"',
+            'aria-label="Chat with ChatGPT"',
+            "Chat with ChatGPT",
+            "Message ChatGPT",
+        )
+    )
+    return {
+        "hasPrompt": has_prompt,
+        "humanReason": human_reason,
+        "crashReason": crash_reason,
+        "href": "",
+        "readyState": "unknown",
+    }
+
+
+def _wait_for_prompt_box(args: argparse.Namespace, cwd: Path, timeout_s: int = 60) -> None:
+    deadline = time.time() + timeout_s
+    last_state: dict[str, Any] = {}
+    last_error = ""
+    consecutive_state_failures = 0
+    while time.time() < deadline:
+        try:
+            state = _page_access_state(args, cwd)
+            last_state = state
+            last_error = ""
+            consecutive_state_failures = 0
+        except HumanAttentionRequired:
+            raise
+        except Exception as error:
+            consecutive_state_failures += 1
+            last_error = f"{type(error).__name__}: {error}"
+            if consecutive_state_failures >= PAGE_STATE_FAILURES_BEFORE_RECOVERY:
+                raise RecoverablePageError(
+                    "ChatGPT page health could not be read for "
+                    f"{consecutive_state_failures} consecutive checks: {last_error}"
+                ) from error
+            time.sleep(1)
+            continue
+        if state.get("humanReason"):
+            _activate_for_human_attention(args, str(state["humanReason"]))
+        if state.get("crashReason"):
+            raise RecoverablePageError(
+                "ChatGPT page is not usable: "
+                f"{state['crashReason']} at {state.get('href') or 'unknown URL'}"
+            )
+        if state.get("hasPrompt"):
+            return
         time.sleep(1)
-    raise TimeoutError("ChatGPT prompt textbox did not become visible")
+    detail = {
+        "last_state": last_state,
+        **({"last_error": last_error} if last_error else {}),
+    }
+    raise RecoverablePageError(
+        "ChatGPT prompt textbox did not become visible before the bounded wait expired: "
+        f"{json.dumps(detail, ensure_ascii=False)}"
+    )
 
 
 def _activate_for_human_attention(args: argparse.Namespace, reason: str) -> None:
@@ -3218,6 +3368,224 @@ def _activate_for_human_attention(args: argparse.Namespace, reason: str) -> None
     raise HumanAttentionRequired(reason, activation)
 
 
+def _page_recovery_attempt_limit(args: argparse.Namespace) -> int:
+    return max(
+        0,
+        int(getattr(args, "page_recovery_attempts", DEFAULT_PAGE_RECOVERY_ATTEMPTS)),
+    )
+
+
+def _recover_chatgpt_page(
+    args: argparse.Namespace,
+    cwd: Path,
+    target_url: str,
+    *,
+    phase: str,
+    attempt: int,
+    reason: str,
+) -> dict[str, Any]:
+    target_url = target_url or "https://chatgpt.com/"
+    try:
+        state = _page_access_state(args, cwd)
+    except HumanAttentionRequired:
+        raise
+    except Exception:
+        state = {}
+    if state.get("humanReason"):
+        _activate_for_human_attention(args, str(state["humanReason"]))
+
+    previous_target_id = str(getattr(args, "_owned_tab_cdp_target_id", "") or "")
+    recovery_method = "navigate_owned_tab"
+    if _owned_tab_cdp_url(args):
+        navigated = _navigate_owned_cdp_tab(args, target_url)
+        if not navigated:
+            recovery_method = "replace_owned_tab"
+            _close_owned_tab(args, cwd)
+            _forget_owned_cdp_target(args)
+            if not _open_background_cdp_tab(args, target_url):
+                raise RecoverablePageError(
+                    "ChatGPT page target was unreadable and a replacement CDP tab could not be created: "
+                    f"{getattr(args, '_owned_tab_cdp_error', '')}"
+                )
+    else:
+        recovery_method = "reopen_url"
+        _open_url(args, cwd, target_url)
+
+    _wait_ms(args, cwd, 1000)
+    _wait_for_prompt_box(args, cwd, timeout_s=30)
+    return {
+        "phase": phase,
+        "attempt": attempt,
+        "status": "page_recovered",
+        "reason": reason,
+        "target_url": target_url,
+        "method": recovery_method,
+        "previous_target_id": previous_target_id,
+        "current_target_id": str(getattr(args, "_owned_tab_cdp_target_id", "") or ""),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def _record_page_recovery(
+    event: dict[str, Any],
+    *,
+    job: dict[str, Any] | None,
+    label: int | str,
+) -> None:
+    progress = {"event": "chatgpt_page_recovery", **event}
+    print(json.dumps(progress, ensure_ascii=False), file=sys.stderr, flush=True)
+    if job is not None:
+        _write_session_patch(
+            job,
+            {
+                "label": label,
+                "status": event["status"],
+                "page_recovery": event,
+                "attempt": {
+                    "action": "page_recovery",
+                    "label": label,
+                    **event,
+                },
+            },
+        )
+
+
+def _run_with_page_recovery(
+    args: argparse.Namespace,
+    cwd: Path,
+    operation: Callable[[], Any],
+    *,
+    phase: str,
+    target_url: str,
+    job: dict[str, Any] | None = None,
+    label: int | str = "batch",
+    failure_confirmations: int = 1,
+) -> tuple[Any, list[dict[str, Any]]]:
+    nonrecoverable_errors = (
+        ChatSurfaceSelectionError,
+        ImageModeSelectionError,
+        ReferenceUploadError,
+    )
+    recoverable_errors = (
+        RecoverablePageError,
+        TimeoutError,
+        RuntimeError,
+        OSError,
+        subprocess.SubprocessError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+    )
+
+    def stop_for_human_gate() -> None:
+        try:
+            state = _page_access_state(args, cwd)
+        except Exception:
+            return
+        if state.get("humanReason"):
+            _activate_for_human_attention(args, str(state["humanReason"]))
+
+    try:
+        return operation(), []
+    except HumanAttentionRequired:
+        raise
+    except nonrecoverable_errors:
+        stop_for_human_gate()
+        raise
+    except recoverable_errors as error:
+        last_error: BaseException = error
+
+    for _ in range(1, max(1, failure_confirmations)):
+        time.sleep(1)
+        try:
+            return operation(), []
+        except HumanAttentionRequired:
+            raise
+        except nonrecoverable_errors:
+            stop_for_human_gate()
+            raise
+        except recoverable_errors as error:
+            last_error = error
+
+    events: list[dict[str, Any]] = []
+    limit = _page_recovery_attempt_limit(args)
+    for attempt in range(1, limit + 1):
+        reason = f"{type(last_error).__name__}: {last_error}"
+        started = {
+            "phase": phase,
+            "attempt": attempt,
+            "status": "page_recovery_started",
+            "reason": reason,
+            "target_url": target_url or "https://chatgpt.com/",
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        _record_page_recovery(started, job=job, label=label)
+        try:
+            event = _recover_chatgpt_page(
+                args,
+                cwd,
+                target_url,
+                phase=phase,
+                attempt=attempt,
+                reason=reason,
+            )
+        except HumanAttentionRequired:
+            raise
+        except recoverable_errors as recovery_error:
+            last_error = recovery_error
+            event = {
+                **started,
+                "status": "page_recovery_failed",
+                "recovery_error": f"{type(recovery_error).__name__}: {recovery_error}",
+            }
+            events.append(event)
+            _record_page_recovery(event, job=job, label=label)
+            continue
+
+        try:
+            result = operation()
+        except HumanAttentionRequired:
+            raise
+        except nonrecoverable_errors:
+            stop_for_human_gate()
+            raise
+        except recoverable_errors as operation_error:
+            last_error = operation_error
+            event.update(
+                {
+                    "status": "page_recovery_retry_failed",
+                    "operation_error": f"{type(operation_error).__name__}: {operation_error}",
+                }
+            )
+            events.append(event)
+            _record_page_recovery(event, job=job, label=label)
+            continue
+
+        events.append(event)
+        _record_page_recovery(event, job=job, label=label)
+        return result, events
+
+    post_submit = phase.startswith("post_submit")
+    report = {
+        "status": "generation_failed",
+        "error_type": "chatgpt_page_recovery_exhausted",
+        "retryable": True,
+        "terminal": True,
+        "recommended_next_action": (
+            "collect_current_or_inspect_conversation" if post_submit else "rerun_same_job"
+        ),
+        "submission_committed": True if post_submit else False,
+        "should_collect_current_first": post_submit,
+        "phase": phase,
+        "target_url": target_url or "https://chatgpt.com/",
+        "recovery_attempt_count": len(events),
+        "recovery_attempts": events,
+        "reason": f"{type(last_error).__name__}: {last_error}",
+    }
+    if job is not None:
+        _write_session_patch(job, {"label": label, **report})
+    raise PageRecoveryExhaustedError(report) from last_error
+
+
 def _wait_ms(args: argparse.Namespace, cwd: Path, milliseconds: int) -> None:
     if _owned_tab_cdp_url(args):
         time.sleep(max(0, milliseconds) / 1000)
@@ -3228,6 +3596,10 @@ def _wait_ms(args: argparse.Namespace, cwd: Path, milliseconds: int) -> None:
 def _upload_files(args: argparse.Namespace, cwd: Path, references: list[str]) -> None:
     if not references:
         return
+    if len(references) != 1:
+        raise ValueError(
+            "Reference files must be uploaded one at a time so attachment order can be audited"
+        )
     if _owned_tab_cdp_url(args):
         try:
             with _CDPConnection.connect(_owned_tab_cdp_url(args), timeout=180) as conn:
@@ -3337,28 +3709,171 @@ def _wait_for_reference_uploads_ready(
     started_at = time.time()
     observation_window_s = min(max(0, min_wait_s), max(0, timeout_s))
     while True:
+        access_state = _page_access_state(args, cwd)
+        if access_state.get("humanReason"):
+            _activate_for_human_attention(args, str(access_state["humanReason"]))
+        if access_state.get("crashReason"):
+            raise RecoverablePageError(
+                "ChatGPT page became unusable while waiting for reference uploads: "
+                f"{access_state['crashReason']}"
+            )
         observation = _reference_upload_observation(args, cwd, references)
         if observation.get("failure"):
             raise ReferenceUploadError(observation["failure"])
         elapsed = time.time() - started_at
         if observation.get("ready") and elapsed >= observation_window_s:
             return observation
+        if (
+            elapsed >= min(timeout_s, REFERENCE_UPLOAD_NO_EVIDENCE_RECOVERY_SECONDS)
+            and int(observation.get("attachment_count") or 0) == 0
+            and int(observation.get("blob_image_count") or 0) == 0
+        ):
+            raise RecoverablePageError(
+                "Reference upload showed no attachment evidence after the bounded startup wait; "
+                "the pre-submit page state may have been refreshed or lost."
+            )
         if elapsed >= timeout_s:
-            raise ReferenceUploadError(
-                {
-                    "status": "reference_upload_failed",
-                    "error_type": "reference_upload_unverified",
-                    "retryable": True,
-                    "terminal": False,
-                    "recommended_next_action": "retry_reference_upload",
-                    "observation": {
+            raise RecoverablePageError(
+                "Reference attachments disappeared or never became verifiable before submission: "
+                + json.dumps(
+                    {
                         key: value
                         for key, value in observation.items()
                         if key != "page_text"
                     },
-                }
+                    ensure_ascii=False,
+                )
             )
         time.sleep(1)
+
+
+def _upload_references_in_order(
+    args: argparse.Namespace,
+    cwd: Path,
+    references: list[str],
+) -> dict[str, Any]:
+    """Upload each reference separately and prove a monotonic attachment sequence."""
+    if not references:
+        return {
+            "reference_count": 0,
+            "blob_image_count": 0,
+            "filename_mentions": {},
+            "upload_sequence": [],
+            "ordered_upload_paths": [],
+            "order_verified": True,
+            "order_verification_method": "no_references",
+        }
+
+    steps: list[dict[str, Any]] = []
+    final_observation: dict[str, Any] = {}
+    for index, path in enumerate(references, start=1):
+        _upload_files(args, cwd, [path])
+        final_observation = _wait_for_reference_uploads_ready(
+            args,
+            cwd,
+            references[:index],
+        )
+        observed_count = max(
+            int(final_observation.get("attachment_count") or 0),
+            int(final_observation.get("blob_image_count") or 0),
+        )
+        if observed_count < index:
+            raise RecoverablePageError(
+                "Sequential reference upload did not produce a monotonic attachment count: "
+                f"Reference Image {index}, observed_count={observed_count}"
+            )
+        steps.append(
+            {
+                "index": index,
+                "path": path,
+                "observed_attachment_count": int(
+                    final_observation.get("attachment_count") or 0
+                ),
+                "observed_blob_image_count": int(
+                    final_observation.get("blob_image_count") or 0
+                ),
+            }
+        )
+
+    attachment_label_order_verified: bool | None = None
+    attachment_labels = [str(label) for label in final_observation.get("attachment_labels") or []]
+    indexed_labels: list[tuple[int, str]] = []
+    for label in attachment_labels:
+        match = re.match(r"^Remove file\s+(\d+):\s*(.+)$", label, re.IGNORECASE)
+        if match:
+            indexed_labels.append((int(match.group(1)), match.group(2)))
+    if len(indexed_labels) >= len(references):
+        indexed_labels.sort(key=lambda item: item[0])
+        expected_indices = list(range(1, len(references) + 1))
+        attachment_label_order_verified = (
+            [index for index, _ in indexed_labels[: len(references)]] == expected_indices
+            and all(
+                Path(path).name.casefold() in label.casefold()
+                or Path(path).stem.casefold() in label.casefold()
+                for path, (_, label) in zip(
+                    references,
+                    indexed_labels[: len(references)],
+                    strict=True,
+                )
+            )
+        )
+        if not attachment_label_order_verified:
+            raise ReferenceUploadError(
+                {
+                    "status": "reference_upload_failed",
+                    "error_type": "reference_upload_order_mismatch",
+                    "retryable": True,
+                    "terminal": True,
+                    "recommended_next_action": "rerun_same_job_after_inspecting_upload_trace",
+                    "reason": "Visible ChatGPT attachment labels do not match manifest array order",
+                    "expected_upload_order": list(enumerate(references, start=1)),
+                    "observed_attachment_labels": attachment_labels,
+                }
+            )
+
+    return {
+        **final_observation,
+        "upload_sequence": steps,
+        "ordered_upload_paths": list(references),
+        "order_verified": True,
+        "attachment_label_order_verified": attachment_label_order_verified,
+        "order_verification_method": (
+            "visible_attachment_labels_and_sequential_file_input"
+            if attachment_label_order_verified
+            else "sequential_file_input_with_monotonic_attachment_count"
+        ),
+    }
+
+
+def _require_verified_reference_upload_order(
+    references: list[str],
+    observation: dict[str, Any],
+) -> None:
+    if not references:
+        return
+    steps = observation.get("upload_sequence") or []
+    actual = [
+        (int(step.get("index") or 0), str(step.get("path") or ""))
+        for step in steps
+        if isinstance(step, dict)
+    ]
+    expected = list(enumerate(references, start=1))
+    if not observation.get("order_verified") or actual != expected:
+        raise ReferenceUploadError(
+            {
+                "status": "reference_upload_failed",
+                "error_type": "reference_upload_order_unverified",
+                "retryable": True,
+                "terminal": True,
+                "recommended_next_action": "rerun_same_job_after_inspecting_upload_trace",
+                "reason": (
+                    "The runner could not prove that UI attachment order matches Reference "
+                    "Image 1..N numbering"
+                ),
+                "expected_upload_order": expected,
+                "observed_upload_order": actual,
+            }
+        )
 
 
 def _upload_failure_report(
@@ -3381,7 +3896,7 @@ def _upload_failure_report(
         "resumed": False,
         "conversation_id": _conversation_id_from_url(conversation_url),
         "conversation_url": conversation_url,
-        "reference_image_mapping": _job_reference_mapping(job),
+        **reference_audit_fields(job),
         "agent_browser_profile": _profile_label(args),
         "account_lane": TARGET_CHATGPT_ACCOUNT_SIGNAL,
         "account_guard": account_guard,
@@ -3405,6 +3920,7 @@ def _upload_failure_report(
         "agent_browser_session": _agent_browser_session_record(args),
         "conversation_url": conversation_url,
         "reference_count": len(references),
+        **reference_audit_fields(job),
         "trace_dir": str(trace_dir),
         "account_guard": account_guard,
         **({"continued_from": continued_from} if continued_from else {}),
@@ -3422,35 +3938,53 @@ def _upload_failure_report(
 def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any]:
     trace_dir = Path(job["download_dir"]) / "agent_browser_trace"
     trace_dir.mkdir(parents=True, exist_ok=True)
-
-    _open_new_chat(args, cwd)
-    _wait_for_prompt_box(args, cwd)
-    chat_surface = _ensure_chat_surface(args, cwd)
-    account_guard = _validate_account_lane(args, cwd, job)
-    _screenshot(args, cwd, trace_dir / "01_open.png")
-
-    image_mode = _enable_image_mode_if_available(
-        args,
-        cwd,
-        "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd),
-    )
-    aspect_ratio_delivery = _configure_aspect_ratio(
-        args,
-        cwd,
-        str(job.get("output_aspect_ratio") or "1:1"),
-    )
-
     references = [ref["path"] for ref in job.get("reference_images", [])]
-    # ChatGPT keeps a file input mounted after image mode is available. If this
-    # fails, the screenshot and snapshot remain enough to debug the UI state.
-    if references:
-        _upload_files(args, cwd, references)
-        upload_observation = _wait_for_reference_uploads_ready(args, cwd, references)
-    else:
-        upload_observation = {"reference_count": 0, "blob_image_count": 0, "filename_mentions": {}}
-    chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface)
-    _screenshot(args, cwd, trace_dir / "02_after_upload.png")
-    after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+
+    def prepare_surface() -> dict[str, Any]:
+        _open_new_chat(args, cwd)
+        _wait_for_prompt_box(args, cwd)
+        chat_surface = _ensure_chat_surface(args, cwd)
+        account_guard = _validate_account_lane(args, cwd, job)
+        _screenshot(args, cwd, trace_dir / "01_open.png")
+        image_mode = _enable_image_mode_if_available(
+            args,
+            cwd,
+            "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd),
+        )
+        aspect_ratio_delivery = _configure_aspect_ratio(
+            args,
+            cwd,
+            str(job.get("output_aspect_ratio") or "1:1"),
+        )
+        upload_observation = _upload_references_in_order(args, cwd, references)
+        _require_verified_reference_upload_order(references, upload_observation)
+        chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface)
+        _screenshot(args, cwd, trace_dir / "02_after_upload.png")
+        after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+        return {
+            "chat_surface": chat_surface,
+            "account_guard": account_guard,
+            "image_mode": image_mode,
+            "aspect_ratio_delivery": aspect_ratio_delivery,
+            "upload_observation": upload_observation,
+            "after_upload": after_upload,
+        }
+
+    prepared, page_recoveries = _run_with_page_recovery(
+        args,
+        cwd,
+        prepare_surface,
+        phase="dry_upload_prepare",
+        target_url="https://chatgpt.com/",
+        job=job,
+        label="batch",
+    )
+    chat_surface = prepared["chat_surface"]
+    account_guard = prepared["account_guard"]
+    image_mode = prepared["image_mode"]
+    aspect_ratio_delivery = prepared["aspect_ratio_delivery"]
+    upload_observation = prepared["upload_observation"]
+    after_upload = prepared["after_upload"]
 
     report = {
         "schema_version": 1,
@@ -3459,6 +3993,7 @@ def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> 
         "prompt_card": job["prompt_card"],
         "agent_browser_session": _agent_browser_session_record(args),
         "reference_count": len(references),
+        **reference_audit_fields(job),
         "trace_dir": str(trace_dir),
         "account_guard": account_guard,
         "chat_surface": chat_surface,
@@ -3472,6 +4007,7 @@ def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> 
             for key, value in upload_observation.items()
             if key != "page_text"
         },
+        "page_recoveries": page_recoveries,
     }
     report_path = trace_dir / "dry_upload_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -4435,6 +4971,21 @@ def _collect_generated_images_with_retries(
             )
         ),
     )
+    page_recoveries: list[dict[str, Any]] = []
+
+    def monitored_page_call(operation: Callable[[], Any], operation_name: str) -> Any:
+        result, recovery_events = _run_with_page_recovery(
+            args,
+            cwd,
+            operation,
+            phase=f"post_submit_monitor:{operation_name}",
+            target_url=active_expected_conversation_url or "https://chatgpt.com/",
+            job=job,
+            label=label,
+            failure_confirmations=3,
+        )
+        page_recoveries.extend(recovery_events)
+        return result
 
     for retry_index in range(max_failure_retries + 1):
         deadline = time.time() + args.timeout
@@ -4448,11 +4999,14 @@ def _collect_generated_images_with_retries(
         missing_submitted_turn_heartbeats = 0
         detected_generation_error: dict[str, str] | None = None
         while time.time() < deadline:
-            conversation_guard = _ensure_expected_conversation(
-                args,
-                cwd,
-                active_expected_conversation_url,
-                baseline_user_message_count,
+            conversation_guard = monitored_page_call(
+                lambda: _ensure_expected_conversation(
+                    args,
+                    cwd,
+                    active_expected_conversation_url,
+                    baseline_user_message_count,
+                ),
+                "conversation_guard",
             )
             active_expected_conversation_url = _persist_canonical_conversation(
                 job,
@@ -4462,7 +5016,10 @@ def _collect_generated_images_with_retries(
             )
             if conversation_guard.get("restored"):
                 conversation_restores.append(conversation_guard)
-            page_text = _page_text(args, cwd)
+            page_text = monitored_page_call(
+                lambda: _page_text(args, cwd),
+                "page_text",
+            )
             policy_refusal = _content_policy_refusal(page_text)
             if policy_refusal:
                 _emit_progress(
@@ -4489,6 +5046,7 @@ def _collect_generated_images_with_retries(
                     "failure_retries": failures,
                     "conversation_guard": conversation_guard,
                     "conversation_restores": conversation_restores,
+                    "page_recoveries": page_recoveries,
                 }
                 _write_session_patch(
                     job,
@@ -4507,7 +5065,10 @@ def _collect_generated_images_with_retries(
                 )
                 _screenshot(args, cwd, trace_dir / "05_policy_refused.png")
                 return result
-            rows = _image_inventory(args, cwd)
+            rows = monitored_page_call(
+                lambda: _image_inventory(args, cwd),
+                "image_inventory",
+            )
             candidates = _vertical_images(rows, baseline, baseline_user_message_count)
             if len(candidates) > len(best_candidates):
                 best_candidates = candidates
@@ -4518,12 +5079,20 @@ def _collect_generated_images_with_retries(
                 best_candidate_count = len(candidates)
                 last_candidate_growth_at = time.time()
             if time.time() >= next_progress_at:
-                page_health = _generation_page_health(
-                    args,
-                    cwd,
-                    active_expected_conversation_url,
-                    page_text,
+                page_health = monitored_page_call(
+                    lambda: _generation_page_health(
+                        args,
+                        cwd,
+                        active_expected_conversation_url,
+                        page_text,
+                    ),
+                    "heartbeat",
                 )
+                if page_health.get("human_reason") or page_health.get("challenge_frame"):
+                    _activate_for_human_attention(
+                        args,
+                        str(page_health.get("human_reason") or "anti_automation_verification"),
+                    )
                 next_missing_heartbeat = missing_submitted_turn_heartbeats + 1
                 missing_turn_error = _missing_submitted_turn_error(
                     page_health,
@@ -4564,7 +5133,10 @@ def _collect_generated_images_with_retries(
                     page_health=page_health,
                 )
                 next_progress_at = time.time() + progress_interval
-            button_state = _generation_button_state(args, cwd)
+            button_state = monitored_page_call(
+                lambda: _checked_generation_button_state(args, cwd),
+                "composer_controls",
+            )
             generation_active = _generation_active_from_button_state(button_state)
             now = time.time()
             if _stale_generation_refresh_due(
@@ -4605,6 +5177,7 @@ def _collect_generated_images_with_retries(
                         "resumed": resumed,
                         "conversation_guard": refresh_event,
                         "conversation_restores": conversation_restores,
+                        "page_recoveries": page_recoveries,
                         "recognized_candidate_count": len(candidates),
                         "expected_image_count": expected_count,
                     },
@@ -4675,6 +5248,7 @@ def _collect_generated_images_with_retries(
                             "shortfall_count": max(0, expected_count - len(downloaded)),
                             "conversation_guard": conversation_guard,
                             "conversation_restores": conversation_restores,
+                            "page_recoveries": page_recoveries,
                             **completion_metadata,
                             "outputs": [item["path"] for item in downloaded],
                             "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -4706,6 +5280,7 @@ def _collect_generated_images_with_retries(
                         "expected_image_count": expected_count,
                         "conversation_guard": conversation_guard,
                         "conversation_restores": conversation_restores,
+                        "page_recoveries": page_recoveries,
                         **completion_metadata,
                     }
                 if download_failures:
@@ -4732,6 +5307,7 @@ def _collect_generated_images_with_retries(
                         "failure_retries": failures,
                         "conversation_guard": conversation_guard,
                         "conversation_restores": conversation_restores,
+                        "page_recoveries": page_recoveries,
                     }
                     _write_session_patch(job, {**result, "label": label})
                     _screenshot(args, cwd, trace_dir / "05_download_failed.png")
@@ -4742,11 +5318,14 @@ def _collect_generated_images_with_retries(
                 continue
             time.sleep(5)
 
-        conversation_guard = _ensure_expected_conversation(
-            args,
-            cwd,
-            active_expected_conversation_url,
-            baseline_user_message_count,
+        conversation_guard = monitored_page_call(
+            lambda: _ensure_expected_conversation(
+                args,
+                cwd,
+                active_expected_conversation_url,
+                baseline_user_message_count,
+            ),
+            "final_conversation_guard",
         )
         active_expected_conversation_url = _persist_canonical_conversation(
             job,
@@ -4756,14 +5335,25 @@ def _collect_generated_images_with_retries(
         )
         if conversation_guard.get("restored"):
             conversation_restores.append(conversation_guard)
-        page_text = _page_text(args, cwd)
+        page_text = monitored_page_call(
+            lambda: _page_text(args, cwd),
+            "final_page_text",
+        )
         if not detected_generation_error:
-            page_health = _generation_page_health(
-                args,
-                cwd,
-                active_expected_conversation_url,
-                page_text,
+            page_health = monitored_page_call(
+                lambda: _generation_page_health(
+                    args,
+                    cwd,
+                    active_expected_conversation_url,
+                    page_text,
+                ),
+                "final_heartbeat",
             )
+            if page_health.get("human_reason") or page_health.get("challenge_frame"):
+                _activate_for_human_attention(
+                    args,
+                    str(page_health.get("human_reason") or "anti_automation_verification"),
+                )
             detected_generation_error = page_health.get("generation_error")
         policy_refusal = _content_policy_refusal(page_text)
         if policy_refusal:
@@ -4781,6 +5371,7 @@ def _collect_generated_images_with_retries(
                 "failure_retries": failures,
                 "conversation_guard": conversation_guard,
                 "conversation_restores": conversation_restores,
+                "page_recoveries": page_recoveries,
             }
             _write_session_patch(
                 job,
@@ -4855,6 +5446,7 @@ def _collect_generated_images_with_retries(
                     "shortfall_count": max(0, expected_count - len(downloaded)),
                     "conversation_guard": conversation_guard,
                     "conversation_restores": conversation_restores,
+                    "page_recoveries": page_recoveries,
                     **completion_metadata,
                     "outputs": [item["path"] for item in downloaded],
                     "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -4885,6 +5477,7 @@ def _collect_generated_images_with_retries(
                 "expected_image_count": expected_count,
                 "conversation_guard": conversation_guard,
                 "conversation_restores": conversation_restores,
+                "page_recoveries": page_recoveries,
                 **completion_metadata,
             }
         if not detected_generation_error:
@@ -4896,6 +5489,7 @@ def _collect_generated_images_with_retries(
                     "resumed": resumed,
                     "conversation_guard": conversation_guard,
                     "conversation_restores": conversation_restores,
+                    "page_recoveries": page_recoveries,
                 },
             )
             raise TimeoutError("No generated image appeared before timeout")
@@ -4917,6 +5511,7 @@ def _collect_generated_images_with_retries(
                 "resumed": resumed,
                 "conversation_guard": conversation_guard,
                 "conversation_restores": conversation_restores,
+                "page_recoveries": page_recoveries,
                 "attempt": {"action": "failure", "label": label, "mode": mode, **failure},
             },
         )
@@ -4945,6 +5540,7 @@ def _collect_generated_images_with_retries(
                 "failure_retries": failures,
                 "conversation_guard": conversation_guard,
                 "conversation_restores": conversation_restores,
+                "page_recoveries": page_recoveries,
             }
             _write_session_patch(job, {**result, "label": label})
             _screenshot(args, cwd, trace_dir / "05_generation_failed.png")
@@ -5111,6 +5707,7 @@ def _write_summary(
         "request_mode": request_mode,
         "image_generation_mode": job.get("image_generation_mode") or "create_image",
         "output_aspect_ratio": job.get("output_aspect_ratio") or "1:1",
+        **reference_audit_fields(job),
         "start_variant": start_variant,
         "end_variant": end_variant,
         "variants": variants,
@@ -5173,7 +5770,8 @@ def _update_summary_for_collect_current(
         "variant_count": max(1, int(job.get("variant_count") or 1)),
         "request_mode": job.get("request_mode") or "single_batch",
         "image_generation_mode": job.get("image_generation_mode") or "create_image",
-        "output_aspect_ratio": job.get("output_aspect_ratio") or "1:1",
+            "output_aspect_ratio": job.get("output_aspect_ratio") or "1:1",
+            **reference_audit_fields(job),
         "start_variant": 1,
         "end_variant": "batch",
         "variants": [],
@@ -5185,6 +5783,7 @@ def _update_summary_for_collect_current(
             "job_name": job["job_name"],
             "prompt_card": job["prompt_card"],
             "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **reference_audit_fields(job),
         }
     )
     variants = list(summary.get("variants") or [])
@@ -5461,6 +6060,7 @@ def _run_one_request(
             "conversation_url": conversation_url,
             "trace_dir": str(trace_dir),
             "reference_count": len(references),
+            **reference_audit_fields(job),
             "account_guard": account_guard,
             "chat_surface": chat_surface,
             "image_mode": existing_session.get("image_mode"),
@@ -5485,18 +6085,8 @@ def _run_one_request(
                 "original turn is not overwritten."
             )
         continued_from = _conversation_source_session(source_path)
-        conversation_url = _open_conversation(args, cwd, continued_from["conversation_url"])
-        _wait_for_followup_composer(args, cwd)
-        _wait_for_conversation_history(args, cwd)
-        chat_surface = _ensure_chat_surface(
-            args,
-            cwd,
-            recorded=continued_from.get("chat_surface"),
-            timeout_s=2,
-        )
-        account_guard = _validate_account_lane(args, cwd, job, label)
-        _screenshot(args, cwd, trace_dir / "01_conversation_followup.png")
         submit_throttle = {"enabled": False, "reason": "conversation_followup"}
+        prepare_target_url = continued_from["conversation_url"]
     else:
         submit_throttle = _wait_for_submit_throttle_slot(
             args,
@@ -5504,69 +6094,151 @@ def _run_one_request(
             label=label,
             expected_count=expected_count,
         )
-        _open_new_chat(args, cwd)
-        _wait_for_prompt_box(args, cwd)
-        chat_surface = _ensure_chat_surface(args, cwd)
-        account_guard = _validate_account_lane(args, cwd, job, label)
-        _screenshot(args, cwd, trace_dir / "01_open.png")
+        prepare_target_url = "https://chatgpt.com/"
 
-    image_mode = _enable_image_mode_if_available(
-        args,
-        cwd,
-        "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd),
-    )
-    aspect_ratio_delivery = _configure_aspect_ratio(
-        args,
-        cwd,
-        str(job.get("output_aspect_ratio") or "1:1"),
-    )
-
-    if references:
-        _upload_files(args, cwd, references)
-        try:
-            upload_observation = _wait_for_reference_uploads_ready(args, cwd, references)
-        except ReferenceUploadError as error:
-            _screenshot(args, cwd, trace_dir / "02_upload_failed.png")
-            return _upload_failure_report(
-                job=job,
-                args=args,
-                label=label,
-                mode=submit_mode,
-                trace_dir=trace_dir,
-                references=references,
-                account_guard=account_guard,
-                failure=error.failure,
-                continued_from=continued_from,
+    def prepare_surface() -> dict[str, Any]:
+        if continued_from:
+            _open_conversation(args, cwd, continued_from["conversation_url"])
+            _wait_for_followup_composer(args, cwd)
+            _wait_for_conversation_history(args, cwd)
+            chat_surface = _ensure_chat_surface(
+                args,
+                cwd,
+                recorded=continued_from.get("chat_surface"),
+                timeout_s=2,
             )
-    else:
-        upload_observation = {"reference_count": 0, "blob_image_count": 0, "filename_mentions": {}}
-    _screenshot(args, cwd, trace_dir / "02_after_upload.png")
-    after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+            open_screenshot = trace_dir / "01_conversation_followup.png"
+        else:
+            _open_new_chat(args, cwd)
+            _wait_for_prompt_box(args, cwd)
+            chat_surface = _ensure_chat_surface(args, cwd)
+            open_screenshot = trace_dir / "01_open.png"
+        account_guard = _validate_account_lane(args, cwd, job, label)
+        _screenshot(args, cwd, open_screenshot)
+        image_mode = _enable_image_mode_if_available(
+            args,
+            cwd,
+            "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd),
+        )
+        aspect_ratio_delivery = _configure_aspect_ratio(
+            args,
+            cwd,
+            str(job.get("output_aspect_ratio") or "1:1"),
+        )
+        upload_observation = _upload_references_in_order(args, cwd, references)
+        _require_verified_reference_upload_order(references, upload_observation)
+        _wait_for_prompt_box(args, cwd)
+        chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface, timeout_s=2)
+        _screenshot(args, cwd, trace_dir / "02_after_upload.png")
+        after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+        _paste_prompt(args, cwd, message)
+        _screenshot(args, cwd, trace_dir / "03_after_prompt.png")
+        baseline_rows = _image_inventory(args, cwd)
+        baseline = {row.get("src") for row in baseline_rows if row.get("src")}
+        baseline_message_counts = _conversation_message_counts(args, cwd)
+        return {
+            "chat_surface": chat_surface,
+            "account_guard": account_guard,
+            "image_mode": image_mode,
+            "aspect_ratio_delivery": aspect_ratio_delivery,
+            "upload_observation": upload_observation,
+            "after_upload": after_upload,
+            "baseline": baseline,
+            "baseline_message_counts": baseline_message_counts,
+        }
+
+    prepared, page_recoveries = _run_with_page_recovery(
+        args,
+        cwd,
+        prepare_surface,
+        phase="pre_submit_prepare",
+        target_url=prepare_target_url,
+        job=job,
+        label=label,
+    )
+    chat_surface = prepared["chat_surface"]
+    account_guard = prepared["account_guard"]
+    image_mode = prepared["image_mode"]
+    aspect_ratio_delivery = prepared["aspect_ratio_delivery"]
+    upload_observation = prepared["upload_observation"]
+    after_upload = prepared["after_upload"]
+    baseline = prepared["baseline"]
+    baseline_message_counts = prepared["baseline_message_counts"]
     upload_mentions = {Path(path).name: Path(path).name in after_upload for path in references}
 
-    _wait_for_prompt_box(args, cwd)
-    chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface, timeout_s=2)
-    _paste_prompt(args, cwd, message)
-    _screenshot(args, cwd, trace_dir / "03_after_prompt.png")
+    try:
+        _submit_prompt(
+            args,
+            cwd,
+            message,
+            trace_dir=trace_dir,
+        )
+    except HumanAttentionRequired:
+        raise
+    except (TimeoutError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        submission_report = {
+            "status": "submission_state_unknown",
+            "error_type": "chatgpt_submission_state_unknown",
+            "retryable": False,
+            "terminal": True,
+            "recommended_next_action": "inspect_or_collect_current_before_resubmitting",
+            "submission_committed": "unknown",
+            "label": label,
+            "reason": f"{type(error).__name__}: {error}",
+        }
+        _write_session_patch(job, submission_report)
+        raise SubmissionStateUnknownError(submission_report) from error
+    _write_session_patch(
+        job,
+        {
+            "status": "submission_committed",
+            "label": label,
+            "submission_committed": True,
+            "page_recoveries": page_recoveries,
+            "attempt": {
+                "action": "submission_committed",
+                "label": label,
+                "mode": submit_mode,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        },
+    )
+    try:
+        post_submit_target_url = _current_url(args, cwd)
+    except RuntimeError:
+        post_submit_target_url = prepare_target_url
+    if not post_submit_target_url.startswith("https://chatgpt.com/"):
+        post_submit_target_url = prepare_target_url
 
-    baseline_rows = _image_inventory(args, cwd)
-    baseline = {row.get("src") for row in baseline_rows if row.get("src")}
-    baseline_message_counts = _conversation_message_counts(args, cwd)
-    _submit_prompt(
+    def confirm_submitted_turn() -> dict[str, str]:
+        _wait_ms(args, cwd, 3000)
+        conversation_url = _wait_for_conversation_url(args, cwd)
+        if not _conversation_id_from_url(conversation_url):
+            raise RecoverablePageError(
+                "The prompt was submitted, but its ChatGPT conversation URL did not become available."
+            )
+        _screenshot(args, cwd, trace_dir / "04_after_submit.png")
+        after_submit = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+        return {"conversation_url": conversation_url, "after_submit": after_submit}
+
+    submitted_turn, post_submit_recoveries = _run_with_page_recovery(
         args,
         cwd,
-        message,
-        trace_dir=trace_dir,
+        confirm_submitted_turn,
+        phase="post_submit_confirm",
+        target_url=post_submit_target_url,
+        job=job,
+        label=label,
+        failure_confirmations=3,
     )
-    _wait_ms(args, cwd, 3000)
-    _screenshot(args, cwd, trace_dir / "04_after_submit.png")
-    conversation_url = _wait_for_conversation_url(args, cwd)
+    page_recoveries.extend(post_submit_recoveries)
+    conversation_url = submitted_turn["conversation_url"]
     if continued_from and _conversation_id_from_url(conversation_url) != continued_from["conversation_id"]:
         raise RuntimeError(
             "Conversation follow-up left the requested ChatGPT conversation: "
             f"expected={continued_from['conversation_url']} current={conversation_url}"
         )
-    after_submit = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+    after_submit = submitted_turn["after_submit"]
     upload_failure = _reference_upload_failure(after_submit, references)
     if upload_failure:
         return _upload_failure_report(
@@ -5587,12 +6259,13 @@ def _run_one_request(
             "status": "submitted",
             "label": label,
             "resumed": False,
+            "submission_committed": True,
             "conversation_id": _conversation_id_from_url(conversation_url),
             "conversation_url": conversation_url,
             "baseline_asset_urls": list(baseline),
             "baseline_user_message_count": baseline_message_counts["user_message_count"],
             "baseline_assistant_message_count": baseline_message_counts["assistant_message_count"],
-            "reference_image_mapping": _job_reference_mapping(job),
+            **reference_audit_fields(job),
             "chat_surface": chat_surface,
             "image_mode": image_mode,
             "aspect_ratio_delivery": aspect_ratio_delivery,
@@ -5605,6 +6278,7 @@ def _run_one_request(
             "account_lane": TARGET_CHATGPT_ACCOUNT_SIGNAL,
             "account_guard": account_guard,
             "submit_throttle": submit_throttle,
+            "page_recoveries": page_recoveries,
             **({"continued_from": continued_from} if continued_from else {}),
             "attempt": {
                 "action": "conversation_followup_submit" if continued_from else "submit",
@@ -5651,10 +6325,12 @@ def _run_one_request(
         "adapter": "agent_browser_cdp",
         "mode": submit_mode,
         "label": label,
+        "submission_committed": True,
         "prompt_card": job["prompt_card"],
         "agent_browser_session": _agent_browser_session_record(args),
         "conversation_url": conversation_url,
         "reference_count": len(references),
+        **reference_audit_fields(job),
         "trace_dir": str(trace_dir),
         "account_guard": account_guard,
         "chat_surface": chat_surface,
@@ -5668,6 +6344,7 @@ def _run_one_request(
             if key != "page_text"
         },
         "submit_throttle": submit_throttle,
+        "page_recoveries": page_recoveries,
         **({"continued_from": continued_from} if continued_from else {}),
         **collected,
     }
@@ -5952,6 +6629,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "resumed": True,
         "conversation_id": _conversation_id_from_url(conversation_url),
         "conversation_url": conversation_url,
+        **reference_audit_fields(job),
         "agent_browser_profile": _profile_label(args),
         "account_lane": TARGET_CHATGPT_ACCOUNT_SIGNAL,
         "account_guard": account_guard,
@@ -5994,6 +6672,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "prompt_card": job["prompt_card"],
         "agent_browser_session": _agent_browser_session_record(args),
         "conversation_url": conversation_url,
+        **reference_audit_fields(job),
         "trace_dir": str(trace_dir),
         "account_guard": account_guard,
         "raw_image_count": len(downloaded_all),
@@ -6139,8 +6818,19 @@ def main() -> int:
         default=DEFAULT_STALE_GENERATION_REFRESH_SECONDS,
         help=(
             "Seconds of no candidate growth while ChatGPT's Stop button stays active before "
-            "reopening the same conversation URL to recover a stale generation connection. "
-            "Set 0 to disable."
+            "reopening the same conversation URL. Disabled by default so a normally running "
+            "generation is never refreshed merely for taking a long time; set a positive value "
+            "only for explicit diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--page-recovery-attempts",
+        type=int,
+        default=DEFAULT_PAGE_RECOVERY_ATTEMPTS,
+        help=(
+            "Maximum automatic reload/reopen attempts after a confirmed page failure. "
+            "Pre-submit recovery replays image mode, ratio, and reference upload; post-submit "
+            "recovery only reopens the same conversation and never resubmits."
         ),
     )
     parser.add_argument(
@@ -6262,6 +6952,15 @@ def main() -> int:
             report = run_collect_current(args, job, cwd)
         else:
             report = run_dry_upload(args, job, cwd)
+    except PageRecoveryExhaustedError as error:
+        report = error.report
+        exit_code = 2
+    except SubmissionStateUnknownError as error:
+        report = error.report
+        exit_code = 2
+    except ReferenceUploadError as error:
+        report = error.failure
+        exit_code = 2
     except ChatSurfaceSelectionError as error:
         report = {
             "status": "generation_failed",
@@ -6285,9 +6984,23 @@ def main() -> int:
     except HumanAttentionRequired as error:
         report = {
             "status": "needs_ops",
+            "error_type": "human_attention_required",
             "reason": error.reason,
+            "retryable": True,
+            "terminal": False,
             "browser_activation": error.activation,
+            "verification_must_be_completed_by_human": True,
             "next": "Complete the login or verification in the active Chrome window, then rerun the job.",
+        }
+        exit_code = 2
+    except (TimeoutError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        report = {
+            "status": "generation_failed",
+            "error_type": "chatgpt_web_runner_failed",
+            "retryable": True,
+            "terminal": True,
+            "recommended_next_action": "inspect_session_and_rerun_if_not_submitted",
+            "reason": f"{type(error).__name__}: {error}",
         }
         exit_code = 2
     finally:

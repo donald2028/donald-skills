@@ -80,22 +80,50 @@ live under `~/Library/Application Support/Donald Skills/state/chatgpt-web/` on m
 `${XDG_STATE_HOME:-~/.local/state}/donald-skills/chatgpt-web/` on Linux.
 
 For a plain prompt, place the entire prompt in a `.txt` file. For Markdown, put executable prompt
-text in `## Prompt`. Optional reference images can be supplied with repeated `--reference` flags or
-declared in the card:
+text in `## Prompt`. Define the reference map before preparing any job that uses local images. Each
+reference needs four model-facing fields: what it represents, its whole-image or positional map,
+what visual evidence may be used, and what must be ignored. This applies to one image as well as to
+multiple images. Use `Whole image` or `Single subject` when positions do not distinguish content.
 
 ```markdown
 ## Required Reference Images
 
-1. `refs/identity.png`
-2. `refs/product.png`
-
-- Reference Image 1: controls identity only.
-- Reference Image 2: controls product shape and color only.
+1. `refs/style.png`
+   - Role: Page visual style anchor.
+   - Spatial map: Whole image; no subject identity mapping.
+   - Use: Illustration style, palette, and rendering only.
+   - Ignore: People, text, digits, and original layout.
+2. `refs/identity.png`
+   - Role: Identity sheet for Mia, Ryan, and Owen.
+   - Spatial map: Left is Mia, center is Ryan, right is Owen.
+   - Use: Facial identity, hair, and body proportions.
+   - Ignore: Clothing, background, captions, and composition.
 
 ## Prompt
 
 Create a studio portrait...
 ```
+
+The numbered path list is uploader metadata; local paths and filenames never identify images to the
+model. `prepare_job.py` converts the structured entries into two separate artifacts:
+
+- `ordered_upload_paths`, whose array order is the only source for numbering; and
+- `model_reference_map` plus `compiled_model_reference_map`, which contain only `Reference Image
+  1..N` semantics and are inserted into every submitted message.
+
+The compiler rejects missing or duplicate numbers, missing fields, path/filename-only roles,
+placeholders such as `Reference Image 1: Reference Image 1`, stale compiled maps, and spatial maps
+that do not identify the whole image, a single subject, or positions such as left/center/right and
+top/bottom. Do not collapse several inputs into only `Images 3-5 are character references`; each
+number still needs its own entry. Keep style responsibility separate from identity, clothing,
+accessory, or composition responsibility, and make `Ignore` override old captions, numbers,
+layouts, relationships, unrelated people, or conflicting clothing where relevant.
+
+For a plain prompt plus repeated `--reference` paths, also repeat `--reference-role`,
+`--reference-spatial-map`, `--reference-use`, and `--reference-ignore` once per image in exactly the
+same order. A path-only `--reference` is invalid. These numbered-map rules are a general
+model-facing principle for reference-image generation; this Skill implements and validates only
+the external ChatGPT browser path. Do not route the built-in `image_gen` path through this runner.
 
 Prepare the manifest once:
 
@@ -128,6 +156,11 @@ control is nested in that menu. A missing or unverifiable Chat surface or image 
 do not silently submit through Work or fall back to ordinary chat. Reference uploads likewise
 require visible composer-attachment evidence before submission.
 
+The runner uploads references one at a time in manifest-array order. After every upload it requires
+a monotonic attachment count, records the numbered local-path sequence, and refuses to submit if it
+cannot prove that UI attachment order matches the compiled `Reference Image 1..N` map. Batch file
+selection is not used because its attachment order is not treated as reliable.
+
 The runner treats `--aspect-ratio` as an end-to-end output contract. If the current ChatGPT UI
 exposes a visible exact ratio control, it clicks that control and records the result. When the UI
 has no such control, it records `delivery=prompt_text`, includes the ratio in the submitted image
@@ -142,6 +175,28 @@ During generation the runner records a structured page-health observation every 
 the compact latest-turn excerpt, and any recognized current-turn error text, visible error surface,
 or Retry control. Deep page-health inspection runs on that heartbeat, not on the shorter
 candidate-collection loop.
+Page recovery is state-aware and bounded (three attempts by default):
+
+- before submission, a confirmed page failure reopens ChatGPT and replays the complete preparation
+  transaction: select `Chat`, select `Create image`, apply the ratio control when available, upload
+  and verify every reference, and restore the prompt;
+- after the submit control has been invoked, the session records `submission_committed=true` and
+  recovery may only reopen the same conversation and continue observing or collecting it. It must
+  never replay the prompt or submit a replacement request;
+- a normally slow generation is not a recovery signal. Time-based generation refresh is disabled
+  by default; post-submit recovery begins only after three consecutive page/DOM heartbeat failures
+  or an explicit browser error page;
+- after candidates exist, download recovery operates on the existing conversation and never starts
+  generation again;
+- login, CAPTCHA, Turnstile, Cloudflare, or other human-verification evidence bypasses automatic
+  recovery, activates and preserves the visible browser, and returns `needs_ops` for a human click.
+
+After the bounded attempts fail, return `chatgpt_page_recovery_exhausted` to the caller instead of
+waiting indefinitely. If the submit action itself errors and the runner cannot prove whether the
+click committed, return `chatgpt_submission_state_unknown` and require inspection or
+`collect-current` before any resubmission, avoiding duplicate jobs. `--page-recovery-attempts`
+changes the bounded recovery count; `--stale-generation-refresh-interval` is diagnostic opt-in and
+defaults to disabled.
 An explicit ChatGPT generation error ends the wait at the next heartbeat with structured
 `generation_failed` and `recommended_next_action=submit_new_request`; it must not wait until the
 image timeout or surface a raw traceback.

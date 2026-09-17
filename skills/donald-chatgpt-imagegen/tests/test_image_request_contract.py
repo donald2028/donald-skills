@@ -105,13 +105,323 @@ class ImageRequestContractTests(unittest.TestCase):
                 cli_references=[str(reference)],
                 variant_notes=[],
                 reuse_conversation_references=False,
+                cli_reference_roles=["Identity portrait for the only subject"],
+                cli_reference_spatial_maps=["Whole image; single subject"],
+                cli_reference_uses=["Facial identity and hair only"],
+                cli_reference_ignores=["Background, clothing, text, and composition"],
             )
 
         self.assertEqual(job["image_generation_mode"], "create_image")
         self.assertEqual(job["output_aspect_ratio"], "16:9")
         self.assertEqual(job["reference_images"][0]["path"], str(reference.resolve()))
+        self.assertEqual(job["ordered_upload_paths"], [str(reference.resolve())])
+        self.assertEqual(job["model_reference_map"][0]["index"], 1)
         self.assertIn("aspect ratio 16:9", job["chatgpt_batch_message"])
         self.assertIn("Reference Image 1", job["chatgpt_batch_message"])
+        self.assertNotIn("reference.png", job["chatgpt_batch_message"])
+
+    def test_prepare_job_compiles_five_distinct_references_without_filename_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = ["style.png", "identities.png", "meeting.png", "farewell.png", "digits.png"]
+            for name in names:
+                (root / name).write_bytes(b"reference")
+            prompt = root / "prompt.md"
+            prompt.write_text(
+                """## Required Reference Images
+
+1. `style.png`
+   - Role: Page visual style anchor.
+   - Spatial map: Whole image; no subject identity mapping.
+   - Use: Illustration style, palette, and rendering only.
+   - Ignore: People, text, digits, and original layout.
+2. `identities.png`
+   - Role: Identity sheet for Mia, Ryan, and Owen.
+   - Spatial map: Left is Mia, center is Ryan, right is Owen.
+   - Use: Facial identity, hair, and body proportions.
+   - Ignore: Clothing, background, captions, and composition.
+3. `meeting.png`
+   - Role: A1 meeting appearance reference.
+   - Spatial map: Left is Mia, center is Ryan, right is Owen.
+   - Use: Ordinary clothing for the meeting scene only.
+   - Ignore: Text, numbers, props, and original layout.
+4. `farewell.png`
+   - Role: Farewell accessory reference.
+   - Spatial map: Top panel is Ryan's backpack and telescope; bottom panel is Mia's backpack.
+   - Use: Those named accessories in the farewell scene only.
+   - Ignore: People, clothing, captions, and panel layout.
+5. `digits.png`
+   - Role: B1 and B2 character appearance reference.
+   - Spatial map: Left is Mia, center is Owen, right is Ryan.
+   - Use: Character appearance for B1 and B2 only.
+   - Ignore: Card digits, subtitles, clothing conflicts, and speaking relationships.
+
+## Prompt
+
+Create the requested illustrated page.
+""",
+                encoding="utf-8",
+            )
+
+            job = prepare_job.build_job(
+                prompt_path=prompt,
+                output_dir=root / "output",
+                variant_count=1,
+                request_mode="single_batch",
+                aspect_ratio="16:9",
+                reference_base_dir=root,
+                cli_references=[],
+                variant_notes=[],
+                reuse_conversation_references=False,
+            )
+
+        self.assertEqual([entry["index"] for entry in job["model_reference_map"]], [1, 2, 3, 4, 5])
+        self.assertEqual(job["ordered_upload_paths"], [str((root / name).resolve()) for name in names])
+        for index in range(1, 6):
+            self.assertIn(f"Reference Image {index}\n", job["compiled_model_reference_map"])
+        for name in names:
+            self.assertNotIn(name, job["chatgpt_batch_message"])
+        runner._validate_manifest_reference_mapping(job)
+        leaked_job = {
+            **job,
+            "chatgpt_batch_message": job["chatgpt_batch_message"] + "Use style.png.\n",
+        }
+        with self.assertRaisesRegex(ValueError, "local reference path or filename"):
+            runner._validate_manifest_reference_mapping(leaked_job)
+
+    def test_prepare_job_rejects_missing_or_duplicate_reference_map_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "one.png").write_bytes(b"one")
+            (root / "two.png").write_bytes(b"two")
+            prompt = root / "prompt.md"
+            build = lambda: prepare_job.build_job(
+                prompt_path=prompt,
+                output_dir=root / "output",
+                variant_count=1,
+                request_mode="single_batch",
+                aspect_ratio="1:1",
+                reference_base_dir=root,
+                cli_references=[],
+                variant_notes=[],
+                reuse_conversation_references=False,
+            )
+            prompt.write_text(
+                """## Required Reference Images
+1. `one.png`
+   - Role: Primary identity portrait.
+   - Spatial map: Whole image; single subject.
+   - Use: Face and hair only.
+   - Ignore: Clothing and background.
+2. `two.png`
+## Prompt
+Create an image.
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Reference Image 2 is missing"):
+                build()
+
+            prompt.write_text(
+                """## Required Reference Images
+1. `one.png`
+1. `two.png`
+## Prompt
+Create an image.
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate index 1"):
+                build()
+
+    def test_prepare_job_rejects_filename_and_reference_image_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "identity.png").write_bytes(b"identity")
+            prompt = root / "prompt.md"
+
+            def build(role: str) -> None:
+                prompt.write_text(
+                    f"""## Required Reference Images
+1. `identity.png`
+   - Role: {role}
+   - Spatial map: Whole image; single subject.
+   - Use: Face and hair only.
+   - Ignore: Clothing and background.
+## Prompt
+Create an image.
+""",
+                    encoding="utf-8",
+                )
+                prepare_job.build_job(
+                    prompt_path=prompt,
+                    output_dir=root / "output",
+                    variant_count=1,
+                    request_mode="single_batch",
+                    aspect_ratio="1:1",
+                    reference_base_dir=root,
+                    cli_references=[],
+                    variant_notes=[],
+                    reuse_conversation_references=False,
+                )
+
+            with self.assertRaisesRegex(ValueError, "path or filename"):
+                build("identity.png")
+            with self.assertRaisesRegex(ValueError, "generic placeholder"):
+                build("Reference Image 1")
+
+    def test_prepare_job_without_references_does_not_emit_reference_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prompt = root / "prompt.txt"
+            prompt.write_text("Create an image.", encoding="utf-8")
+            job = prepare_job.build_job(
+                prompt_path=prompt,
+                output_dir=root / "output",
+                variant_count=1,
+                request_mode="single_batch",
+                aspect_ratio="1:1",
+                reference_base_dir=root,
+                cli_references=[],
+                variant_notes=[],
+                reuse_conversation_references=False,
+            )
+
+        self.assertEqual(job["model_reference_map"], [])
+        self.assertEqual(job["compiled_model_reference_map"], "")
+        self.assertNotIn("REFERENCE IMAGE MAP", job["chatgpt_batch_message"])
+
+    def test_runner_uploads_reference_files_sequentially_and_records_order(self) -> None:
+        references = ["C:/refs/one.png", "C:/refs/two.png", "C:/refs/three.png"]
+        observations = [
+            {
+                "attachment_count": index,
+                "blob_image_count": index,
+                "ready": True,
+                "attachment_labels": [
+                    f"Remove file {position}: {Path(path).name}"
+                    for position, path in enumerate(references[:index], start=1)
+                ],
+            }
+            for index in range(1, 4)
+        ]
+        with (
+            mock.patch.object(runner, "_upload_files") as upload,
+            mock.patch.object(
+                runner,
+                "_wait_for_reference_uploads_ready",
+                side_effect=observations,
+            ),
+        ):
+            result = runner._upload_references_in_order(
+                argparse.Namespace(),
+                Path.cwd(),
+                references,
+            )
+
+        self.assertEqual(
+            [call.args[2] for call in upload.call_args_list],
+            [[references[0]], [references[1]], [references[2]]],
+        )
+        self.assertTrue(result["order_verified"])
+        self.assertTrue(result["attachment_label_order_verified"])
+        self.assertEqual(
+            result["order_verification_method"],
+            "visible_attachment_labels_and_sequential_file_input",
+        )
+        self.assertEqual(
+            [(entry["index"], entry["path"]) for entry in result["upload_sequence"]],
+            list(enumerate(references, start=1)),
+        )
+
+    def test_runner_rejects_visible_attachment_order_mismatch(self) -> None:
+        references = ["C:/refs/one.png", "C:/refs/two.png"]
+        observations = [
+            {
+                "attachment_count": 1,
+                "blob_image_count": 1,
+                "ready": True,
+                "attachment_labels": ["Remove file 1: one.png"],
+            },
+            {
+                "attachment_count": 2,
+                "blob_image_count": 2,
+                "ready": True,
+                "attachment_labels": [
+                    "Remove file 1: two.png",
+                    "Remove file 2: one.png",
+                ],
+            },
+        ]
+        with (
+            mock.patch.object(runner, "_upload_files"),
+            mock.patch.object(
+                runner,
+                "_wait_for_reference_uploads_ready",
+                side_effect=observations,
+            ),
+            self.assertRaises(runner.ReferenceUploadError) as raised,
+        ):
+            runner._upload_references_in_order(
+                argparse.Namespace(),
+                Path.cwd(),
+                references,
+            )
+
+        self.assertEqual(raised.exception.failure["error_type"], "reference_upload_order_mismatch")
+
+    def test_run_summary_keeps_upload_and_model_reference_audits_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ordered_paths = ["C:/refs/style.png", "C:/refs/identity.png"]
+            model_map = [
+                {
+                    "index": 1,
+                    "model_role": "Visual style anchor",
+                    "spatial_map": "Whole image",
+                    "use": "Rendering style only",
+                    "ignore": "People and text",
+                },
+                {
+                    "index": 2,
+                    "model_role": "Identity sheet",
+                    "spatial_map": "Left is Mia and right is Ryan",
+                    "use": "Facial identity only",
+                    "ignore": "Clothing and background",
+                },
+            ]
+            compiled = prepare_job.compile_model_reference_map(model_map)
+            job = {
+                "job_name": "audit",
+                "prompt_card": "C:/prompts/audit.md",
+                "download_dir": temporary,
+                "reference_images": [
+                    {"index": index, "path": path}
+                    for index, path in enumerate(ordered_paths, start=1)
+                ],
+                "ordered_upload_paths": ordered_paths,
+                "model_reference_map": model_map,
+                "compiled_model_reference_map": compiled,
+            }
+
+            summary = runner._write_summary(
+                job,
+                request_mode="single_batch",
+                variant_count=1,
+                start_variant=1,
+                end_variant="batch",
+                variants=[],
+            )
+
+        self.assertEqual(summary["ordered_upload_paths"], ordered_paths)
+        self.assertEqual(summary["model_reference_map"], model_map)
+        self.assertEqual(summary["compiled_model_reference_map"], compiled)
+        self.assertEqual(
+            summary["reference_upload_order"],
+            [
+                {"index": 1, "path": ordered_paths[0]},
+                {"index": 2, "path": ordered_paths[1]},
+            ],
+        )
 
     def test_prepare_job_rejects_invalid_aspect_ratio(self) -> None:
         with self.assertRaisesRegex(ValueError, "WIDTH:HEIGHT"):
