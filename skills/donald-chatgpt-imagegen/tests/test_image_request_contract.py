@@ -431,17 +431,33 @@ Create an image.
         states = [
             {"selected": False, "editorText": "", "hasPromptCategories": False},
             {"found": False},
-            {"found": True, "x": 10, "y": 10},
-            {"found": True, "label": "Create image Visualize anything", "x": 20, "y": 20},
-            {"selected": True, "editorText": "Create image", "hasPromptCategories": True},
+            {
+                "found": True,
+                "x": 10,
+                "y": 10,
+                "evidenceSource": "composer_left_edge_button",
+            },
+            {
+                "found": True,
+                "label": "Create image Visualize anything",
+                "role": "menuitem",
+                "x": 20,
+                "y": 20,
+            },
+            {
+                "selected": True,
+                "editorText": "",
+                "placeholderText": "Create image",
+                "hasPromptCategories": False,
+            },
         ]
         with (
             mock.patch.object(runner, "_eval_json", side_effect=states),
             mock.patch.object(
                 runner,
                 "_dispatch_owned_tab_click",
-                side_effect=[False, True, True],
-            ),
+                side_effect=[True, True],
+            ) as click,
             mock.patch.object(runner, "_wait_ms"),
         ):
             result = runner._enable_image_mode_if_available(
@@ -454,6 +470,115 @@ Create an image.
         self.assertTrue(result["opened_add_menu"])
         self.assertTrue(result["clicked_create_image"])
         self.assertTrue(result["verified"])
+        self.assertEqual(click.call_count, 2)
+        self.assertEqual(
+            result["menu_control"]["evidenceSource"],
+            "composer_left_edge_button",
+        )
+        self.assertEqual(result["verification"]["placeholderText"], "Create image")
+
+    def test_create_image_ui_contract_supports_current_plus_menu_and_placeholder(self) -> None:
+        self.assertIn("data-placeholder", runner.IMAGE_MODE_STATE_JS)
+        self.assertIn("aria-placeholder", runner.IMAGE_MODE_STATE_JS)
+        self.assertIn("selectedControlLabel", runner.IMAGE_MODE_STATE_JS)
+        self.assertIn("[role='menuitem']", runner.CREATE_IMAGE_CONTROL_JS)
+        self.assertIn("[role='group']", runner.CREATE_IMAGE_CONTROL_JS)
+        self.assertIn(".popover", runner.CREATE_IMAGE_CONTROL_JS)
+        self.assertIn("Generate", runner.CREATE_IMAGE_CONTROL_JS)
+        self.assertIn("composer.*plus", runner.IMAGE_MODE_ADD_MENU_CONTROL_JS)
+        self.assertIn("composer_left_edge_button", runner.IMAGE_MODE_ADD_MENU_CONTROL_JS)
+        self.assertIn("atLeadingEdge", runner.IMAGE_MODE_ADD_MENU_CONTROL_JS)
+
+    def test_missing_create_image_control_requests_pre_submit_page_recovery(self) -> None:
+        with (
+            mock.patch.object(
+                runner,
+                "_image_mode_state",
+                return_value={"selected": False},
+            ),
+            mock.patch.object(
+                runner,
+                "_find_create_image_control",
+                return_value={"found": False},
+            ),
+            mock.patch.object(
+                runner,
+                "_find_image_mode_add_menu_control",
+                return_value={"found": True, "expanded": False, "x": 10, "y": 10},
+            ),
+            mock.patch.object(
+                runner,
+                "_poll_for_create_image_control",
+                return_value={"found": False},
+            ),
+            mock.patch.object(
+                runner,
+                "_poll_for_image_mode_selection",
+                return_value={"selected": False},
+            ),
+            mock.patch.object(runner, "_dispatch_owned_tab_click", return_value=True),
+            mock.patch.object(runner, "_wait_ms"),
+            self.assertRaises(runner.RecoverablePageError),
+        ):
+            runner._enable_image_mode_if_available(
+                argparse.Namespace(),
+                Path.cwd(),
+                "",
+            )
+
+    def test_page_health_recognizes_subscription_and_network_errors(self) -> None:
+        self.assertIn("failed to load subscription", runner.PAGE_ACCESS_STATE_JS)
+        self.assertIn("chatgpt_transient_page_error", runner.PAGE_ACCESS_STATE_JS)
+        self.assertIn("[data-message-author-role]", runner.PAGE_ACCESS_STATE_JS)
+
+    def test_image_mode_failure_stays_before_upload_prompt_and_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {
+                "job_name": "image-mode-gate",
+                "download_dir": temporary,
+                "prompt_card": str(Path(temporary) / "prompt.md"),
+                "variant_count": 1,
+                "output_aspect_ratio": "1:1",
+                "reference_images": [{"path": str(Path(temporary) / "reference.png")}],
+            }
+            args = argparse.Namespace(
+                page_recovery_attempts=3,
+                max_failure_retries=0,
+            )
+            with (
+                mock.patch.object(runner, "_wait_for_submit_throttle_slot", return_value={}),
+                mock.patch.object(runner, "_open_new_chat"),
+                mock.patch.object(runner, "_wait_for_prompt_box"),
+                mock.patch.object(
+                    runner,
+                    "_ensure_chat_surface",
+                    return_value={"selected_surface": "chat", "verified": True},
+                ),
+                mock.patch.object(runner, "_validate_account_lane", return_value={"ok": True}),
+                mock.patch.object(runner, "_screenshot"),
+                mock.patch.object(runner, "_owned_tab_cdp_url", return_value="ws://owned"),
+                mock.patch.object(
+                    runner,
+                    "_enable_image_mode_if_available",
+                    side_effect=runner.ImageModeSelectionError("not verified"),
+                ),
+                mock.patch.object(runner, "_upload_references_in_order") as upload,
+                mock.patch.object(runner, "_paste_prompt") as paste,
+                mock.patch.object(runner, "_submit_prompt") as submit,
+                self.assertRaises(runner.ImageModeSelectionError),
+            ):
+                runner._run_one_request(
+                    args,
+                    job,
+                    Path.cwd(),
+                    label="batch",
+                    message="Generate an image",
+                    resume=False,
+                )
+
+        upload.assert_not_called()
+        paste.assert_not_called()
+        submit.assert_not_called()
 
     def test_reference_upload_uses_visible_composer_attachment_as_evidence(self) -> None:
         reference = "C:/images/reference.png"

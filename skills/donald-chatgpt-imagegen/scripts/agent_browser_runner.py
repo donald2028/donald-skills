@@ -2975,44 +2975,7 @@ def _ensure_chat_surface(
     }
 
 
-def _enable_image_mode_if_available(
-    args: argparse.Namespace,
-    cwd: Path,
-    snapshot: str,
-) -> dict[str, Any]:
-    del snapshot
-
-    def state() -> dict[str, Any]:
-        return _eval_json(
-            args,
-            cwd,
-            r"""
-JSON.stringify((() => {
-  const visible = (el) => {
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  };
-  const editors = Array.from(document.querySelectorAll("[contenteditable='true']")).filter(visible);
-  const editorText = editors.map((el) => el.innerText || el.textContent || "").join(" ");
-  const hasPromptCategories = Array.from(document.querySelectorAll("[role='tablist']"))
-    .filter(visible)
-    .some((el) => /Image prompt categories/i.test(el.getAttribute("aria-label") || ""));
-  return {
-    selected: /\bCreate (?:an )?image\b/i.test(editorText) || hasPromptCategories,
-    editorText: editorText.trim(),
-    hasPromptCategories,
-  };
-})())
-""".strip(),
-            timeout=60,
-        )
-
-    def find_create_image() -> dict[str, Any]:
-        return _eval_json(
-            args,
-            cwd,
-            r"""
+IMAGE_MODE_STATE_JS = r"""
 JSON.stringify((() => {
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
@@ -3020,29 +2983,219 @@ JSON.stringify((() => {
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
   const textFor = (el) => [
-    el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent
+    el.getAttribute("aria-label"), el.getAttribute("title"),
+    el.getAttribute("data-placeholder"), el.getAttribute("aria-placeholder"),
+    el.getAttribute("placeholder"), el.innerText, el.textContent
   ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
-  const menuOpen = Array.from(document.querySelectorAll("button,[role='button']"))
+  const imageModeText = /\b(?:Create|Generate) (?:an )?image\b|创建图片|生成图片/i;
+  const exactImageModeText = /^(?:Create|Generate) (?:an )?image$|^创建图片$|^生成图片$/i;
+  const editors = Array.from(document.querySelectorAll("[contenteditable='true']")).filter(visible);
+  const editorText = editors.map(textFor).join(" ").trim();
+  const placeholderText = editors.flatMap((editor) => [
+    editor,
+    ...Array.from(editor.querySelectorAll("[data-placeholder],[aria-placeholder],[placeholder]"))
+  ]).map(textFor).filter(Boolean).join(" ").trim();
+  const composer = editors[0]?.closest("form") || null;
+  const selectedControl = composer
+    ? Array.from(composer.querySelectorAll(
+        "button,[role='button'],[aria-pressed],[aria-selected],[data-state]"
+      )).filter(visible).find((el) => {
+        if (!imageModeText.test(textFor(el))) return false;
+        return el.getAttribute("aria-pressed") === "true"
+          || el.getAttribute("aria-selected") === "true"
+          || /^(?:on|checked|active|selected)$/i.test(el.getAttribute("data-state") || "");
+      })
+    : null;
+  const hasPromptCategories = Array.from(document.querySelectorAll("[role='tablist']"))
     .filter(visible)
-    .some((el) => /Add files and more/i.test(textFor(el)) && el.getAttribute("aria-expanded") === "true");
-  const selector = menuOpen
-    ? "button,[role='button'],a,[role='menuitem'],[role='option'],[tabindex]"
-    : "button,[role='button'],a,[role='menuitem'],[role='option']";
-  const controls = Array.from(document.querySelectorAll(selector)).filter(visible);
-  const control = controls.find((el) => {
-    const label = textFor(el);
-    return label.length <= 160 && /^Create (?:an )?image(?:\b|\s)/i.test(label);
-  });
-  if (!control) return {found: false};
-  const label = textFor(control);
-  const rect = control.getBoundingClientRect();
-  return {found: true, label, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+    .some((el) => /Image prompt categories/i.test(el.getAttribute("aria-label") || ""));
+  return {
+    selected: editors.some((editor) => exactImageModeText.test(textFor(editor)))
+      || imageModeText.test(placeholderText)
+      || Boolean(selectedControl)
+      || hasPromptCategories,
+    editorText,
+    placeholderText,
+    selectedControlLabel: selectedControl ? textFor(selectedControl) : "",
+    hasPromptCategories,
+  };
 })())
-""".strip(),
-            timeout=60,
-        )
+""".strip()
 
-    initial = state()
+CREATE_IMAGE_CONTROL_JS = r"""
+JSON.stringify((() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const textFor = (el) => [
+    el.getAttribute("aria-label"), el.getAttribute("title"),
+    el.getAttribute("data-testid"), el.innerText, el.textContent
+  ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const imageAction = /\b(?:Create|Generate) (?:an )?image\b|创建图片|生成图片/i;
+  const editor = Array.from(document.querySelectorAll("[contenteditable='true']")).find(visible);
+  const composer = editor?.closest("form") || null;
+  const raw = Array.from(document.querySelectorAll(
+    "[role='menuitem'],[role='option'],button,[role='button'],a,[data-testid],[tabindex]"
+  )).filter(visible).filter((el) => !el.matches("[contenteditable='true']"));
+  const seen = new Set();
+  const controls = raw.map((el) => {
+    const interactive = el.matches("button,a,[role='button'],[role='menuitem'],[role='option']")
+      ? el
+      : el.closest("button,a,[role='button'],[role='menuitem'],[role='option']") || el;
+    return interactive;
+  }).filter((el) => {
+    if (seen.has(el)) return false;
+    seen.add(el);
+    const label = textFor(el);
+    const role = el.getAttribute("role") || "";
+    const testId = el.getAttribute("data-testid") || "";
+    const inMenu = Boolean(el.closest(
+      "[role='menu'],[role='group'],[data-radix-menu-content]," +
+      "[data-radix-popper-content-wrapper],.popover"
+    ));
+    const inComposer = Boolean(composer && composer.contains(el));
+    const explicitTestId = /create.*image|image.*create|generate.*image/i.test(testId);
+    return label.length <= 240
+      && imageAction.test(label)
+      && (/menuitem|option/i.test(role) || inMenu || inComposer || explicitTestId);
+  });
+  const scored = controls.map((el) => {
+    const label = textFor(el);
+    const role = el.getAttribute("role") || "";
+    const testId = el.getAttribute("data-testid") || "";
+    let score = 0;
+    if (/menuitem|option/i.test(role)) score += 80;
+    if (el.closest(
+      "[role='menu'],[role='group'],[data-radix-menu-content]," +
+      "[data-radix-popper-content-wrapper],.popover"
+    )) score += 60;
+    if (/create.*image|image.*create|generate.*image/i.test(testId)) score += 40;
+    if (/^(?:Create|Generate) (?:an )?image\b/i.test(label)) score += 30;
+    score -= Math.min(label.length, 240) / 1000;
+    return {el, label, role, testId, score};
+  }).sort((a, b) => b.score - a.score);
+  const choice = scored[0];
+  const control = choice?.el;
+  if (!control) return {found: false};
+  const rect = control.getBoundingClientRect();
+  return {
+    found: true,
+    label: choice.label,
+    role: choice.role,
+    testId: choice.testId,
+    evidenceSource: choice.role || choice.testId || "visible_text",
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+  };
+})())
+""".strip()
+
+IMAGE_MODE_ADD_MENU_CONTROL_JS = r"""
+JSON.stringify((() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const textFor = (el) => [
+    el.getAttribute("aria-label"), el.getAttribute("title"),
+    el.getAttribute("data-testid"), el.innerText, el.textContent
+  ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const editor = Array.from(document.querySelectorAll("[contenteditable='true']")).find(visible);
+  const composer = editor?.closest("form") || null;
+  if (!editor || !composer) return {found: false, reason: "composer_not_found"};
+  const controls = Array.from(composer.querySelectorAll("button,[role='button']")).filter(visible);
+  const semantic = controls.find((el) => {
+    const label = textFor(el);
+    const testId = el.getAttribute("data-testid") || "";
+    return /Add files and more|Add (?:photos? (?:and|&) )?files|Attach files|Upload files|Open (?:the )?(?:attachment|tools?) menu|添加文件|上传文件|附件/i.test(label)
+      || /attach|upload|file|composer.*plus|plus.*composer|composer.*tool/i.test(testId);
+  });
+  const editorRect = editor.getBoundingClientRect();
+  const fallback = controls.map((el) => ({el, rect: el.getBoundingClientRect(), label: textFor(el)}))
+    .filter(({rect, label}) => {
+      const centerY = rect.top + rect.height / 2;
+      const sameRow = centerY >= editorRect.top - 24 && centerY <= editorRect.bottom + 24;
+      const compact = rect.width > 0 && rect.height > 0 && rect.width <= 72 && rect.height <= 72;
+      const atLeadingEdge = rect.left <= editorRect.left + 32
+        && rect.right >= editorRect.left - 96;
+      const excluded = /send|submit|voice|microphone|dictat|model|reasoning/i.test(label);
+      return sameRow && compact && atLeadingEdge && !excluded;
+    })
+    .sort((a, b) => a.rect.left - b.rect.left)[0]?.el || null;
+  const control = semantic || fallback;
+  if (!control) return {found: false, reason: "add_menu_control_not_found"};
+  const rect = control.getBoundingClientRect();
+  return {
+    found: true,
+    label: textFor(control),
+    testId: control.getAttribute("data-testid") || "",
+    expanded: control.getAttribute("aria-expanded") === "true",
+    evidenceSource: semantic ? "semantic_label_or_testid" : "composer_left_edge_button",
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+  };
+})())
+""".strip()
+
+
+def _image_mode_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    return _eval_json(args, cwd, IMAGE_MODE_STATE_JS, timeout=60)
+
+
+def _find_create_image_control(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    return _eval_json(args, cwd, CREATE_IMAGE_CONTROL_JS, timeout=60)
+
+
+def _find_image_mode_add_menu_control(
+    args: argparse.Namespace,
+    cwd: Path,
+) -> dict[str, Any]:
+    return _eval_json(args, cwd, IMAGE_MODE_ADD_MENU_CONTROL_JS, timeout=60)
+
+
+def _poll_for_create_image_control(
+    args: argparse.Namespace,
+    cwd: Path,
+    *,
+    attempts: int = 12,
+) -> dict[str, Any]:
+    last = {"found": False}
+    for attempt in range(max(1, attempts)):
+        last = _find_create_image_control(args, cwd)
+        if last.get("found"):
+            return last
+        if attempt + 1 < attempts:
+            _wait_ms(args, cwd, 250)
+    return last
+
+
+def _poll_for_image_mode_selection(
+    args: argparse.Namespace,
+    cwd: Path,
+    *,
+    attempts: int = 20,
+) -> dict[str, Any]:
+    last: dict[str, Any] = {"selected": False}
+    for attempt in range(max(1, attempts)):
+        last = _image_mode_state(args, cwd)
+        if last.get("selected"):
+            return last
+        if attempt + 1 < attempts:
+            _wait_ms(args, cwd, 250)
+    return last
+
+
+def _enable_image_mode_if_available(
+    args: argparse.Namespace,
+    cwd: Path,
+    snapshot: str,
+) -> dict[str, Any]:
+    del snapshot
+
+    initial = _image_mode_state(args, cwd)
     if initial.get("selected"):
         return {
             "requested": True,
@@ -3053,46 +3206,46 @@ JSON.stringify((() => {
             "verification": initial,
         }
 
-    direct = find_create_image()
+    direct = _find_create_image_control(args, cwd)
     opened_add_menu = False
-    clicked = _dispatch_owned_tab_click(args, cwd, direct)
+    clicked = bool(direct.get("found")) and _dispatch_owned_tab_click(args, cwd, direct)
     selected_label = str(direct.get("label") or "")
+    menu: dict[str, Any] = {"found": False}
+    menu_choice: dict[str, Any] = {"found": False}
     if not clicked:
-        menu = _eval_json(
-            args,
-            cwd,
-            r"""
-JSON.stringify((() => {
-  const visible = (el) => {
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  };
-  const controls = Array.from(document.querySelectorAll("button,[role='button']")).filter(visible);
-  const control = controls.find((el) => /Add files and more/i.test([
-    el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent
-  ].filter(Boolean).join(" ")));
-  if (!control) return {found: false};
-  const rect = control.getBoundingClientRect();
-  return {found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
-})())
-""".strip(),
-            timeout=60,
+        menu = _find_image_mode_add_menu_control(args, cwd)
+        opened_add_menu = bool(menu.get("expanded")) or (
+            bool(menu.get("found")) and _dispatch_owned_tab_click(args, cwd, menu)
         )
-        opened_add_menu = _dispatch_owned_tab_click(args, cwd, menu)
         if opened_add_menu:
-            _wait_ms(args, cwd, 500)
-            menu_choice = find_create_image()
-            clicked = _dispatch_owned_tab_click(args, cwd, menu_choice)
+            menu_choice = _poll_for_create_image_control(args, cwd)
+            clicked = bool(menu_choice.get("found")) and _dispatch_owned_tab_click(
+                args,
+                cwd,
+                menu_choice,
+            )
             selected_label = str(menu_choice.get("label") or "")
 
     if clicked:
-        _wait_ms(args, cwd, 1000)
-    verification = state()
+        _wait_ms(args, cwd, 250)
+    verification = _poll_for_image_mode_selection(args, cwd)
+    if not verification.get("selected") and not clicked:
+        raise RecoverablePageError(
+            "ChatGPT Create image control was unavailable before submission; "
+            "the page may be in a transient error state. "
+            f"opened_add_menu={opened_add_menu} "
+            f"direct={json.dumps(direct, ensure_ascii=False)} "
+            f"menu={json.dumps(menu, ensure_ascii=False)} "
+            f"menu_choice={json.dumps(menu_choice, ensure_ascii=False)} "
+            f"last_state={json.dumps(verification, ensure_ascii=False)}"
+        )
     if not verification.get("selected"):
         raise ImageModeSelectionError(
             "ChatGPT Create image mode could not be selected and verified. "
             f"opened_add_menu={opened_add_menu} clicked_create_image={clicked} "
+            f"direct={json.dumps(direct, ensure_ascii=False)} "
+            f"menu={json.dumps(menu, ensure_ascii=False)} "
+            f"menu_choice={json.dumps(menu_choice, ensure_ascii=False)} "
             f"last_state={json.dumps(verification, ensure_ascii=False)}"
         )
     return {
@@ -3102,6 +3255,8 @@ JSON.stringify((() => {
         "opened_add_menu": opened_add_menu,
         "clicked_create_image": clicked,
         "selected_label": selected_label,
+        "menu_control": menu,
+        "menu_choice": menu_choice,
         "verification": verification,
     }
 
@@ -3236,6 +3391,17 @@ JSON.stringify((() => {
   let humanReason = "";
   if (challengeFrame || challengeText) humanReason = "anti_automation_verification";
   else if (loginPath || loginControl) humanReason = "login_required";
+  const transientPageErrorPattern = /failed to load subscription|something went wrong|network error|failed to load|unable to load|try again later/i;
+  const transientPageErrorTexts = Array.from(document.querySelectorAll("body *"))
+    .filter(visible)
+    .filter((el) => !el.closest(
+      "[inert],#history,[aria-label='Chat history'],[data-sidebar-item]," +
+      "[data-message-author-role],#prompt-textarea"
+    ))
+    .map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim())
+    .filter((value) => value.length >= 8 && value.length <= 800 && transientPageErrorPattern.test(value))
+    .sort((a, b) => a.length - b.length);
+  const transientPageErrorText = transientPageErrorTexts[0] || "";
   const crashMarkers = [
     "aw, snap!", "this page isn't working", "this page isn’t working",
     "this site can't be reached", "this site can’t be reached", "page crashed",
@@ -3246,11 +3412,13 @@ JSON.stringify((() => {
   let crashReason = "";
   if (location.href.startsWith("chrome-error://")) crashReason = "chrome_error_page";
   else if (matchedCrashMarker) crashReason = matchedCrashMarker;
+  else if (transientPageErrorText) crashReason = "chatgpt_transient_page_error";
   else if (document.readyState === "complete" && location.href === "about:blank") crashReason = "unexpected_blank_page";
   return {
     hasPrompt,
     humanReason,
     crashReason,
+    transientPageErrorText,
     href: location.href,
     title: document.title,
     readyState: document.readyState,

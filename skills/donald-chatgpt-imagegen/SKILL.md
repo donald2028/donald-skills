@@ -148,13 +148,50 @@ python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest returned by 
   --timeout 1200
 ```
 
+Treat the command's final JSON as the result contract even when the process exits nonzero. Do not
+abandon the image request from the exit code or a single transient browser error alone. The runner
+owns the first recovery tier: it retries confirmed page failures three times by default, visible
+ChatGPT generation failures twice by default (`--max-failure-retries`), and authenticated image
+downloads four times. Keep those bounded defaults enabled for normal runs.
+
+If the runner still returns a failure, perform at most one caller-level recovery cycle before
+reporting it:
+
+- for `retryable=true` with `recommended_next_action=rerun_same_job` and
+  `submission_committed=false`, rerun the same command once;
+- for `collect_current_first` or `collect_current_or_inspect_conversation`, run `collect-current`
+  against the saved session before considering any new submission;
+- for an unknown submit state, inspect the saved session and conversation first; use
+  `collect-current` when a conversation URL exists, and never infer that a missing URL proves the
+  prompt was not submitted;
+- for `timeout_no_images`, preserve the current conversation and try `collect-current` once rather
+  than opening a new request immediately;
+- for `submit_new_request` after an explicit terminal generation error and exhausted in-page Retry
+  attempts, rerun the same manifest once with `--no-resume` to create a fresh request;
+- for `inspect_session_and_rerun_if_not_submitted`, inspect `chatgpt_session.json`: rerun only when
+  it proves the prompt was not submitted; otherwise collect the current conversation first;
+- for `policy_refused`, `retryable=false`, login, MFA, CAPTCHA, verification, or account
+  restrictions, do not retry unchanged. Report or request the required user action immediately.
+
+Never loop caller-level retries indefinitely and never resubmit when commit state is unknown. If
+the one recovery cycle fails or no safe automatic action exists, promptly return the structured
+`status`, `error_type`, completed internal and caller retry actions, conversation URL, retained
+artifact paths, and `recommended_next_action` to the calling agent. A failed command must end in
+either a downloaded result or an explicit handoff, not a silent wait or abandonment. See
+`references/output-contract.md` for the full status-to-action mapping.
+
 For every fresh submission, the runner first selects and verifies the top-level `Chat` surface,
 never `Work`, using ChatGPT's `Select chat surface` control. It then explicitly selects ChatGPT's
 `Create image` mode and verifies the selected composer token or image-prompt surface before it
 uploads references or sends the prompt. It opens `Add files and more` first when the Create image
-control is nested in that menu. A missing or unverifiable Chat surface or image mode is terminal;
-do not silently submit through Work or fall back to ordinary chat. Reference uploads likewise
-require visible composer-attachment evidence before submission.
+control is nested in that menu. Visible page-level errors such as `Failed to load subscription`,
+`Something went wrong`, or network/load failures are pre-submit recovery signals. A temporarily
+missing Create image control is also recoverable because ChatGPT may omit the tool while such an
+error is active; reload and replay the complete preparation transaction within the normal bounded
+page-recovery budget. A persistent missing control returns recovery-exhausted evidence to the
+caller. A control that was clicked but whose selected state cannot be verified remains a selector
+contract failure. Never silently submit through Work or fall back to ordinary chat. Reference
+uploads likewise require visible composer-attachment evidence before submission.
 
 The runner uploads references one at a time in manifest-array order. After every upload it requires
 a monotonic attachment count, records the numbered local-path sequence, and refuses to submit if it
@@ -179,7 +216,8 @@ Page recovery is state-aware and bounded (three attempts by default):
 
 - before submission, a confirmed page failure reopens ChatGPT and replays the complete preparation
   transaction: select `Chat`, select `Create image`, apply the ratio control when available, upload
-  and verify every reference, and restore the prompt;
+  and verify every reference, and restore the prompt. Confirmed failures include visible
+  page-level load/network errors and a missing Create image control after its menu was opened;
 - after the submit control has been invoked, the session records `submission_committed=true` and
   recovery may only reopen the same conversation and continue observing or collecting it. It must
   never replay the prompt or submit a replacement request;
@@ -197,9 +235,11 @@ click committed, return `chatgpt_submission_state_unknown` and require inspectio
 `collect-current` before any resubmission, avoiding duplicate jobs. `--page-recovery-attempts`
 changes the bounded recovery count; `--stale-generation-refresh-interval` is diagnostic opt-in and
 defaults to disabled.
-An explicit ChatGPT generation error ends the wait at the next heartbeat with structured
-`generation_failed` and `recommended_next_action=submit_new_request`; it must not wait until the
-image timeout or surface a raw traceback.
+An explicit ChatGPT generation error interrupts the wait at the next heartbeat. The runner first
+uses the visible Retry control up to `--max-failure-retries` times (two by default). Only after
+those in-page retries fail does it return structured `generation_failed` with
+`recommended_next_action=submit_new_request`; it must not wait until the image timeout or surface a
+raw traceback.
 If the expected conversation URL remains open but the submitted user turn is missing for two
 consecutive heartbeats, the runner reports `generation_failed` with
 `error_type=chatgpt_submitted_turn_missing`. This covers blank, unrecoverable conversation shells

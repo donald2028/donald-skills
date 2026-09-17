@@ -53,6 +53,12 @@ current-turn error text, visible error surfaces, and Retry controls without wait
 timeout. Deep page-health inspection is performed on the heartbeat rather than the shorter
 candidate-collection loop.
 
+Before submission, visible ChatGPT page-level failures such as `Failed to load subscription`,
+`Something went wrong`, network/load errors, or an opened tool menu that temporarily omits the
+Create image control enter the bounded page-recovery path. The runner reloads and replays the full
+preparation transaction. A persistent missing control is reported as page recovery exhaustion;
+it is not silently downgraded to ordinary chat.
+
 Routine browser checkpoints are temporary diagnostics. After a request reaches fully
 `downloaded`, the runner removes its routine trace screenshots and records
 `trace_retention.policy=failures_only` plus the removed count and reclaimed bytes in the run
@@ -84,3 +90,26 @@ Important terminal or recoverable states include:
 - `needs_ops` with `error_type=human_attention_required`: login or human verification requires an
   operator in the activated visible browser. The runner preserves that tab and never refreshes or
   attempts the verification itself.
+
+## Caller Recovery Contract
+
+A nonzero runner exit is not, by itself, a final workflow decision. The caller must read the final
+JSON and use `retryable`, `submission_committed`, `recommended_next_action`, the session file, and
+the retained conversation URL to choose the next action. The runner's internal recovery remains
+the first tier; after it is exhausted, the caller gets one bounded recovery cycle:
+
+| Result evidence | Caller action |
+| --- | --- |
+| `rerun_same_job` and `submission_committed=false` | Rerun the same command once. |
+| `collect_current_first` or `collect_current_or_inspect_conversation` | Run `collect-current` once; do not resubmit first. |
+| `submission_state_unknown` or `submission_committed=unknown` | Inspect the session and conversation; use `collect-current` when a conversation URL exists, and never assume the prompt was not sent. |
+| `timeout_no_images` | Preserve the existing conversation and run `collect-current` once before considering a new request. |
+| `submit_new_request` after explicit `generation_failed` | Start one fresh request from the same manifest with `--no-resume`. |
+| `inspect_session_and_rerun_if_not_submitted` | Inspect `chatgpt_session.json`; rerun only if it proves no submission occurred, otherwise collect first. |
+| `policy_refused`, `retryable=false`, or human/account intervention | Do not retry unchanged; report or request the required action immediately. |
+
+After that caller recovery fails, or when no safe automatic action exists, return control promptly
+with the terminal `status`, `error_type`, internal retry history (`page_recoveries`,
+`failure_retries`, or download failures), the caller action attempted, conversation URL, retained
+artifact paths, and `recommended_next_action`. Do not silently stop at the first transient error,
+wait indefinitely, or create an unbounded retry loop.
