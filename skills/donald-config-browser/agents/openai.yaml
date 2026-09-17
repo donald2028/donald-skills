@@ -4,4 +4,4 @@ interface:
   default_prompt: "Use $donald-config-browser to configure, inspect, change, reset, or repair the Chrome Profile binding for a specific Donald browser skill."
 
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true

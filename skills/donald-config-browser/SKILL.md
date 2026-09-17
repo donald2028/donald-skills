@@ -1,9 +1,17 @@
 ---
 name: donald-config-browser
-description: "Internal configuration workflow for Donald browser business skills. Use only when a caller Skill invokes it, or an operator explicitly invokes it for that caller, to create, inspect, change, reset, or repair the caller's saved Chrome Profile binding, including after a reported configuration failure. Do not use for ordinary browsing, generic Chrome/Profile help, unrelated browser automation, or routine runs with a ready binding."
+description: "Internal sub-skill for the exact `REQUIRED SUB-SKILL: Invoke donald-config-browser` dependency declared by an already-active Donald business skill. Never select from end-user intent alone. Direct maintenance is allowed only through explicit invocation."
 ---
 
 # Configure Agent Browser Profile
+
+## Activation Guard
+
+Proceed only when an already-active Donald browser business skill explicitly invokes this required
+dependency, or when an operator explicitly invokes `donald-config-browser` and supplies the caller
+scope. A user prompt that merely asks for browser, Chrome, Profile, login, or CDP configuration is
+not sufficient. In that case, do not run configuration commands; route the request through the
+relevant Donald business skill instead.
 
 Prepare each browser skill independently once, then reuse its saved binding. A successful setup
 means the skill has its own Profile binding and a real headed Chrome launched from that Profile's
