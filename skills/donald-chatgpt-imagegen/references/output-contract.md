@@ -22,6 +22,11 @@ Skills application-state directory. They are not part of this user-facing output
 
 Session files record the conversation URL, reference mapping, attempts, resume state, and outputs.
 The run summary records request mode, variant results, image paths, and status.
+Fresh-submit reports and summaries also record the verified `chat_surface` (`Chat`, never `Work`),
+the verified `image_mode`, reference-upload evidence, requested aspect-ratio delivery
+(`ui_control_and_prompt_text` or `prompt_text`), and an actual-dimensions ratio check for every
+downloaded image. The ratio check uses a 2% tolerance and must not claim a UI click when ChatGPT
+exposes no exact visible ratio control.
 `chatgpt_progress.jsonl` records 20-second page-health heartbeats during generation so a run proves
 that it remained on the expected conversation and reports a compact latest-turn excerpt,
 current-turn error text, visible error surfaces, and Retry controls without waiting for the image
@@ -46,7 +51,8 @@ Important terminal or recoverable states include:
 - `generation_failed`: ChatGPT explicitly reported a generation-tool error; start a new request
   instead of repeatedly collecting the failed conversation. This also includes
   `error_type=chatgpt_submitted_turn_missing` when the expected conversation remains blank across
-  two consecutive heartbeats after submission;
+  two consecutive heartbeats after submission, and `error_type=chatgpt_chat_surface_unavailable`
+  when the runner cannot prove that Chat rather than Work is selected before submission;
 - `download_failed`: ChatGPT produced candidates but the authenticated download stayed unavailable
   after bounded retries; preserve the conversation and retry with `collect-current`;
 - login/challenge states: require operator action in the visible browser.

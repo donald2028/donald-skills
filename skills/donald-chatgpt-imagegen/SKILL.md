@@ -120,6 +120,20 @@ python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest returned by 
   --timeout 1200
 ```
 
+For every fresh submission, the runner first selects and verifies the top-level `Chat` surface,
+never `Work`, using ChatGPT's `Select chat surface` control. It then explicitly selects ChatGPT's
+`Create image` mode and verifies the selected composer token or image-prompt surface before it
+uploads references or sends the prompt. It opens `Add files and more` first when the Create image
+control is nested in that menu. A missing or unverifiable Chat surface or image mode is terminal;
+do not silently submit through Work or fall back to ordinary chat. Reference uploads likewise
+require visible composer-attachment evidence before submission.
+
+The runner treats `--aspect-ratio` as an end-to-end output contract. If the current ChatGPT UI
+exposes a visible exact ratio control, it clicks that control and records the result. When the UI
+has no such control, it records `delivery=prompt_text`, includes the ratio in the submitted image
+request, and validates every downloaded image's actual dimensions against the requested ratio with
+a 2% tolerance. Never report a ratio UI click when the control was unavailable.
+
 The runner reuses an existing session URL by default. Do not use `--no-resume` unless the saved
 conversation is unavailable or the user explicitly requests a fresh conversation.
 
@@ -161,6 +175,9 @@ prompt in the same conversation, prepare a separate `single_batch` job with
 ## Completion Check
 
 - Confirm the requested candidate count and inspect every PNG.
+- Confirm `chat_surface.verified` with `selected_surface=chat`, `image_mode.verified`, reference
+  `upload_observation.ready`, and
+  `aspect_ratio_validation.all_match` for fresh requests that use those inputs.
 - Validate `chatgpt_web_run_summary.json`, session JSON, conversation URL, and trace reports.
 - Report `partial_downloaded`, `policy_refused`, timeout, or login-required states honestly.
 - Keep session state, progress logs, reports, and failure-specific screenshots until the caller

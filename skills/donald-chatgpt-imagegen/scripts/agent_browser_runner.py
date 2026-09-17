@@ -174,6 +174,14 @@ class ReferenceUploadError(RuntimeError):
         self.failure = failure
 
 
+class ImageModeSelectionError(RuntimeError):
+    pass
+
+
+class ChatSurfaceSelectionError(RuntimeError):
+    pass
+
+
 class HumanAttentionRequired(RuntimeError):
     def __init__(self, reason: str, activation: dict[str, Any]):
         super().__init__(reason)
@@ -1550,6 +1558,7 @@ def _conversation_source_session(session_path: Path) -> dict[str, Any]:
         "conversation_url": conversation_url,
         "job_name": session.get("job_name"),
         "reference_image_mapping": session.get("reference_image_mapping") or [],
+        "chat_surface": session.get("chat_surface"),
     }
 
 
@@ -2732,40 +2741,372 @@ def _open_new_chat(args: argparse.Namespace, cwd: Path) -> None:
     _wait_ms(args, cwd, 2000)
 
 
-def _enable_image_mode_if_available(args: argparse.Namespace, cwd: Path, snapshot: str) -> None:
+def _dispatch_owned_tab_click(
+    args: argparse.Namespace,
+    cwd: Path,
+    control: dict[str, Any],
+) -> bool:
+    if not control.get("found"):
+        return False
+    x = float(control.get("x") or 0)
+    y = float(control.get("y") or 0)
+    if x <= 0 or y <= 0:
+        return False
     if _owned_tab_cdp_url(args):
-        script = r"""
-(() => {
-  const labels = ["Create image", "Create an image"];
+        with _CDPConnection.connect(_owned_tab_cdp_url(args), timeout=30) as conn:
+            conn.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+            conn.call(
+                "Input.dispatchMouseEvent",
+                {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+            )
+            conn.call(
+                "Input.dispatchMouseEvent",
+                {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+            )
+        return True
+    clicked = _eval_json(
+        args,
+        cwd,
+        f"""
+JSON.stringify((() => {{
+  const control = document.elementFromPoint({x}, {y});
+  if (!control) return {{clicked: false}};
+  control.click();
+  return {{clicked: true}};
+}})())
+""".strip(),
+        timeout=60,
+    )
+    return bool(clicked.get("clicked"))
+
+
+CHAT_SURFACE_STATE_JS = r"""
+JSON.stringify((() => {
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const textFor = (el) => String(el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
+  const groups = Array.from(document.querySelectorAll("[role='radiogroup']")).filter(visible);
+  const group = groups.find((el) => /^Select chat surface$/i.test(el.getAttribute("aria-label") || "")) || null;
+  if (!group) {
+    return {control_available: false, selected_surface: "unknown"};
+  }
+  const radios = Array.from(group.querySelectorAll("button[role='radio'],[role='radio']")).filter(visible);
+  const chat = group.querySelector("[data-tpp-toggle-value='chatgpt']")
+    || radios.find((el) => /^Chat$/i.test(textFor(el)))
+    || null;
+  const work = group.querySelector("[data-tpp-toggle-value='work']")
+    || radios.find((el) => /^Work$/i.test(textFor(el)))
+    || null;
+  const selected = (el) => Boolean(el)
+    && (el.getAttribute("aria-checked") === "true" || el.getAttribute("data-state") === "on");
+  const control = (el) => {
+    if (!el || !visible(el)) return {found: false};
+    const rect = el.getBoundingClientRect();
+    return {
+      found: true,
+      label: textFor(el),
+      aria_checked: el.getAttribute("aria-checked"),
+      data_state: el.getAttribute("data-state"),
+      value: el.getAttribute("data-tpp-toggle-value"),
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+  };
+  const chatSelected = selected(chat);
+  const workSelected = selected(work);
+  return {
+    control_available: true,
+    group_label: group.getAttribute("aria-label"),
+    chat_selected: chatSelected,
+    work_selected: workSelected,
+    selected_surface: chatSelected && !workSelected ? "chat" : (workSelected && !chatSelected ? "work" : "unknown"),
+    chat_control: control(chat),
+    work_control: control(work),
+  };
+})())
+"""
+
+
+def _recorded_chat_surface_is_verified(record: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(record, dict)
+        and record.get("verified")
+        and record.get("selected_surface") == "chat"
+    )
+
+
+def _chat_surface_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    return _eval_json(args, cwd, CHAT_SURFACE_STATE_JS, timeout=60)
+
+
+def _ensure_chat_surface(
+    args: argparse.Namespace,
+    cwd: Path,
+    *,
+    recorded: dict[str, Any] | None = None,
+    timeout_s: float = 10,
+) -> dict[str, Any]:
+    deadline = time.time() + max(0, timeout_s)
+    initial: dict[str, Any] = {}
+    while True:
+        initial = _chat_surface_state(args, cwd)
+        if initial.get("control_available"):
+            break
+        if _recorded_chat_surface_is_verified(recorded):
+            return {
+                "requested_surface": "chat",
+                "status": "verified_from_session",
+                "verified": True,
+                "control_available": False,
+                "clicked_chat": False,
+                "selected_surface": "chat",
+                "evidence_source": "recorded_session",
+                "origin_evidence_source": recorded.get("origin_evidence_source")
+                or recorded.get("evidence_source"),
+                "origin_status": recorded.get("origin_status") or recorded.get("status"),
+            }
+        if time.time() >= deadline:
+            raise ChatSurfaceSelectionError(
+                "ChatGPT's Chat/Work selector is not visible and this conversation has no "
+                "previously verified Chat-surface record. Refusing to submit an image request."
+            )
+        _wait_ms(args, cwd, 250)
+
+    if initial.get("selected_surface") == "chat":
+        return {
+            "requested_surface": "chat",
+            "status": "already_selected",
+            "verified": True,
+            "control_available": True,
+            "clicked_chat": False,
+            "selected_surface": "chat",
+            "evidence_source": "live_selector",
+            "initial": initial,
+            "verification": initial,
+        }
+
+    clicked = _dispatch_owned_tab_click(args, cwd, initial.get("chat_control") or {})
+    if clicked:
+        _wait_ms(args, cwd, 750)
+    verification = _chat_surface_state(args, cwd)
+    verified = bool(
+        verification.get("control_available")
+        and verification.get("selected_surface") == "chat"
+        and verification.get("chat_selected")
+        and not verification.get("work_selected")
+    )
+    if not verified:
+        raise ChatSurfaceSelectionError(
+            "ChatGPT Chat surface could not be selected and verified. "
+            f"clicked_chat={clicked} initial={json.dumps(initial, ensure_ascii=False)} "
+            f"verification={json.dumps(verification, ensure_ascii=False)}"
+        )
+    return {
+        "requested_surface": "chat",
+        "status": "selected",
+        "verified": True,
+        "control_available": True,
+        "clicked_chat": bool(clicked),
+        "selected_surface": "chat",
+        "evidence_source": "live_selector",
+        "initial": initial,
+        "verification": verification,
+    }
+
+
+def _enable_image_mode_if_available(
+    args: argparse.Namespace,
+    cwd: Path,
+    snapshot: str,
+) -> dict[str, Any]:
+    del snapshot
+
+    def state() -> dict[str, Any]:
+        return _eval_json(
+            args,
+            cwd,
+            r"""
+JSON.stringify((() => {
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
-  const controls = Array.from(document.querySelectorAll("button,[role='button'],a")).filter(visible);
-  const control = controls.find((candidate) => {
-    const text = [
-      candidate.getAttribute("aria-label"),
-      candidate.getAttribute("title"),
-      candidate.innerText,
-      candidate.textContent,
-    ].filter(Boolean).join(" ");
-    return labels.some((label) => text.includes(label));
-  });
-  if (!control) return "";
-  control.click();
-  return "clicked";
-})()
-"""
-        ok, result = _try_cdp_eval_js(args, script, timeout=60)
-        if ok and result.strip() == "clicked":
-            _wait_ms(args, cwd, 1000)
-        return
-    for label in ("Create image", "Create an image"):
-        if label in snapshot:
-            _safe_agent(args, cwd, ["find", "text", label, "click", "--exact"], timeout=120)
-            _wait_ms(args, cwd, 1000)
-            return
+  const editors = Array.from(document.querySelectorAll("[contenteditable='true']")).filter(visible);
+  const editorText = editors.map((el) => el.innerText || el.textContent || "").join(" ");
+  const hasPromptCategories = Array.from(document.querySelectorAll("[role='tablist']"))
+    .filter(visible)
+    .some((el) => /Image prompt categories/i.test(el.getAttribute("aria-label") || ""));
+  return {
+    selected: /\bCreate (?:an )?image\b/i.test(editorText) || hasPromptCategories,
+    editorText: editorText.trim(),
+    hasPromptCategories,
+  };
+})())
+""".strip(),
+            timeout=60,
+        )
+
+    def find_create_image() -> dict[str, Any]:
+        return _eval_json(
+            args,
+            cwd,
+            r"""
+JSON.stringify((() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const textFor = (el) => [
+    el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent
+  ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const controls = Array.from(document.querySelectorAll(
+    "button,[role='button'],a,[role='menuitem'],[role='option'],[tabindex]"
+  )).filter(visible);
+  const control = controls.find((el) => /^Create (?:an )?image(?:\b|\s)/i.test(textFor(el)));
+  if (!control) return {found: false};
+  const label = textFor(control);
+  const rect = control.getBoundingClientRect();
+  return {found: true, label, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+})())
+""".strip(),
+            timeout=60,
+        )
+
+    initial = state()
+    if initial.get("selected"):
+        return {
+            "requested": True,
+            "status": "already_selected",
+            "verified": True,
+            "opened_add_menu": False,
+            "clicked_create_image": False,
+            "verification": initial,
+        }
+
+    direct = find_create_image()
+    opened_add_menu = False
+    clicked = _dispatch_owned_tab_click(args, cwd, direct)
+    selected_label = str(direct.get("label") or "")
+    if not clicked:
+        menu = _eval_json(
+            args,
+            cwd,
+            r"""
+JSON.stringify((() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const controls = Array.from(document.querySelectorAll("button,[role='button']")).filter(visible);
+  const control = controls.find((el) => /Add files and more/i.test([
+    el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent
+  ].filter(Boolean).join(" ")));
+  if (!control) return {found: false};
+  const rect = control.getBoundingClientRect();
+  return {found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+})())
+""".strip(),
+            timeout=60,
+        )
+        opened_add_menu = _dispatch_owned_tab_click(args, cwd, menu)
+        if opened_add_menu:
+            _wait_ms(args, cwd, 500)
+            menu_choice = find_create_image()
+            clicked = _dispatch_owned_tab_click(args, cwd, menu_choice)
+            selected_label = str(menu_choice.get("label") or "")
+
+    if clicked:
+        _wait_ms(args, cwd, 1000)
+    verification = state()
+    if not verification.get("selected"):
+        raise ImageModeSelectionError(
+            "ChatGPT Create image mode could not be selected and verified. "
+            f"opened_add_menu={opened_add_menu} clicked_create_image={clicked} "
+            f"last_state={json.dumps(verification, ensure_ascii=False)}"
+        )
+    return {
+        "requested": True,
+        "status": "selected",
+        "verified": True,
+        "opened_add_menu": opened_add_menu,
+        "clicked_create_image": clicked,
+        "selected_label": selected_label,
+        "verification": verification,
+    }
+
+
+def _configure_aspect_ratio(
+    args: argparse.Namespace,
+    cwd: Path,
+    requested: str,
+) -> dict[str, Any]:
+    requested = requested.strip()
+
+    def find_control() -> dict[str, Any]:
+        return _eval_json(
+            args,
+            cwd,
+            f"""
+JSON.stringify((() => {{
+  const requested = {json.dumps(requested)};
+  const visible = (el) => {{
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  }};
+  const textFor = (el) => [
+    el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent
+  ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+  const controls = Array.from(document.querySelectorAll(
+    "button,[role='button'],[role='radio'],[role='option'],[role='menuitem'],[tabindex]"
+  )).filter(visible);
+  const exact = controls.find((el) => textFor(el) === requested);
+  if (!exact) return {{found: false}};
+  const rect = exact.getBoundingClientRect();
+  const selected = exact.getAttribute("aria-checked") === "true"
+    || exact.getAttribute("aria-selected") === "true"
+    || exact.getAttribute("data-state") === "checked";
+  return {{
+    found: true,
+    selected,
+    label: textFor(exact),
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+  }};
+}})())
+""".strip(),
+            timeout=60,
+        )
+
+    state = find_control()
+    if state.get("found"):
+        clicked = True if state.get("selected") else _dispatch_owned_tab_click(args, cwd, state)
+        _wait_ms(args, cwd, 500)
+        verification = find_control()
+        verified = bool(state.get("selected") or verification.get("selected"))
+        return {
+            "requested": requested,
+            "delivery": "ui_control_and_prompt_text",
+            "ui_control_available": True,
+            "clicked": bool(clicked),
+            "verified": verified,
+            "label": state.get("label") or requested,
+        }
+    return {
+        "requested": requested,
+        "delivery": "prompt_text",
+        "ui_control_available": False,
+        "clicked": False,
+        "verified": False,
+        "reason": "current_chatgpt_create_image_ui_has_no_visible_exact_ratio_control",
+    }
 
 
 def _wait_until_idle(args: argparse.Namespace, cwd: Path, timeout_s: int = 600) -> None:
@@ -2924,13 +3265,62 @@ def _reference_upload_observation(
         }
     )
     filenames = [Path(path).name for path in references]
+    attachment_state: dict[str, Any] = {}
+    if _owned_tab_cdp_url(args):
+        try:
+            attachment_state = _eval_json(
+                args,
+                cwd,
+                r"""
+JSON.stringify((() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+  };
+  const buttons = Array.from(document.querySelectorAll("button,[role='button']")).filter(visible);
+  const removeLabels = buttons
+    .map((el) => el.getAttribute("aria-label") || "")
+    .filter((label) => /^Remove file\s+\d+:/i.test(label));
+  const uploadedImageLabels = buttons
+    .map((el) => el.getAttribute("aria-label") || "")
+    .filter((label) => /^Open image:\s*User uploaded image/i.test(label));
+  return {
+    removeFileCount: removeLabels.length,
+    removeFileLabels: removeLabels,
+    uploadedImagePreviewCount: uploadedImageLabels.length,
+    uploadedImagePreviewLabels: uploadedImageLabels,
+  };
+})())
+""".strip(),
+                timeout=60,
+            )
+        except Exception:
+            attachment_state = {}
+    attachment_labels = [str(label) for label in attachment_state.get("removeFileLabels") or []]
+    attachment_count = max(
+        int(attachment_state.get("removeFileCount") or 0),
+        int(attachment_state.get("uploadedImagePreviewCount") or 0),
+    )
+    filename_mentions = {
+        filename: (
+            filename in page_text
+            or Path(filename).stem in page_text
+            or any(filename in label or Path(filename).stem in label for label in attachment_labels)
+        )
+        for filename in filenames
+    }
     return {
         "failure": failure,
         "page_text": page_text,
         "reference_count": len(references),
         "blob_image_count": len(image_urls),
         "blob_image_urls": image_urls,
-        "filename_mentions": {filename: filename in page_text for filename in filenames},
+        "attachment_count": attachment_count,
+        "attachment_labels": attachment_labels,
+        "uploaded_image_preview_count": int(attachment_state.get("uploadedImagePreviewCount") or 0),
+        "filename_mentions": filename_mentions,
+        "ready": attachment_count >= len(references) or len(image_urls) >= len(references),
     }
 
 
@@ -2940,7 +3330,7 @@ def _wait_for_reference_uploads_ready(
     references: list[str],
     *,
     timeout_s: int = 90,
-    min_wait_s: int = 12,
+    min_wait_s: int = 1,
 ) -> dict[str, Any]:
     if not references:
         return {"reference_count": 0, "blob_image_count": 0, "filename_mentions": {}}
@@ -2950,8 +3340,24 @@ def _wait_for_reference_uploads_ready(
         observation = _reference_upload_observation(args, cwd, references)
         if observation.get("failure"):
             raise ReferenceUploadError(observation["failure"])
-        if time.time() - started_at >= observation_window_s:
+        elapsed = time.time() - started_at
+        if observation.get("ready") and elapsed >= observation_window_s:
             return observation
+        if elapsed >= timeout_s:
+            raise ReferenceUploadError(
+                {
+                    "status": "reference_upload_failed",
+                    "error_type": "reference_upload_unverified",
+                    "retryable": True,
+                    "terminal": False,
+                    "recommended_next_action": "retry_reference_upload",
+                    "observation": {
+                        key: value
+                        for key, value in observation.items()
+                        if key != "page_text"
+                    },
+                }
+            )
         time.sleep(1)
 
 
@@ -3019,10 +3425,20 @@ def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> 
 
     _open_new_chat(args, cwd)
     _wait_for_prompt_box(args, cwd)
+    chat_surface = _ensure_chat_surface(args, cwd)
     account_guard = _validate_account_lane(args, cwd, job)
     _screenshot(args, cwd, trace_dir / "01_open.png")
 
-    _enable_image_mode_if_available(args, cwd, "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd))
+    image_mode = _enable_image_mode_if_available(
+        args,
+        cwd,
+        "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd),
+    )
+    aspect_ratio_delivery = _configure_aspect_ratio(
+        args,
+        cwd,
+        str(job.get("output_aspect_ratio") or "1:1"),
+    )
 
     references = [ref["path"] for ref in job.get("reference_images", [])]
     # ChatGPT keeps a file input mounted after image mode is available. If this
@@ -3032,6 +3448,7 @@ def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> 
         upload_observation = _wait_for_reference_uploads_ready(args, cwd, references)
     else:
         upload_observation = {"reference_count": 0, "blob_image_count": 0, "filename_mentions": {}}
+    chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface)
     _screenshot(args, cwd, trace_dir / "02_after_upload.png")
     after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
 
@@ -3044,6 +3461,9 @@ def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> 
         "reference_count": len(references),
         "trace_dir": str(trace_dir),
         "account_guard": account_guard,
+        "chat_surface": chat_surface,
+        "image_mode": image_mode,
+        "aspect_ratio_delivery": aspect_ratio_delivery,
         "after_upload_mentions": {
             Path(path).name: Path(path).name in after_upload for path in references
         },
@@ -3075,16 +3495,30 @@ def _paste_prompt(args: argparse.Namespace, cwd: Path, message: str) -> None:
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
-  const editors = Array.from(document.querySelectorAll("[contenteditable='true']")).filter(visible);
+  const editors = Array.from(document.querySelectorAll(
+    "#prompt-textarea[contenteditable='true'], [contenteditable='true'][role='textbox']"
+  )).filter(visible);
   const editor = editors.find((candidate) => candidate.closest("form")) || editors.at(-1);
   if (!editor) throw new Error("composer editor not found");
   editor.focus();
+  const block = editor.lastElementChild || editor;
   const selection = window.getSelection();
   const range = document.createRange();
-  range.selectNodeContents(editor);
+  const pills = Array.from(block.querySelectorAll("[data-inline-selection-pill]"));
+  if (pills.length > 0) {
+    range.setStartAfter(pills.at(-1));
+    range.setEnd(block, block.childNodes.length);
+  } else {
+    range.selectNodeContents(block);
+  }
   selection.removeAllRanges();
   selection.addRange(range);
-  document.execCommand("delete");
+  if (!range.collapsed) document.execCommand("delete");
+  const insertionRange = document.createRange();
+  insertionRange.selectNodeContents(block);
+  insertionRange.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(insertionRange);
   return "focused";
 })()
 """,
@@ -3096,6 +3530,12 @@ def _paste_prompt(args: argparse.Namespace, cwd: Path, message: str) -> None:
                     raise RuntimeError(f"Runtime.evaluate exception: {result['exceptionDetails']}")
                 conn.call("Input.insertText", {"text": message})
             _wait_ms(args, cwd, 1000)
+            state = _composer_submit_state(args, cwd, message)
+            if not state.get("editorHasPromptTail"):
+                raise RuntimeError(
+                    "Prompt text did not appear in the ChatGPT composer after CDP insertion. "
+                    f"Composer state: {json.dumps(state, ensure_ascii=False)}"
+                )
             return
         except Exception as error:
             args._owned_tab_cdp_error = f"{type(error).__name__}: {error}"
@@ -3155,23 +3595,21 @@ COMPOSER_SUBMIT_STATE_JS = r"""
     button.textContent,
     button.type,
   ].filter(Boolean).join(" ");
-  const editors = Array.from(document.querySelectorAll("[contenteditable='true']")).filter(visible);
+  const editors = Array.from(document.querySelectorAll(
+    "#prompt-textarea[contenteditable='true'], [contenteditable='true'][role='textbox']"
+  )).filter(visible);
   const editor = editors.find((candidate) => candidate.closest("form")) || editors.at(-1) || null;
-  let composer = editor;
-  for (let i = 0; composer && i < 10; i += 1) {
-    const buttons = composer.querySelectorAll ? Array.from(composer.querySelectorAll("button")).filter(visible) : [];
-    if (buttons.length >= 2) break;
-    composer = composer.parentElement;
-  }
-  const root = composer || document.body;
+  const root = editor ? (editor.closest("form") || editor.parentElement || editor) : null;
   const editorText = normalize(editor ? editor.innerText || editor.textContent : "");
   const hasPromptTail = Boolean(promptTail) && editorText.includes(normalize(promptTail));
   const hasComposerText = editorText.length > 0;
   const conversationStarted = /\/c\/[^/?#]+/.test(window.location.pathname);
   const userMessageCount = document.querySelectorAll('[data-message-author-role="user"]').length;
   const assistantMessageCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-  const buttons = Array.from(root.querySelectorAll("button")).filter(visible);
-  const sendButton = buttons.find((button) => /send/i.test(labelFor(button)))
+  const buttons = root ? Array.from(root.querySelectorAll("button")).filter(visible) : [];
+  const sendButton = buttons.find((button) => button.id === "composer-submit-button")
+    || buttons.find((button) => button.getAttribute("data-testid") === "send-button")
+    || buttons.find((button) => /^send prompt$/i.test(normalize(button.getAttribute("aria-label"))))
     || buttons.find((button) => button.type === "submit")
     || null;
   const disabled = sendButton
@@ -3179,7 +3617,7 @@ COMPOSER_SUBMIT_STATE_JS = r"""
     : true;
   return JSON.stringify({
     submitted: !hasPromptTail && editorText.length < 500,
-    readyToSubmit: hasComposerText && Boolean(sendButton) && !disabled,
+    readyToSubmit: hasPromptTail && Boolean(sendButton) && !disabled,
     buttonFound: Boolean(sendButton),
     buttonDisabled: disabled,
     buttonLabel: sendButton ? labelFor(sendButton) : "",
@@ -3212,27 +3650,24 @@ COMPOSER_CLICK_SEND_JS = r"""
     button.textContent,
     button.type,
   ].filter(Boolean).join(" ");
-  const editors = Array.from(document.querySelectorAll("[contenteditable='true']")).filter(visible);
+  const editors = Array.from(document.querySelectorAll(
+    "#prompt-textarea[contenteditable='true'], [contenteditable='true'][role='textbox']"
+  )).filter(visible);
   const editor = editors.find((candidate) => candidate.closest("form")) || editors.at(-1) || null;
-  let composer = editor;
-  for (let i = 0; composer && i < 10; i += 1) {
-    const buttons = composer.querySelectorAll ? Array.from(composer.querySelectorAll("button")).filter(visible) : [];
-    if (buttons.length >= 2) break;
-    composer = composer.parentElement;
-  }
-  const root = composer || document.body;
+  const root = editor ? (editor.closest("form") || editor.parentElement || editor) : null;
   const editorText = normalize(editor ? editor.innerText || editor.textContent : "");
   const hasPromptTail = Boolean(promptTail) && editorText.includes(normalize(promptTail));
   const hasComposerText = editorText.length > 0;
-  const buttons = Array.from(root.querySelectorAll("button")).filter(visible);
-  const sendButton = buttons.find((button) => /send|submit|发送|提交/i.test(labelFor(button)))
-    || buttons.find((button) => /send-button|composer-submit/i.test(labelFor(button)))
+  const buttons = root ? Array.from(root.querySelectorAll("button")).filter(visible) : [];
+  const sendButton = buttons.find((button) => button.id === "composer-submit-button")
+    || buttons.find((button) => button.getAttribute("data-testid") === "send-button")
+    || buttons.find((button) => /^send prompt$/i.test(normalize(button.getAttribute("aria-label"))))
     || buttons.find((button) => button.type === "submit")
     || null;
   const disabled = sendButton
     ? Boolean(sendButton.disabled || sendButton.getAttribute("aria-disabled") === "true" || sendButton.closest("[aria-disabled='true']"))
     : true;
-  const clicked = hasComposerText && Boolean(sendButton) && !disabled;
+  const clicked = hasPromptTail && Boolean(sendButton) && !disabled;
   if (clicked) {
     sendButton.click();
   }
@@ -3284,25 +3719,9 @@ def _composer_state_has_submission_evidence(
     saw_prompt: bool,
     enter_presses: int,
 ) -> bool:
-    def as_int(value: Any) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    if not state.get("submitted") or state.get("editorHasPromptTail"):
+    if not saw_prompt or not state.get("submitted") or state.get("editorHasPromptTail"):
         return False
-    if saw_prompt or enter_presses > 0:
-        return saw_prompt or as_int(state.get("editorTextLength")) == 0
-    editor_text_length = as_int(state.get("editorTextLength"))
-    return (
-        editor_text_length == 0
-        and (
-            bool(state.get("conversationStarted"))
-            or as_int(state.get("userMessageCount")) > 0
-            or as_int(state.get("assistantMessageCount")) > 0
-        )
-    )
+    return True
 
 
 def _submit_prompt(
@@ -3742,6 +4161,55 @@ def _validate_downloaded_image(output_path: Path) -> dict[str, Any]:
         "width": width,
         "height": height,
         "format": fmt,
+    }
+
+
+def _annotate_aspect_ratio_validation(
+    job: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    requested = str(job.get("output_aspect_ratio") or "1:1").strip()
+    try:
+        expected_width, expected_height = (float(part) for part in requested.split(":", 1))
+        expected_ratio = expected_width / expected_height
+    except (TypeError, ValueError, ZeroDivisionError):
+        return {
+            "requested": requested,
+            "valid_request": False,
+            "all_match": False,
+            "images": [],
+        }
+
+    checks: list[dict[str, Any]] = []
+    for image in payload.get("images") or []:
+        validation = image.get("image_validation") or {}
+        width = int(validation.get("width") or 0)
+        height = int(validation.get("height") or 0)
+        if width <= 0 or height <= 0:
+            check = {
+                "requested": requested,
+                "matches": False,
+                "reason": "missing_dimensions",
+            }
+        else:
+            actual_ratio = width / height
+            relative_error = abs(actual_ratio - expected_ratio) / expected_ratio
+            check = {
+                "requested": requested,
+                "expected_ratio": round(expected_ratio, 6),
+                "actual_dimensions": f"{width}x{height}",
+                "actual_ratio": round(actual_ratio, 6),
+                "relative_error": round(relative_error, 6),
+                "tolerance": 0.02,
+                "matches": relative_error <= 0.02,
+            }
+        image["aspect_ratio_validation"] = check
+        checks.append(check)
+    return {
+        "requested": requested,
+        "valid_request": True,
+        "all_match": all(bool(check.get("matches")) for check in checks) if checks else None,
+        "images": checks,
     }
 
 
@@ -4641,6 +5109,8 @@ def _write_summary(
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "variant_count": variant_count,
         "request_mode": request_mode,
+        "image_generation_mode": job.get("image_generation_mode") or "create_image",
+        "output_aspect_ratio": job.get("output_aspect_ratio") or "1:1",
         "start_variant": start_variant,
         "end_variant": end_variant,
         "variants": variants,
@@ -4702,6 +5172,8 @@ def _update_summary_for_collect_current(
         "prompt_card": job["prompt_card"],
         "variant_count": max(1, int(job.get("variant_count") or 1)),
         "request_mode": job.get("request_mode") or "single_batch",
+        "image_generation_mode": job.get("image_generation_mode") or "create_image",
+        "output_aspect_ratio": job.get("output_aspect_ratio") or "1:1",
         "start_variant": 1,
         "end_variant": "batch",
         "variants": [],
@@ -4716,6 +5188,10 @@ def _update_summary_for_collect_current(
         }
     )
     variants = list(summary.get("variants") or [])
+    aspect_ratio_validation = _annotate_aspect_ratio_validation(
+        job,
+        {"images": downloaded},
+    )
     batch_variant = {
         "variant_index": "batch",
         "submitted": True,
@@ -4733,6 +5209,7 @@ def _update_summary_for_collect_current(
                 expected_count=expected_count,
                 download_reason="partial_terminal" if len(downloaded) < expected_count else status,
             ),
+            "aspect_ratio_validation": aspect_ratio_validation,
             "images": downloaded,
         },
     }
@@ -4765,6 +5242,10 @@ def _variant_summary_from_report(
         "resumed": resumed,
         "conversation_url": report.get("conversation_url"),
         "report_path": str(report_path),
+        "chat_surface": report.get("chat_surface"),
+        "image_mode": report.get("image_mode"),
+        "aspect_ratio_delivery": report.get("aspect_ratio_delivery"),
+        "reference_upload": report.get("upload_observation"),
         "downloaded": {
             "status": report.get("status"),
             "error_type": report.get("error_type"),
@@ -4778,6 +5259,7 @@ def _variant_summary_from_report(
             "safe_to_fallback": report.get("safe_to_fallback"),
             "should_collect_current_first": report.get("should_collect_current_first"),
             "missing_image_count": report.get("missing_image_count"),
+            "aspect_ratio_validation": report.get("aspect_ratio_validation"),
             "images": report.get("images", []),
         },
     }
@@ -4801,6 +5283,7 @@ def _variant_summary_from_session(
         "resumed": session.get("resumed"),
         "conversation_url": conversation_url,
         "report_path": "",
+        "chat_surface": session.get("chat_surface"),
         "downloaded": {
             "status": status,
             "image_count": output_count,
@@ -4909,6 +5392,12 @@ def _run_one_request(
         _validate_session_reference_mapping(job, existing_session)
         conversation_url = _open_conversation(args, cwd, existing_conversation_url)
         _wait_until_idle(args, cwd)
+        chat_surface = _ensure_chat_surface(
+            args,
+            cwd,
+            recorded=existing_session.get("chat_surface"),
+            timeout_s=2,
+        )
         account_guard = _validate_account_lane(args, cwd, job, label)
         _screenshot(args, cwd, trace_dir / "01_resumed.png")
         baseline = set(existing_session.get("baseline_asset_urls") or [])
@@ -4923,6 +5412,7 @@ def _run_one_request(
                 "agent_browser_profile": _profile_label(args),
                 "account_lane": TARGET_CHATGPT_ACCOUNT_SIGNAL,
                 "account_guard": account_guard,
+                "chat_surface": existing_session.get("chat_surface") or chat_surface,
                 "attempt": {
                     "action": "resume",
                     "label": label,
@@ -4954,6 +5444,7 @@ def _run_one_request(
             expected_conversation_url=conversation_url,
             baseline_user_message_count=existing_session.get("baseline_user_message_count"),
         )
+        aspect_ratio_validation = _annotate_aspect_ratio_validation(job, collected)
         conversation_url = str(
             (collected.get("conversation_guard") or {}).get("current_url") or conversation_url
         )
@@ -4971,6 +5462,11 @@ def _run_one_request(
             "trace_dir": str(trace_dir),
             "reference_count": len(references),
             "account_guard": account_guard,
+            "chat_surface": chat_surface,
+            "image_mode": existing_session.get("image_mode"),
+            "aspect_ratio_delivery": existing_session.get("aspect_ratio_delivery"),
+            "aspect_ratio_validation": aspect_ratio_validation,
+            "upload_observation": existing_session.get("reference_upload"),
             **({"continued_from": existing_session.get("continued_from")} if existing_session.get("continued_from") else {}),
             **collected,
         }
@@ -4992,6 +5488,12 @@ def _run_one_request(
         conversation_url = _open_conversation(args, cwd, continued_from["conversation_url"])
         _wait_for_followup_composer(args, cwd)
         _wait_for_conversation_history(args, cwd)
+        chat_surface = _ensure_chat_surface(
+            args,
+            cwd,
+            recorded=continued_from.get("chat_surface"),
+            timeout_s=2,
+        )
         account_guard = _validate_account_lane(args, cwd, job, label)
         _screenshot(args, cwd, trace_dir / "01_conversation_followup.png")
         submit_throttle = {"enabled": False, "reason": "conversation_followup"}
@@ -5004,9 +5506,20 @@ def _run_one_request(
         )
         _open_new_chat(args, cwd)
         _wait_for_prompt_box(args, cwd)
+        chat_surface = _ensure_chat_surface(args, cwd)
         account_guard = _validate_account_lane(args, cwd, job, label)
         _screenshot(args, cwd, trace_dir / "01_open.png")
-        _enable_image_mode_if_available(args, cwd, "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd))
+
+    image_mode = _enable_image_mode_if_available(
+        args,
+        cwd,
+        "" if _owned_tab_cdp_url(args) else _snapshot(args, cwd),
+    )
+    aspect_ratio_delivery = _configure_aspect_ratio(
+        args,
+        cwd,
+        str(job.get("output_aspect_ratio") or "1:1"),
+    )
 
     if references:
         _upload_files(args, cwd, references)
@@ -5032,6 +5545,7 @@ def _run_one_request(
     upload_mentions = {Path(path).name: Path(path).name in after_upload for path in references}
 
     _wait_for_prompt_box(args, cwd)
+    chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface, timeout_s=2)
     _paste_prompt(args, cwd, message)
     _screenshot(args, cwd, trace_dir / "03_after_prompt.png")
 
@@ -5079,6 +5593,14 @@ def _run_one_request(
             "baseline_user_message_count": baseline_message_counts["user_message_count"],
             "baseline_assistant_message_count": baseline_message_counts["assistant_message_count"],
             "reference_image_mapping": _job_reference_mapping(job),
+            "chat_surface": chat_surface,
+            "image_mode": image_mode,
+            "aspect_ratio_delivery": aspect_ratio_delivery,
+            "reference_upload": {
+                key: value
+                for key, value in upload_observation.items()
+                if key != "page_text"
+            },
             "agent_browser_profile": _profile_label(args),
             "account_lane": TARGET_CHATGPT_ACCOUNT_SIGNAL,
             "account_guard": account_guard,
@@ -5116,6 +5638,7 @@ def _run_one_request(
         expected_conversation_url=conversation_url,
         baseline_user_message_count=baseline_message_counts["user_message_count"],
     )
+    aspect_ratio_validation = _annotate_aspect_ratio_validation(job, collected)
     conversation_url = str(
         (collected.get("conversation_guard") or {}).get("current_url") or conversation_url
     )
@@ -5134,6 +5657,10 @@ def _run_one_request(
         "reference_count": len(references),
         "trace_dir": str(trace_dir),
         "account_guard": account_guard,
+        "chat_surface": chat_surface,
+        "image_mode": image_mode,
+        "aspect_ratio_delivery": aspect_ratio_delivery,
+        "aspect_ratio_validation": aspect_ratio_validation,
         "upload_mentions": upload_mentions,
         "upload_observation": {
             key: value
@@ -5170,6 +5697,10 @@ def run_submit(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict
                 "resumed": report.get("resumed"),
                 "conversation_url": report.get("conversation_url"),
                 "report_path": report.get("report_path"),
+                "chat_surface": report.get("chat_surface"),
+                "image_mode": report.get("image_mode"),
+                "aspect_ratio_delivery": report.get("aspect_ratio_delivery"),
+                "reference_upload": report.get("upload_observation"),
                 "downloaded": {
                     "status": report.get("status"),
                     "error_type": report.get("error_type"),
@@ -5183,6 +5714,7 @@ def run_submit(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict
                     "safe_to_fallback": report.get("safe_to_fallback"),
                     "should_collect_current_first": report.get("should_collect_current_first"),
                     "missing_image_count": report.get("missing_image_count"),
+                    "aspect_ratio_validation": report.get("aspect_ratio_validation"),
                     "images": report.get("images", []),
                 },
             }
@@ -5248,6 +5780,10 @@ def run_conversation_followup(args: argparse.Namespace, job: dict[str, Any], cwd
             "conversation_url": report.get("conversation_url"),
             "continued_from": report.get("continued_from"),
             "report_path": report.get("report_path"),
+            "chat_surface": report.get("chat_surface"),
+            "image_mode": report.get("image_mode"),
+            "aspect_ratio_delivery": report.get("aspect_ratio_delivery"),
+            "reference_upload": report.get("upload_observation"),
             "downloaded": {
                 "status": report.get("status"),
                 "error_type": report.get("error_type"),
@@ -5261,6 +5797,7 @@ def run_conversation_followup(args: argparse.Namespace, job: dict[str, Any], cwd
                 "safe_to_fallback": report.get("safe_to_fallback"),
                 "should_collect_current_first": report.get("should_collect_current_first"),
                 "missing_image_count": report.get("missing_image_count"),
+                "aspect_ratio_validation": report.get("aspect_ratio_validation"),
                 "images": report.get("images", []),
             },
         }
@@ -5406,6 +5943,10 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
             )
         )
     )
+    aspect_ratio_validation = _annotate_aspect_ratio_validation(
+        job,
+        {"images": downloaded},
+    )
     session_patch = {
         "status": status,
         "resumed": True,
@@ -5421,6 +5962,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         **({"generation_error": detected_generation_error} if detected_generation_error else {}),
         **({"download_failures": download_failures} if download_failures else {}),
         **completion_metadata,
+        "aspect_ratio_validation": aspect_ratio_validation,
         "attempt": {
             "action": "collect_current",
             "mode": "collect_current",
@@ -5467,6 +6009,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "expected_image_count": expected_count,
         "partial": bool(downloaded and len(downloaded) < expected_count),
         **completion_metadata,
+        "aspect_ratio_validation": aspect_ratio_validation,
         "preserved_existing_outputs": (not downloaded and bool(existing_session.get("outputs"))),
         "images": downloaded,
     }
@@ -5719,6 +6262,26 @@ def main() -> int:
             report = run_collect_current(args, job, cwd)
         else:
             report = run_dry_upload(args, job, cwd)
+    except ChatSurfaceSelectionError as error:
+        report = {
+            "status": "generation_failed",
+            "error_type": "chatgpt_chat_surface_unavailable",
+            "retryable": False,
+            "terminal": True,
+            "recommended_next_action": "inspect_chatgpt_chat_work_selector",
+            "reason": str(error),
+        }
+        exit_code = 2
+    except ImageModeSelectionError as error:
+        report = {
+            "status": "generation_failed",
+            "error_type": "chatgpt_create_image_mode_unavailable",
+            "retryable": False,
+            "terminal": True,
+            "recommended_next_action": "inspect_chatgpt_create_image_ui",
+            "reason": str(error),
+        }
+        exit_code = 2
     except HumanAttentionRequired as error:
         report = {
             "status": "needs_ops",

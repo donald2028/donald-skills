@@ -19,6 +19,7 @@ REFERENCE_ROLE_RE = re.compile(
     r"^\s*[-*]\s+Reference Image\s+(\d+)\s*:\s*(.+?)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
+ASPECT_RATIO_RE = re.compile(r"^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$")
 
 
 def safe_path_part(value: str) -> str:
@@ -112,6 +113,17 @@ def reference_instructions(references: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def validate_aspect_ratio(value: str) -> str:
+    normalized = value.strip()
+    match = ASPECT_RATIO_RE.fullmatch(normalized)
+    if not match:
+        raise ValueError("aspect ratio must use WIDTH:HEIGHT with positive numbers, for example 16:9")
+    width, height = (float(part) for part in match.groups())
+    if width <= 0 or height <= 0:
+        raise ValueError("aspect ratio dimensions must be greater than zero")
+    return normalized
+
+
 def build_message(
     *,
     prompt: str,
@@ -155,6 +167,7 @@ def build_job(
         raise ValueError("variant note count cannot exceed variants")
     if reuse_conversation_references and request_mode != "single_batch":
         raise ValueError("--reuse-conversation-references requires single_batch")
+    aspect_ratio = validate_aspect_ratio(aspect_ratio)
 
     prompt_path = prompt_path.expanduser().resolve()
     markdown = prompt_path.read_text(encoding="utf-8")
@@ -205,6 +218,7 @@ def build_job(
         "reference_images": references,
         "reference_image_mapping": references,
         "reuse_conversation_references": reuse_conversation_references,
+        "image_generation_mode": "create_image",
         "variant_count": variant_count,
         "request_mode": request_mode,
         "output_aspect_ratio": aspect_ratio,
