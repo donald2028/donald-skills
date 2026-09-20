@@ -67,6 +67,20 @@ class ScopeRegistryTests(unittest.TestCase):
 
         self.assertEqual(result, completed)
         self.assertEqual(run.call_args.kwargs["env"]["AGENT_BROWSER_IDLE_TIMEOUT_MS"], "1000")
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+
+    def test_agent_browser_output_uses_utf8_independent_of_windows_locale(self) -> None:
+        result = profile_config.run_agent_browser(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write('验证设备'.encode('utf-8'))",
+            ],
+            timeout=15,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "验证设备")
 
     def test_windows_initialization_creates_a_fresh_profile_without_copying_login_data(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

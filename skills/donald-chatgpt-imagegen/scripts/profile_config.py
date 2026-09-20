@@ -266,6 +266,8 @@ def run_agent_browser(
 ) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "timeout": timeout,
