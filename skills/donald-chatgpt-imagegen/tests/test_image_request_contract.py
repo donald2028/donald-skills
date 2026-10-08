@@ -16,10 +16,47 @@ import prepare_job  # noqa: E402
 
 
 class ImageRequestContractTests(unittest.TestCase):
-    def test_chat_surface_selector_matches_current_chatgpt_contract(self) -> None:
-        self.assertIn("Select chat surface", runner.CHAT_SURFACE_STATE_JS)
-        self.assertIn("data-tpp-toggle-value='chatgpt'", runner.CHAT_SURFACE_STATE_JS)
-        self.assertIn("data-tpp-toggle-value='work'", runner.CHAT_SURFACE_STATE_JS)
+    def test_already_selected_chat_surface_requires_no_click(self) -> None:
+        state = {
+            "control_available": True,
+            "group_label": "Composer mode",
+            "selected_surface": "chat",
+            "chat_selected": True,
+            "work_selected": False,
+            "chat_control": {"found": True, "aria_pressed": "true"},
+            "work_control": {"found": True, "aria_pressed": "false"},
+        }
+        with (
+            mock.patch.object(runner, "_chat_surface_state", return_value=state),
+            mock.patch.object(runner, "_dispatch_owned_tab_click") as click,
+        ):
+            result = runner._ensure_chat_surface(argparse.Namespace(), Path.cwd())
+
+        click.assert_not_called()
+        self.assertEqual(result["status"], "already_selected")
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["verification"], state)
+
+    def test_visible_unverified_surface_cannot_reuse_recorded_chat(self) -> None:
+        state = {
+            "control_available": True,
+            "selected_surface": "unknown",
+            "chat_selected": False,
+            "work_selected": False,
+            "chat_control": {"found": True, "x": 20, "y": 30},
+        }
+        with (
+            mock.patch.object(runner, "_chat_surface_state", return_value=state),
+            mock.patch.object(runner, "_dispatch_owned_tab_click", return_value=True),
+            mock.patch.object(runner, "_wait_ms"),
+            self.assertRaises(runner.ChatSurfaceSelectionError),
+        ):
+            runner._ensure_chat_surface(
+                argparse.Namespace(),
+                Path.cwd(),
+                recorded={"verified": True, "selected_surface": "chat"},
+                timeout_s=0,
+            )
 
     def test_chat_surface_switches_from_work_to_chat_and_verifies(self) -> None:
         work_state = {

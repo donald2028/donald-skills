@@ -1875,6 +1875,23 @@ def _emit_progress(
     return progress
 
 
+CONVERSATION_DOM_JS = r"""
+(() => {
+  const legacyUsers = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const legacyAssistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+  const users = legacyUsers.length ? legacyUsers
+    : Array.from(document.querySelectorAll('[data-user-message-bubble]'));
+  const assistants = legacyAssistants.length ? legacyAssistants
+    : Array.from(document.querySelectorAll('[data-conversation-role="assistant"]'))
+        .map((el) => el.parentElement).filter(Boolean);
+  const turnSelector = 'section[data-testid^="conversation-turn-"],[data-turn-key]';
+  const turns = Array.from(document.querySelectorAll(turnSelector));
+  const turnFor = (el) => el?.closest(turnSelector) || el?.closest('article,section') || null;
+  return {users, assistants, turns, turnFor};
+})()
+""".strip()
+
+
 def _generation_page_health(
     args: argparse.Namespace,
     cwd: Path,
@@ -1886,17 +1903,16 @@ def _generation_page_health(
         cwd,
         r"""
 JSON.stringify((() => {
-  const assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+  const {users, assistants, turns, turnFor} = __CONVERSATION_DOM__;
   const latest = assistants.length ? assistants[assistants.length - 1] : null;
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
-  const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-  const latestTurn = turns.length ? turns[turns.length - 1] : (latest ? latest.closest("article,section") : null);
+  const latestTurn = turns.length ? turns[turns.length - 1] : turnFor(latest);
   const belongsToCurrentTurn = (el) => {
-    const owner = el.closest('section[data-testid^="conversation-turn-"]');
+    const owner = turnFor(el);
     return !owner || owner === latestTurn;
   };
   const labelParts = (el) => [
@@ -1931,7 +1947,7 @@ JSON.stringify((() => {
   ].some((marker) => pageText.includes(marker));
   return {
     href: window.location.href,
-    userMessageCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+    userMessageCount: users.length,
     assistantMessageCount: assistants.length,
     latestAssistantMessage: latest ? (latest.innerText || latest.textContent || "") : "",
     latestAssistantIsCurrent: Boolean(latest && (!latestTurn || latestTurn.contains(latest))),
@@ -1943,7 +1959,7 @@ JSON.stringify((() => {
     humanReason: challengeFrame || challengeText ? "anti_automation_verification" : "",
   };
 })())
-""".strip(),
+""".strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS),
         timeout=30,
     )
     current_url = str(observation.get("href") or "")
@@ -2846,26 +2862,28 @@ JSON.stringify((() => {
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
   const textFor = (el) => String(el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
-  const groups = Array.from(document.querySelectorAll("[role='radiogroup']")).filter(visible);
-  const group = groups.find((el) => /^Select chat surface$/i.test(el.getAttribute("aria-label") || "")) || null;
+  const groups = Array.from(document.querySelectorAll("[role='radiogroup'],[role='group']")).filter(visible);
+  const group = groups.find((el) => /^(?:Select chat surface|Composer mode)$/i.test(el.getAttribute("aria-label") || "")) || null;
   if (!group) {
     return {control_available: false, selected_surface: "unknown"};
   }
-  const radios = Array.from(group.querySelectorAll("button[role='radio'],[role='radio']")).filter(visible);
+  const buttons = Array.from(group.querySelectorAll("button,[role='radio']")).filter(visible);
   const chat = group.querySelector("[data-tpp-toggle-value='chatgpt']")
-    || radios.find((el) => /^Chat$/i.test(textFor(el)))
+    || buttons.find((el) => /^Chat$/i.test(textFor(el)))
     || null;
   const work = group.querySelector("[data-tpp-toggle-value='work']")
-    || radios.find((el) => /^Work$/i.test(textFor(el)))
+    || buttons.find((el) => /^Work$/i.test(textFor(el)))
     || null;
   const selected = (el) => Boolean(el)
-    && (el.getAttribute("aria-checked") === "true" || el.getAttribute("data-state") === "on");
+    && (el.getAttribute("aria-pressed") === "true"
+      || el.getAttribute("aria-checked") === "true" || el.getAttribute("data-state") === "on");
   const control = (el) => {
     if (!el || !visible(el)) return {found: false};
     const rect = el.getBoundingClientRect();
     return {
       found: true,
       label: textFor(el),
+      aria_pressed: el.getAttribute("aria-pressed"),
       aria_checked: el.getAttribute("aria-checked"),
       data_state: el.getAttribute("data-state"),
       value: el.getAttribute("data-tpp-toggle-value"),
@@ -3052,7 +3070,7 @@ JSON.stringify((() => {
     const role = el.getAttribute("role") || "";
     const testId = el.getAttribute("data-testid") || "";
     const inMenu = Boolean(el.closest(
-      "[role='menu'],[role='group'],[data-radix-menu-content]," +
+      "[role='menu'],[role='group'],[data-mention-section-items],[data-radix-menu-content]," +
       "[data-radix-popper-content-wrapper],.popover"
     ));
     const inComposer = Boolean(composer && composer.contains(el));
@@ -3068,7 +3086,7 @@ JSON.stringify((() => {
     let score = 0;
     if (/menuitem|option/i.test(role)) score += 80;
     if (el.closest(
-      "[role='menu'],[role='group'],[data-radix-menu-content]," +
+      "[role='menu'],[role='group'],[data-mention-section-items],[data-radix-menu-content]," +
       "[data-radix-popper-content-wrapper],.popover"
     )) score += 60;
     if (/create.*image|image.*create|generate.*image/i.test(testId)) score += 40;
@@ -4308,8 +4326,9 @@ COMPOSER_SUBMIT_STATE_JS = r"""
   const hasPromptTail = Boolean(promptTail) && editorText.includes(normalize(promptTail));
   const hasComposerText = editorText.length > 0;
   const conversationStarted = /\/c\/[^/?#]+/.test(window.location.pathname);
-  const userMessageCount = document.querySelectorAll('[data-message-author-role="user"]').length;
-  const assistantMessageCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+  const {users, assistants} = __CONVERSATION_DOM__;
+  const userMessageCount = users.length;
+  const assistantMessageCount = assistants.length;
   const buttons = root ? Array.from(root.querySelectorAll("button")).filter(visible) : [];
   const sendButton = buttons.find((button) => button.id === "composer-submit-button")
     || buttons.find((button) => button.getAttribute("data-testid") === "send-button")
@@ -4399,6 +4418,7 @@ def _composer_submit_state(
     script = (
         COMPOSER_SUBMIT_STATE_JS
         .replace("__PROMPT_TAIL__", json.dumps(prompt_tail))
+        .replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
     )
     return _eval_json(args, cwd, script, timeout=60)
 
@@ -4547,7 +4567,9 @@ def _submit_prompt(
 
 def _image_inventory(args: argparse.Namespace, cwd: Path) -> list[dict[str, Any]]:
     script = r"""
-JSON.stringify(Array.from(document.images).map((img) => {
+JSON.stringify((() => {
+const {users, assistants, turns, turnFor} = __CONVERSATION_DOM__;
+return Array.from(document.images).map((img) => {
   const src = img.currentSrc || img.src;
   const alt = img.getAttribute('alt') || '';
   const labelFor = (node) => [
@@ -4559,17 +4581,19 @@ JSON.stringify(Array.from(document.images).map((img) => {
   ].filter(Boolean).join(' ');
   const button = img.closest('button,[role="button"],a');
   const buttonLabel = labelFor(button);
-  const inGeneratedImageControl = /Generated image|生成的图片|生成图/i.test(buttonLabel) || /Generated image/i.test(alt);
-  const turnSection = img.closest('section[data-testid^="conversation-turn-"]');
+  const inGeneratedImageControl = Boolean(img.closest('[data-testid="generated-image-gallery"]'))
+    || /Generated image|生成的图片|生成图/i.test(buttonLabel) || /Generated image/i.test(alt);
+  const turnSection = turnFor(img);
   const article = img.closest('article');
   const roleNode = img.closest('[data-message-author-role]')
     || (turnSection ? turnSection.querySelector('[data-message-author-role]') : null)
     || (article ? article.querySelector('[data-message-author-role]') : null);
-  const role = roleNode ? roleNode.getAttribute('data-message-author-role') : '';
-  const turnSections = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-  const turnIndex = turnSection ? turnSections.indexOf(turnSection) : -1;
+  const role = roleNode ? roleNode.getAttribute('data-message-author-role')
+    : users.some((el) => el.contains(img)) ? 'user'
+    : assistants.some((el) => el.contains(img)) ? 'assistant' : '';
+  const turnIndex = turnSection ? turns.indexOf(turnSection) : -1;
   const messageUserTurn = turnIndex >= 0
-    ? turnSections.slice(0, turnIndex + 1).filter((candidate) => candidate.querySelector('[data-message-author-role="user"]')).length
+    ? turns.slice(0, turnIndex + 1).filter((candidate) => users.some((el) => candidate.contains(el))).length
     : 0;
   const articleText = article ? (article.innerText || article.textContent || '').slice(0, 300) : '';
   const inAssistant = role === 'assistant' || inGeneratedImageControl || /\bChatGPT said\b/i.test(articleText);
@@ -4587,14 +4611,17 @@ JSON.stringify(Array.from(document.images).map((img) => {
     alt,
     buttonLabel,
     inGeneratedImageControl,
+    conversationScopeAvailable: users.length > 0 || assistants.length > 0,
+    inNavigation: Boolean(img.closest('nav,[role="navigation"]')),
     role,
     messageUserTurn,
     inAssistant,
     inUser,
     inComposer
   };
-}))
-"""
+});
+})())
+""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
     output = _eval_js(args, cwd, script, timeout=120).strip()
     try:
         parsed = json.loads(output)
@@ -4616,7 +4643,12 @@ def _conversation_message_counts(args: argparse.Namespace, cwd: Path) -> dict[st
     counts = _eval_json(
         args,
         cwd,
-        "JSON.stringify({ userMessageCount: document.querySelectorAll('[data-message-author-role=\\\"user\\\"]').length, assistantMessageCount: document.querySelectorAll('[data-message-author-role=\\\"assistant\\\"]').length })",
+        r"""
+JSON.stringify((() => {
+  const {users, assistants} = __CONVERSATION_DOM__;
+  return {userMessageCount: users.length, assistantMessageCount: assistants.length};
+})())
+""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS),
         timeout=60,
     )
     return {
@@ -4642,7 +4674,11 @@ def _generated_image_candidates(
 ) -> list[dict[str, Any]]:
     candidates = []
     seen: set[str] = set()
-    scope_available = any(row.get("role") or row.get("inAssistant") or row.get("inUser") for row in rows)
+    scope_available = any(
+        row.get("conversationScopeAvailable") or row.get("role")
+        or row.get("inAssistant") or row.get("inUser")
+        for row in rows
+    )
     for row in rows:
         src = row.get("src") or ""
         width = int(row.get("width") or 0)
@@ -4654,7 +4690,7 @@ def _generated_image_candidates(
             and int(row.get("messageUserTurn") or 0) <= baseline_user_message_count
         ):
             continue
-        if row.get("inComposer") or row.get("inUser"):
+        if row.get("inComposer") or row.get("inUser") or row.get("inNavigation"):
             continue
         if scope_available and not row.get("inAssistant"):
             continue

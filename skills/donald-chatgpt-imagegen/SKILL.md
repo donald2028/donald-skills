@@ -181,10 +181,13 @@ either a downloaded result or an explicit handoff, not a silent wait or abandonm
 `references/output-contract.md` for the full status-to-action mapping.
 
 For every fresh submission, the runner first selects and verifies the top-level `Chat` surface,
-never `Work`, using ChatGPT's `Select chat surface` control. It then explicitly selects ChatGPT's
+never `Work`, using ChatGPT's `Composer mode` button group (`aria-pressed`) or the older
+`Select chat surface` radio group (`aria-checked`/`data-state`). Merely seeing Chat and Work labels
+does not prove which surface is selected. It then explicitly selects ChatGPT's
 `Create image` mode and verifies the selected composer token or image-prompt surface before it
 uploads references or sends the prompt. It opens `Add files and more` first when the Create image
-control is nested in that menu. Visible page-level errors such as `Failed to load subscription`,
+control is nested in that menu, including the newer sectioned suggestion list. Visible page-level
+errors such as `Failed to load subscription`,
 `Something went wrong`, or network/load failures are pre-submit recovery signals. A temporarily
 missing Create image control is also recoverable because ChatGPT may omit the tool while such an
 error is active; reload and replay the complete preparation transaction within the normal bounded
@@ -212,6 +215,9 @@ During generation the runner records a structured page-health observation every 
 the compact latest-turn excerpt, and any recognized current-turn error text, visible error surface,
 or Retry control. Deep page-health inspection runs on that heartbeat, not on the shorter
 candidate-collection loop.
+Message counts and generated-image ownership support both legacy author-role markers and the newer
+turn-key, user-bubble, and assistant-heading structure. A missing legacy marker alone is not
+evidence that the submitted turn disappeared.
 Page recovery is state-aware and bounded (three attempts by default):
 
 - before submission, a confirmed page failure reopens ChatGPT and replays the complete preparation
