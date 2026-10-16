@@ -153,7 +153,7 @@ def validate_reference_contract(
         )
 
     canonical_model_map: list[dict[str, Any]] = []
-    for upload, entry in zip(reference_images, model_reference_map, strict=True):
+    for upload, entry in zip(reference_images, model_reference_map):
         index = int(entry["index"])
         canonical: dict[str, Any] = {"index": index}
         missing = [field for field in MODEL_REFERENCE_FIELDS if not _normalized_text(entry.get(field))]

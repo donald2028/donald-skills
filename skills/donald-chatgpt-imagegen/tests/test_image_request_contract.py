@@ -514,6 +514,26 @@ Create an image.
         )
         self.assertEqual(result["verification"]["placeholderText"], "Create image")
 
+    def test_disabled_create_image_stops_without_page_recovery(self) -> None:
+        with (
+            mock.patch.object(runner, "_image_mode_state", return_value={"selected": False}),
+            mock.patch.object(runner, "_find_create_image_control", return_value={"found": False}),
+            mock.patch.object(
+                runner, "_find_image_mode_add_menu_control",
+                return_value={"found": True, "expanded": False, "x": 10, "y": 10},
+            ),
+            mock.patch.object(
+                runner, "_poll_for_create_image_control",
+                return_value={"found": False, "disabled": True, "label": "Create image"},
+            ),
+            mock.patch.object(runner, "_dispatch_owned_tab_click", return_value=True) as click,
+            mock.patch.object(runner, "_poll_for_image_mode_selection") as poll,
+            self.assertRaisesRegex(runner.ImageModeSelectionError, "disabled"),
+        ):
+            runner._enable_image_mode_if_available(argparse.Namespace(), Path.cwd(), "")
+        self.assertEqual(click.call_count, 1)
+        poll.assert_not_called()
+
     def test_create_image_ui_contract_supports_current_plus_menu_and_placeholder(self) -> None:
         self.assertIn("data-placeholder", runner.IMAGE_MODE_STATE_JS)
         self.assertIn("aria-placeholder", runner.IMAGE_MODE_STATE_JS)

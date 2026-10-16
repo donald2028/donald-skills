@@ -3066,6 +3066,8 @@ JSON.stringify((() => {
   }).filter((el) => {
     if (seen.has(el)) return false;
     seen.add(el);
+    if (el.closest("[data-sidebar-chatgpt-conversation-key],[disabled],[aria-disabled='true']")
+        || el.matches("a[href^='/c/']")) return false;
     const label = textFor(el);
     const role = el.getAttribute("role") || "";
     const testId = el.getAttribute("data-testid") || "";
@@ -3096,7 +3098,15 @@ JSON.stringify((() => {
   }).sort((a, b) => b.score - a.score);
   const choice = scored[0];
   const control = choice?.el;
-  if (!control) return {found: false};
+  if (!control) {
+    const disabled = Array.from(document.querySelectorAll("[disabled],[aria-disabled='true']"))
+      .filter(visible).find((el) => imageAction.test(textFor(el))
+        && textFor(el).length <= 240
+        && el.closest("[role='menu'],[data-mention-section-items],[data-radix-menu-content],.popover"));
+    return disabled
+      ? {found: false, disabled: true, label: textFor(disabled)}
+      : {found: false};
+  }
   const rect = control.getBoundingClientRect();
   return {
     found: true,
@@ -3183,7 +3193,7 @@ def _poll_for_create_image_control(
     last = {"found": False}
     for attempt in range(max(1, attempts)):
         last = _find_create_image_control(args, cwd)
-        if last.get("found"):
+        if last.get("found") or last.get("disabled"):
             return last
         if attempt + 1 < attempts:
             _wait_ms(args, cwd, 250)
@@ -3244,6 +3254,11 @@ def _enable_image_mode_if_available(
             )
             selected_label = str(menu_choice.get("label") or "")
 
+    if direct.get("disabled") or menu_choice.get("disabled"):
+        raise ImageModeSelectionError(
+            "ChatGPT Create image control is disabled in the current session; "
+            "image generation cannot be selected."
+        )
     if clicked:
         _wait_ms(args, cwd, 250)
     verification = _poll_for_image_mode_selection(args, cwd)
@@ -3999,7 +4014,6 @@ def _upload_references_in_order(
                 for path, (_, label) in zip(
                     references,
                     indexed_labels[: len(references)],
-                    strict=True,
                 )
             )
         )

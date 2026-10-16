@@ -102,6 +102,31 @@ class BrowserDomTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_create_image_ignores_sidebar_conversation_titles(self) -> None:
+        sidebar = (
+            '<div data-sidebar-chatgpt-conversation-key="chatgpt:conversation:old" role="listitem">'
+            '<div role="group"><a aria-label="Generate image" href="/c/old">'
+            'Generate image</a></div></div>'
+        )
+        self.load_html(sidebar)
+        self.assertFalse(runner._find_create_image_control(self.args, self.cwd)["found"])
+        self.load_html(
+            sidebar + '<div data-mention-section-items="true"><button>Create image</button></div>'
+        )
+        control = runner._find_create_image_control(self.args, self.cwd)
+        self.assertTrue(control["found"])
+        self.assertIn("Create image", control["label"])
+
+    def test_create_image_reports_disabled_menu_entry(self) -> None:
+        self.load_html(
+            '<div data-mention-section-items="true">'
+            '<div aria-disabled="true"><div data-menu-row-content="true">'
+            '<span>Create image</span></div></div></div>'
+        )
+        control = runner._find_create_image_control(self.args, self.cwd)
+        self.assertFalse(control["found"])
+        self.assertTrue(control.get("disabled"))
+
     def test_conversation_counts_health_and_current_turn_images(self) -> None:
         source = (
             "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
