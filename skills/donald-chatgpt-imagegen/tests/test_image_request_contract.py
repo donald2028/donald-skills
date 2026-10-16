@@ -407,6 +407,24 @@ Create an image.
 
         self.assertEqual(raised.exception.failure["error_type"], "reference_upload_order_mismatch")
 
+    def test_current_attachment_filenames_prove_order_and_reject_swapped_cards(self) -> None:
+        references = ["/refs/one.png", "/refs/two.png"]
+        for names, expected in [(["one(2).png", "two.png"], True), (["two.png", "one.png"], False)]:
+            with (
+                self.subTest(names=names),
+                mock.patch.object(runner, "_upload_files"),
+                mock.patch.object(runner, "_wait_for_reference_uploads_ready", side_effect=[
+                    {"attachment_count": 1, "ready": True, "attachment_filenames": ["one(2).png"]},
+                    {"attachment_count": 2, "ready": True, "attachment_filenames": names},
+                ]),
+            ):
+                if expected:
+                    result = runner._upload_references_in_order(argparse.Namespace(), Path.cwd(), references)
+                    self.assertTrue(result["attachment_label_order_verified"])
+                else:
+                    with self.assertRaises(runner.ReferenceUploadError):
+                        runner._upload_references_in_order(argparse.Namespace(), Path.cwd(), references)
+
     def test_run_summary_keeps_upload_and_model_reference_audits_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             ordered_paths = ["C:/refs/style.png", "C:/refs/identity.png"]

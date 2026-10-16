@@ -186,6 +186,7 @@ class PageRecoveryTests(unittest.TestCase):
             upload_ready = {
                 "reference_count": 1,
                 "blob_image_count": 1,
+                "attachment_count": 1,
                 "filename_mentions": {"reference.png": True},
                 "ready": True,
             }

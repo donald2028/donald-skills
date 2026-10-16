@@ -3794,6 +3794,9 @@ def _wait_ms(args: argparse.Namespace, cwd: Path, milliseconds: int) -> None:
     _call_agent(args, cwd, ["wait", str(milliseconds)], timeout=60)
 
 
+REFERENCE_FILE_INPUT_SELECTOR = "input[type='file']:not(:disabled):not([capture])"
+
+
 def _upload_files(args: argparse.Namespace, cwd: Path, references: list[str]) -> None:
     if not references:
         return
@@ -3805,18 +3808,38 @@ def _upload_files(args: argparse.Namespace, cwd: Path, references: list[str]) ->
         try:
             with _CDPConnection.connect(_owned_tab_cdp_url(args), timeout=180) as conn:
                 conn.call("DOM.enable")
-                root = conn.call("DOM.getDocument", {"depth": -1, "pierce": True})
-                root_id = (root.get("root") or {}).get("nodeId")
-                node = conn.call("DOM.querySelector", {"nodeId": root_id, "selector": "input[type=file]"})
-                node_id = node.get("nodeId")
-                if not node_id:
-                    raise RuntimeError("file input not found")
+                deadline = time.monotonic() + 30
+                while True:
+                    root = conn.call("DOM.getDocument", {"depth": -1, "pierce": True})
+                    root_id = (root.get("root") or {}).get("nodeId")
+                    node = conn.call("DOM.querySelector", {
+                        "nodeId": root_id, "selector": REFERENCE_FILE_INPUT_SELECTOR,
+                    })
+                    node_id = node.get("nodeId")
+                    if node_id:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RecoverablePageError("No enabled attachment file input became available")
+                    time.sleep(1)
                 conn.call("DOM.setFileInputFiles", {"nodeId": node_id, "files": references})
             return
+        except RecoverablePageError:
+            raise
         except Exception as error:
             args._owned_tab_cdp_error = f"{type(error).__name__}: {error}"
             raise RuntimeError(f"Owned CDP file upload failed without using focus-stealing fallback: {error}") from error
-    _call_agent(args, cwd, ["upload", "input[type=file]", *references], timeout=180)
+    _call_agent(args, cwd, ["upload", REFERENCE_FILE_INPUT_SELECTOR, *references], timeout=180)
+
+
+def _attachment_name_matches(path: str, label: str) -> bool:
+    filename = re.sub(r"^Remove file\s+\d+:\s*", "", label, flags=re.IGNORECASE).strip()
+    actual = Path(filename)
+    expected = Path(path)
+    if actual.name.casefold() == expected.name.casefold():
+        return True
+    # ChatGPT may append a numeric suffix when the same reference was uploaded before.
+    stem = re.sub(r"\(\d+\)$", "", actual.stem).rstrip()
+    return stem.casefold() == expected.stem.casefold() and actual.suffix.casefold() == expected.suffix.casefold()
 
 
 def _reference_upload_observation(
@@ -3826,17 +3849,6 @@ def _reference_upload_observation(
 ) -> dict[str, Any]:
     page_text = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
     failure = _reference_upload_failure(page_text, references)
-    try:
-        rows = _image_inventory(args, cwd)
-    except Exception:
-        rows = []
-    image_urls = sorted(
-        {
-            str(row.get("src") or "")
-            for row in rows
-            if str(row.get("src") or "").startswith("blob:https://chatgpt.com/")
-        }
-    )
     filenames = [Path(path).name for path in references]
     attachment_state: dict[str, Any] = {}
     if _owned_tab_cdp_url(args):
@@ -3851,18 +3863,31 @@ JSON.stringify((() => {
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
-  const buttons = Array.from(document.querySelectorAll("button,[role='button']")).filter(visible);
+  const editor = Array.from(document.querySelectorAll("[contenteditable='true']")).find(visible);
+  const composer = editor?.closest("form");
+  if (!composer) return {};
+  const buttons = Array.from(composer.querySelectorAll("button,[role='button']")).filter(visible);
   const removeLabels = buttons
     .map((el) => el.getAttribute("aria-label") || "")
     .filter((label) => /^Remove file\s+\d+:/i.test(label));
   const uploadedImageLabels = buttons
     .map((el) => el.getAttribute("aria-label") || "")
     .filter((label) => /^Open image:\s*User uploaded image/i.test(label));
+  const cards = Array.from(composer.querySelectorAll(
+    "[data-composer-attachments] [role='button'][aria-label]"
+  )).filter((el) => visible(el) && el.querySelector("img"));
   return {
     removeFileCount: removeLabels.length,
     removeFileLabels: removeLabels,
-    uploadedImagePreviewCount: uploadedImageLabels.length,
+    uploadedImagePreviewCount: Math.max(uploadedImageLabels.length, cards.length),
     uploadedImagePreviewLabels: uploadedImageLabels,
+    attachmentFilenames: cards.map((el) => el.getAttribute("aria-label")),
+    pendingAttachmentCount: Array.from(composer.querySelectorAll(
+      "[role='progressbar'],[aria-busy='true']"
+    )).filter(visible).length,
+    blobImageUrls: Array.from(composer.querySelectorAll("img")).filter(visible)
+      .map((el) => el.currentSrc || el.src)
+      .filter((src) => src.startsWith("blob:https://chatgpt.com/")),
   };
 })())
 """.strip(),
@@ -3871,6 +3896,9 @@ JSON.stringify((() => {
         except Exception:
             attachment_state = {}
     attachment_labels = [str(label) for label in attachment_state.get("removeFileLabels") or []]
+    attachment_filenames = [str(name) for name in attachment_state.get("attachmentFilenames") or []]
+    pending_count = int(attachment_state.get("pendingAttachmentCount") or 0)
+    image_urls = sorted(set(attachment_state.get("blobImageUrls") or []))
     attachment_count = max(
         int(attachment_state.get("removeFileCount") or 0),
         int(attachment_state.get("uploadedImagePreviewCount") or 0),
@@ -3879,7 +3907,8 @@ JSON.stringify((() => {
         filename: (
             filename in page_text
             or Path(filename).stem in page_text
-            or any(filename in label or Path(filename).stem in label for label in attachment_labels)
+            or any(_attachment_name_matches(filename, label)
+                   for label in attachment_labels + attachment_filenames)
         )
         for filename in filenames
     }
@@ -3891,9 +3920,11 @@ JSON.stringify((() => {
         "blob_image_urls": image_urls,
         "attachment_count": attachment_count,
         "attachment_labels": attachment_labels,
+        "attachment_filenames": attachment_filenames,
+        "pending_attachment_count": pending_count,
         "uploaded_image_preview_count": int(attachment_state.get("uploadedImagePreviewCount") or 0),
         "filename_mentions": filename_mentions,
-        "ready": attachment_count >= len(references) or len(image_urls) >= len(references),
+        "ready": attachment_count >= len(references) and pending_count == 0,
     }
 
 
@@ -3974,11 +4005,8 @@ def _upload_references_in_order(
             cwd,
             references[:index],
         )
-        observed_count = max(
-            int(final_observation.get("attachment_count") or 0),
-            int(final_observation.get("blob_image_count") or 0),
-        )
-        if observed_count < index:
+        observed_count = int(final_observation.get("attachment_count") or 0)
+        if observed_count != index:
             raise RecoverablePageError(
                 "Sequential reference upload did not produce a monotonic attachment count: "
                 f"Reference Image {index}, observed_count={observed_count}"
@@ -4003,33 +4031,40 @@ def _upload_references_in_order(
         match = re.match(r"^Remove file\s+(\d+):\s*(.+)$", label, re.IGNORECASE)
         if match:
             indexed_labels.append((int(match.group(1)), match.group(2)))
-    if len(indexed_labels) >= len(references):
+    attachment_filenames = final_observation.get("attachment_filenames") or []
+    if attachment_filenames:
+        attachment_label_order_verified = (
+            len(attachment_filenames) == len(references)
+            and all(_attachment_name_matches(path, label)
+                    for path, label in zip(references, attachment_filenames))
+        )
+    elif len(indexed_labels) >= len(references):
         indexed_labels.sort(key=lambda item: item[0])
         expected_indices = list(range(1, len(references) + 1))
         attachment_label_order_verified = (
             [index for index, _ in indexed_labels[: len(references)]] == expected_indices
             and all(
-                Path(path).name.casefold() in label.casefold()
-                or Path(path).stem.casefold() in label.casefold()
+                _attachment_name_matches(path, label)
                 for path, (_, label) in zip(
                     references,
                     indexed_labels[: len(references)],
                 )
             )
         )
-        if not attachment_label_order_verified:
-            raise ReferenceUploadError(
-                {
-                    "status": "reference_upload_failed",
-                    "error_type": "reference_upload_order_mismatch",
-                    "retryable": True,
-                    "terminal": True,
-                    "recommended_next_action": "rerun_same_job_after_inspecting_upload_trace",
-                    "reason": "Visible ChatGPT attachment labels do not match manifest array order",
-                    "expected_upload_order": list(enumerate(references, start=1)),
-                    "observed_attachment_labels": attachment_labels,
-                }
-            )
+    if attachment_label_order_verified is False:
+        raise ReferenceUploadError(
+            {
+                "status": "reference_upload_failed",
+                "error_type": "reference_upload_order_mismatch",
+                "retryable": True,
+                "terminal": True,
+                "recommended_next_action": "rerun_same_job_after_inspecting_upload_trace",
+                "reason": "Visible ChatGPT attachment labels do not match manifest array order",
+                "expected_upload_order": list(enumerate(references, start=1)),
+                "observed_attachment_labels": attachment_labels,
+                "observed_attachment_filenames": attachment_filenames,
+            }
+        )
 
     return {
         **final_observation,

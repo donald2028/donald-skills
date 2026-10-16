@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -126,6 +127,49 @@ class BrowserDomTests(unittest.TestCase):
         control = runner._find_create_image_control(self.args, self.cwd)
         self.assertFalse(control["found"])
         self.assertTrue(control.get("disabled"))
+
+    def test_current_reference_cards_wait_for_upload_and_ignore_other_images(self) -> None:
+        self.load_html(
+            '<nav><img src="blob:https://chatgpt.com/unrelated" width="100" height="100"></nav>'
+            '<form><div contenteditable="true">Create image</div>'
+            '<div data-composer-attachments><div class="composer-attachment-surface" '
+            'role="button" aria-label="reference(2).png">'
+            '<img alt="reference(2).png" width="100" height="100">'
+            '<span role="progressbar" aria-label="Uploading reference(2).png">Uploading</span>'
+            '<button aria-label="Remove reference(2).png">Remove</button>'
+            '</div></div></form>'
+        )
+        observation = runner._reference_upload_observation(self.args, self.cwd, ["/refs/reference.png"])
+        self.assertFalse(observation["ready"])
+        self.assertEqual(observation["attachment_count"], 1)
+        self.assertTrue(observation["filename_mentions"]["reference.png"])
+        runner._eval_js(self.args, self.cwd, "document.querySelector('[role=progressbar]').remove()")
+        observation = runner._reference_upload_observation(self.args, self.cwd, ["/refs/reference.png"])
+        self.assertTrue(observation["ready"])
+        self.assertEqual(observation["attachment_filenames"], ["reference(2).png"])
+        self.assertEqual(observation["blob_image_count"], 0)
+        runner._eval_js(self.args, self.cwd, "document.querySelector('[data-composer-attachments]').remove()")
+        self.assertFalse(
+            runner._reference_upload_observation(self.args, self.cwd, ["/refs/reference.png"])["ready"]
+        )
+
+    def test_reference_upload_selects_enabled_non_camera_input(self) -> None:
+        self.load_html(
+            '<form><div contenteditable="true"></div>'
+            '<input type="file" capture="environment" aria-label="Take a photo">'
+            '<input type="file" disabled aria-label="Unavailable">'
+            '<input type="file" multiple aria-label="Attach files"></form>'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            reference = Path(temporary) / "reference.png"
+            reference.write_bytes(b"test upload selection")
+            runner._upload_files(self.args, self.cwd, [str(reference)])
+            result = runner._eval_json(
+                self.args, self.cwd,
+                "JSON.stringify({names:Array.from(document.querySelectorAll('input')).map(el=>"
+                "Array.from(el.files).map(file=>file.name))})",
+            )
+        self.assertEqual(result["names"], [[], [], ["reference.png"]])
 
     def test_conversation_counts_health_and_current_turn_images(self) -> None:
         source = (
