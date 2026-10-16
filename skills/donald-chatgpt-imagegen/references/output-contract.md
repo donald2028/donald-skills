@@ -95,6 +95,10 @@ Important terminal or recoverable states include:
   inspection or `collect-current` after resolution rather than a new submission. A homepage
   observation must not overwrite an existing committed conversation URL in session state.
 
+Temporary-to-canonical conversation migration requires both a post-submission user-message count
+and the full submitted prompt in the latest user turn. Record that evidence before replacing the
+session URL; message counts alone must not authorize an unrelated conversation change.
+
 ## Caller Recovery Contract
 
 A nonzero runner exit is not, by itself, a final workflow decision. The caller must read the final

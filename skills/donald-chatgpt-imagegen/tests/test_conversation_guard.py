@@ -33,6 +33,7 @@ class ConversationGuardTests(unittest.TestCase):
 
     def test_accepts_verified_temporary_to_canonical_url_migration(self) -> None:
         with (
+            mock.patch.object(runner, "_eval_json", return_value={"latestUserText": "Create a fox"}),
             mock.patch.object(
                 runner,
                 "_current_url",
@@ -46,7 +47,7 @@ class ConversationGuardTests(unittest.TestCase):
             mock.patch.object(runner, "_open_conversation") as reopen,
         ):
             event = runner._ensure_expected_conversation(
-                argparse.Namespace(),
+                argparse.Namespace(_submitted_prompt="Create a fox"),
                 Path.cwd(),
                 "https://chatgpt.com/c/WEB:temporary-id",
                 baseline_user_message_count=0,
@@ -55,6 +56,28 @@ class ConversationGuardTests(unittest.TestCase):
         self.assertTrue(event["canonicalized"])
         self.assertFalse(event["restored"])
         reopen.assert_not_called()
+
+    def test_local_url_migration_requires_same_submitted_prompt(self) -> None:
+        for observed_text, accepted in [("@Create image Create a fox", True), ("Create a bear", False)]:
+            with (
+                self.subTest(observed_text=observed_text),
+                mock.patch.object(runner, "_current_url", return_value="https://chatgpt.com/c/canonical"),
+                mock.patch.object(runner, "_conversation_message_counts", return_value={"user_message_count": 1}),
+                mock.patch.object(runner, "_eval_json", return_value={"latestUserText": observed_text}),
+                mock.patch.object(runner, "_page_access_state", return_value={}),
+                mock.patch.object(runner, "_open_conversation", return_value="https://chatgpt.com/") as reopen,
+            ):
+                args = argparse.Namespace(_submitted_prompt="Create a fox")
+                if accepted:
+                    event = runner._ensure_expected_conversation(args, Path.cwd(),
+                        "https://chatgpt.com/c/local-chatgpt%3A2583e128-6356-4f31-955d-aa1c79b9f858", 0)
+                    self.assertTrue(event["canonicalized"])
+                    self.assertEqual(event["canonicalization_evidence"], "submitted_prompt_matches_latest_user_turn")
+                    reopen.assert_not_called()
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "conversation changed"):
+                        runner._ensure_expected_conversation(args, Path.cwd(),
+                            "https://chatgpt.com/c/local-chatgpt%3Atest", 0)
 
     def test_does_not_accept_unverified_conversation_change(self) -> None:
         with (

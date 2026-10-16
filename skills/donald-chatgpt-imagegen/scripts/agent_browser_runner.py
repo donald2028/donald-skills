@@ -2214,15 +2214,25 @@ def _ensure_expected_conversation(
             baseline_user_message_count is not None
             and message_counts["user_message_count"] > baseline_user_message_count
         ):
-            event.update(
-                {
-                    "canonicalized": True,
-                    "restore_reason": "temporary_conversation_url_canonicalized",
-                    "previous_conversation_id": expected_id,
-                    "message_counts": message_counts,
-                }
-            )
-            return event
+            expected_prompt = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
+            observed = _eval_json(args, cwd, r"""
+JSON.stringify((() => {
+  const {users} = __CONVERSATION_DOM__;
+  return {latestUserText: users.length ? users[users.length - 1].textContent : ""};
+})())
+""".strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)) if expected_prompt else {}
+            latest_user_text = " ".join(str(observed.get("latestUserText") or "").split())
+            if expected_prompt and expected_prompt in latest_user_text:
+                event.update(
+                    {
+                        "canonicalized": True,
+                        "restore_reason": "temporary_conversation_url_canonicalized",
+                        "previous_conversation_id": expected_id,
+                        "message_counts": message_counts,
+                        "canonicalization_evidence": "submitted_prompt_matches_latest_user_turn",
+                    }
+                )
+                return event
 
     access_state = _page_access_state(args, cwd)
     if access_state.get("humanReason"):
@@ -6247,6 +6257,7 @@ def _run_one_request(
 ) -> dict[str, Any]:
     trace_dir = _trace_dir_for_label(job, label)
     args._active_request_label = label
+    args._submitted_prompt = message
     trace_dir.mkdir(parents=True, exist_ok=True)
     is_followup = conversation_session_path is not None
     submit_mode = (
@@ -6267,7 +6278,8 @@ def _run_one_request(
     existing_conversation_url = existing_session.get("conversation_url")
     if existing_conversation_url:
         _validate_session_reference_mapping(job, existing_session)
-        conversation_url = _open_conversation(args, cwd, existing_conversation_url)
+        _open_conversation(args, cwd, existing_conversation_url)
+        conversation_url = existing_conversation_url
         _wait_until_idle(args, cwd)
         chat_surface = _ensure_chat_surface(
             args,
@@ -6768,6 +6780,7 @@ def run_conversation_followup(args: argparse.Namespace, job: dict[str, Any], cwd
 
 
 def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    args._submitted_prompt = str(job.get("chatgpt_message") or job.get("chatgpt_batch_message") or "")
     trace_dir = Path(job["download_dir"]) / "agent_browser_trace_collect"
     trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6787,9 +6800,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
             "conversation_url exists in chatgpt_session.json or chatgpt_web_run_summary.json"
         )
     if _conversation_id_from_url(current_url) != _conversation_id_from_url(target_conversation_url):
-        conversation_url = _open_conversation(args, cwd, target_conversation_url)
-    else:
-        conversation_url = current_url
+        _open_conversation(args, cwd, target_conversation_url)
+    conversation_url = target_conversation_url
     _screenshot(args, cwd, trace_dir / "01_current_page.png")
     references = [ref["path"] for ref in job.get("reference_images", [])]
     expected_count = _expected_image_count(job, "batch")
@@ -6802,7 +6814,10 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     conversation_guard: dict[str, Any] | None = None
     conversation_restores: list[dict[str, Any]] = []
     while time.time() < deadline:
-        conversation_guard = _ensure_expected_conversation(args, cwd, conversation_url)
+        conversation_guard = _ensure_expected_conversation(
+            args, cwd, conversation_url, existing_session.get("baseline_user_message_count"),
+        )
+        conversation_url = _persist_canonical_conversation(job, "batch", conversation_guard, conversation_url) or conversation_url
         if conversation_guard.get("restored"):
             conversation_restores.append(conversation_guard)
         page_text = _page_text(args, cwd)
