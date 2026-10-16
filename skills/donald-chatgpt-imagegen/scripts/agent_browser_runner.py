@@ -1567,6 +1567,16 @@ def _write_session_patch(job: dict[str, Any], patch: dict[str, Any]) -> dict[str
     label = patch.get("label", "batch")
     path = _session_path(job, label)
     previous = _read_json_if_exists(path) or {}
+    patch = dict(patch)
+    previous_url = str(previous.get("conversation_url") or "")
+    if (previous.get("submission_committed") is True
+            and patch.get("submission_committed", True) is True
+            and _conversation_id_from_url(previous_url)
+            and "conversation_url" in patch
+            and not _conversation_id_from_url(str(patch.get("conversation_url") or ""))):
+        patch["observed_page_url"] = patch["conversation_url"]
+        patch["conversation_url"] = previous_url
+        patch["conversation_id"] = _conversation_id_from_url(previous_url)
     attempts = previous.get("attempts") or []
     if patch.get("attempt"):
         attempts = [*attempts, patch["attempt"]]
@@ -1584,6 +1594,8 @@ def _write_session_patch(job: dict[str, Any], patch: dict[str, Any]) -> dict[str
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     session.pop("attempt", None)
+    if session.get("submission_committed") is True and _conversation_id_from_url(str(session.get("conversation_url") or "")):
+        session.setdefault("initial_committed_conversation_url", session["conversation_url"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return session
@@ -1938,11 +1950,11 @@ JSON.stringify((() => {
   const hasComposer = Array.from(document.querySelectorAll('[contenteditable="true"]')).some(visible);
   const challengeFrame = Array.from(document.querySelectorAll('iframe'))
     .some((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
-  const pageText = (document.body?.innerText || "").slice(0, 6000).toLowerCase();
+  const pageText = (document.body?.innerText || "").toLowerCase();
   const challengeText = [
     "verify you are human", "verifying you are human", "confirm you are human",
     "checking your browser before accessing", "performing security verification",
-    "complete the security check", "complete the challenge", "cloudflare ray id",
+    "complete the security check", "complete the challenge", "cloudflare ray id", "cloudflare_challenge",
     "验证码", "安全验证", "人机验证", "验证您是真人"
   ].some((marker) => pageText.includes(marker));
   return {
@@ -1991,6 +2003,11 @@ JSON.stringify((() => {
         }
     if not generation_error and not scoped_error_text:
         generation_error = _generation_error_from_text(page_text)
+    human_reason = str(observation.get("humanReason") or "")
+    if observation.get("challengeFrame") or "cloudflare_challenge" in scoped_error_text.lower():
+        human_reason = "anti_automation_verification"
+    if human_reason:
+        generation_error = None
     conversation_ok = bool(
         current_id
         and (
@@ -1999,14 +2016,14 @@ JSON.stringify((() => {
             or (_temporary_conversation_id(expected_id) and not _temporary_conversation_id(current_id))
         )
     )
-    status = "generation_error" if generation_error else ("ok" if conversation_ok else "unexpected_page")
+    status = "needs_ops" if human_reason else ("generation_error" if generation_error else ("ok" if conversation_ok else "unexpected_page"))
     return {
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "status": status,
         "conversation_ok": conversation_ok,
         "has_composer": bool(observation.get("hasComposer")),
         "challenge_frame": bool(observation.get("challengeFrame")),
-        "human_reason": str(observation.get("humanReason") or ""),
+        "human_reason": human_reason,
         "user_message_count": max(0, int(observation.get("userMessageCount") or 0)),
         "assistant_message_count": max(0, int(observation.get("assistantMessageCount") or 0)),
         "generation_active": _is_busy(page_text),
@@ -2069,7 +2086,7 @@ def _conversation_href_from_url(url: str) -> str | None:
 
 
 def _temporary_conversation_id(conversation_id: str | None) -> bool:
-    return bool(conversation_id and conversation_id.startswith("WEB:"))
+    return urllib.parse.unquote(conversation_id or "").startswith(("WEB:", "local-chatgpt:"))
 
 
 def _current_url(args: argparse.Namespace, cwd: Path) -> str:
@@ -2207,6 +2224,9 @@ def _ensure_expected_conversation(
             )
             return event
 
+    access_state = _page_access_state(args, cwd)
+    if access_state.get("humanReason"):
+        _activate_for_human_attention(args, str(access_state["humanReason"]))
     restored_url = _open_conversation(args, cwd, expected_conversation_url)
     restored_id = _conversation_id_from_url(restored_url)
     event.update(
@@ -2306,6 +2326,9 @@ def _refresh_expected_conversation(
 
 
 def _click_try_again(args: argparse.Namespace, cwd: Path) -> bool:
+    access_state = _page_access_state(args, cwd)
+    if access_state.get("humanReason"):
+        _activate_for_human_attention(args, str(access_state["humanReason"]))
     if _owned_tab_cdp_url(args):
         script = r"""
 (() => {
@@ -3407,7 +3430,7 @@ JSON.stringify((() => {
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
   const hasPrompt = Array.from(document.querySelectorAll("[contenteditable='true']")).some(visible);
-  const rawText = (document.body?.innerText || "").slice(0, 6000);
+  const rawText = document.body?.innerText || "";
   const text = rawText.toLowerCase();
   const loginPath = /\/(auth\/)?(login|signin)(\/|$)/i.test(location.pathname);
   const loginControl = Array.from(document.querySelectorAll("a,button"))
@@ -3418,7 +3441,7 @@ JSON.stringify((() => {
   const challengeText = [
     "verify you are human", "verifying you are human", "confirm you are human",
     "checking your browser before accessing", "performing security verification",
-    "complete the security check", "complete the challenge", "cloudflare ray id",
+    "complete the security check", "complete the challenge", "cloudflare ray id", "cloudflare_challenge",
     "验证码", "安全验证", "人机验证", "验证您是真人"
   ].some((marker) => text.includes(marker));
   let humanReason = "";
@@ -3473,6 +3496,7 @@ def _page_access_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
             "verifying you are human",
             "captcha",
             "turnstile",
+            "cloudflare_challenge",
             "security check",
             "人机验证",
             "安全验证",
@@ -6222,6 +6246,7 @@ def _run_one_request(
     conversation_session_path: Path | None = None,
 ) -> dict[str, Any]:
     trace_dir = _trace_dir_for_label(job, label)
+    args._active_request_label = label
     trace_dir.mkdir(parents=True, exist_ok=True)
     is_followup = conversation_session_path is not None
     submit_mode = (
@@ -6784,6 +6809,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         detected_generation_error = _generation_error_from_text(page_text)
         if detected_generation_error:
             page_health = _generation_page_health(args, cwd, conversation_url, page_text)
+            if page_health.get("human_reason") or page_health.get("challenge_frame"):
+                _activate_for_human_attention(args, str(page_health.get("human_reason") or "anti_automation_verification"))
             detected_generation_error = page_health.get("generation_error") or detected_generation_error
             _emit_progress(
                 job,
@@ -6799,6 +6826,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         candidates = _generated_image_candidates(rows, set())
         if time.time() >= next_progress_at:
             page_health = _generation_page_health(args, cwd, conversation_url, page_text)
+            if page_health.get("human_reason") or page_health.get("challenge_frame"):
+                _activate_for_human_attention(args, str(page_health.get("human_reason") or "anti_automation_verification"))
             detected_generation_error = page_health.get("generation_error")
             _emit_progress(
                 job,
@@ -7235,16 +7264,23 @@ def main() -> int:
         }
         exit_code = 2
     except HumanAttentionRequired as error:
+        label = getattr(args, "_active_request_label", "batch")
+        session = _read_json_if_exists(_session_path(job, label)) or {}
         report = {
             "status": "needs_ops",
             "error_type": "human_attention_required",
             "reason": error.reason,
-            "retryable": True,
+            "retryable": False,
             "terminal": False,
             "browser_activation": error.activation,
             "verification_must_be_completed_by_human": True,
-            "next": "Complete the login or verification in the active Chrome window, then rerun the job.",
+            "submission_committed": session.get("submission_committed", "unknown"),
+            "conversation_url": session.get("conversation_url"),
+            "initial_committed_conversation_url": session.get("initial_committed_conversation_url"),
+            "recommended_next_action": "resolve_verification_then_inspect_or_collect_current",
+            "next": "Inspect the service verification in Chrome. After human resolution, inspect the saved submission state and collect the committed conversation before any new request.",
         }
+        _write_session_patch(job, {**report, "label": label})
         exit_code = 2
     except (TimeoutError, RuntimeError, OSError, subprocess.SubprocessError) as error:
         report = {

@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -170,6 +171,25 @@ class BrowserDomTests(unittest.TestCase):
                 "Array.from(el.files).map(file=>file.name))})",
             )
         self.assertEqual(result["names"], [[], [], ["reference.png"]])
+
+    def test_visible_cloudflare_error_without_frame_blocks_retry_after_long_prompt(self) -> None:
+        self.load_html(
+            '<div data-message-author-role="user">' + 'Long prompt ' * 800 + '</div>'
+            '<div data-message-author-role="assistant"><div role="alert">cloudflare_challenge</div>'
+            '<button onclick="document.body.dataset.retried=1">Retry</button></div>'
+            '<form><div contenteditable="true">Ask ChatGPT</div></form>'
+        )
+        state = runner._page_access_state(self.args, self.cwd)
+        self.assertEqual(state["humanReason"], "anti_automation_verification")
+        health = runner._generation_page_health(self.args, self.cwd, None, runner._page_text(self.args, self.cwd))
+        self.assertEqual(health["human_reason"], "anti_automation_verification")
+        with (
+            mock.patch.object(runner, "_activate_for_human_attention",
+                              side_effect=runner.HumanAttentionRequired("anti_automation_verification", {})),
+            self.assertRaises(runner.HumanAttentionRequired),
+        ):
+            runner._click_try_again(self.args, self.cwd)
+        self.assertNotEqual(runner._eval_js(self.args, self.cwd, "document.body.dataset.retried || ''"), "1")
 
     def test_conversation_counts_health_and_current_turn_images(self) -> None:
         source = (

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +25,35 @@ class PromptGateTests(unittest.TestCase):
             "login_required",
             {"status": "active"},
         )
+
+    def test_needs_ops_report_preserves_committed_state_for_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {"job_name": "challenge", "prompt_card": "prompt.md", "download_dir": temporary}
+            manifest = Path(temporary) / "job.json"
+            manifest.write_text(json.dumps(job))
+            url = "https://chatgpt.com/c/local-chatgpt%3Atest"
+            runner._write_session_patch(job, {"submission_committed": True, "conversation_url": url})
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["runner", str(manifest), "--mode", "collect-current"]),
+                mock.patch.object(runner, "_resolve_browser_profile"),
+                mock.patch.object(runner, "_prepare_browser_lane"),
+                mock.patch.object(runner, "_validate_profile"),
+                mock.patch.object(runner, "run_collect_current", side_effect=self.attention),
+                mock.patch.object(runner, "_cleanup_agent_browser"),
+                contextlib.redirect_stdout(output),
+            ):
+                result = runner.main()
+            session = json.loads((Path(temporary) / "chatgpt_session.json").read_text())
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 2)
+        self.assertEqual(report["status"], "needs_ops")
+        self.assertFalse(report["retryable"])
+        self.assertTrue(report["submission_committed"])
+        self.assertEqual(session["status"], "needs_ops")
+        self.assertEqual(session["conversation_url"], url)
+        self.assertEqual(report["initial_committed_conversation_url"], url)
+        self.assertEqual(report["recommended_next_action"], "resolve_verification_then_inspect_or_collect_current")
 
     def test_cdp_login_blocks_even_when_composer_is_visible(self) -> None:
         with (

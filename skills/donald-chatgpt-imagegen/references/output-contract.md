@@ -89,7 +89,11 @@ Important terminal or recoverable states include:
   after bounded retries; preserve the conversation and retry with `collect-current`;
 - `needs_ops` with `error_type=human_attention_required`: login or human verification requires an
   operator in the activated visible browser. The runner preserves that tab and never refreshes or
-  attempts the verification itself.
+  attempts the verification itself. A visible `cloudflare_challenge` error is sufficient even
+  without a verification frame or clickable widget; it must not trigger Retry. The result is
+  `retryable=false` until human action, retains the committed conversation binding, and recommends
+  inspection or `collect-current` after resolution rather than a new submission. A homepage
+  observation must not overwrite an existing committed conversation URL in session state.
 
 ## Caller Recovery Contract
 
