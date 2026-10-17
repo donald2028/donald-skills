@@ -265,6 +265,20 @@ class BrowserDomTests(unittest.TestCase):
             [],
         )
 
+    def test_canonical_url_matches_prompt_across_rendered_blocks(self) -> None:
+        self.load_html(
+            '<div data-message-author-role="user"><p>Create a fox</p><p>Beside a tree</p></div>'
+        )
+        args = argparse.Namespace(
+            _owned_tab_cdp_url=self.browser.target_url,
+            _submitted_prompt="Create a fox\nBeside a tree",
+        )
+        with mock.patch.object(runner, "_current_url", return_value="https://chatgpt.com/c/canonical"):
+            event = runner._ensure_expected_conversation(
+                args, self.cwd, "https://chatgpt.com/c/local-chatgpt%3Atest", 0,
+            )
+        self.assertTrue(event["canonicalized"])
+
 
 if __name__ == "__main__":
     unittest.main()

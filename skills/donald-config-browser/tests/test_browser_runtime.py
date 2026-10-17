@@ -91,6 +91,25 @@ class BrowserRuntimeTests(unittest.TestCase):
         )
         close_browser.assert_called_once()
 
+    def test_missing_retained_target_does_not_keep_browser_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {runtime.STATE_ROOT_ENV: temporary},
+        ):
+            session = self._open_session(temporary)
+            state = json.loads(session.state_path.read_text())
+            state["retained_targets"] = [{"target_id": "already-closed", "scope": "donald-chatgpt-imagegen"}]
+            session.state_path.write_text(json.dumps(state))
+            with (
+                mock.patch.object(runtime, "cdp_target", side_effect=lambda _port, target:
+                                  None if target == "already-closed" else {"id": target}),
+                mock.patch.object(runtime, "close_background_page"),
+                mock.patch.object(runtime, "close_cdp_browser", return_value={"status": "closed"}) as close_browser,
+            ):
+                session.close()
+            state = json.loads(session.state_path.read_text())
+        close_browser.assert_called_once()
+        self.assertEqual(state["retained_targets"], [])
+
     def test_close_guards_cleanup_focus_without_restoring_stale_session_pid(self) -> None:
         events: list[str] = []
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(

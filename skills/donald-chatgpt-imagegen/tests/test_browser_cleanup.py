@@ -16,6 +16,26 @@ import agent_browser_runner as runner  # noqa: E402
 
 
 class BrowserCleanupTests(unittest.TestCase):
+    def test_replacement_claims_only_the_target_created_by_this_run(self) -> None:
+        session = argparse.Namespace(owned_target_ids=set())
+        args = argparse.Namespace(_browser_session=session)
+        targets = [
+            {"id": "other-blank", "url": "about:blank", "webSocketDebuggerUrl": "ws://other-blank"},
+            {"id": "other-new", "url": "https://chatgpt.com/c/other", "webSocketDebuggerUrl": "ws://other-new"},
+            {"id": "created", "url": "https://chatgpt.com/c/ours", "webSocketDebuggerUrl": "ws://created"},
+        ]
+        with (
+            mock.patch.object(runner, "_cdp_page_targets", return_value=targets),
+            mock.patch.object(runner, "_browser_cdp_websocket_url", return_value="ws://browser"),
+            mock.patch.object(runner._CDPConnection, "connect") as connect,
+            mock.patch.object(runner, "_navigate_owned_cdp_tab", return_value=True) as navigate,
+        ):
+            connect.return_value.__enter__.return_value.call.return_value = {"targetId": "created"}
+            self.assertTrue(runner._open_background_cdp_tab(args, "https://chatgpt.com/c/ours"))
+        self.assertEqual(args._owned_tab_cdp_target_id, "created")
+        self.assertEqual(session.owned_target_ids, {"created"})
+        navigate.assert_not_called()
+
     def test_default_chrome_uses_shared_platform_discovery(self) -> None:
         with mock.patch.object(
             runner,

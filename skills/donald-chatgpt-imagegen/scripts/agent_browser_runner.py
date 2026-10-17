@@ -617,32 +617,17 @@ def _capture_owned_tab_cdp_url(
 
 def _open_background_cdp_tab(args: argparse.Namespace, url: str) -> bool:
     try:
-        targets = _cdp_page_targets(args)
-        blank_target = next(
-            (
-                target
-                for target in targets
-                if target.get("url") == "about:blank"
-                and str(target.get("webSocketDebuggerUrl") or "").startswith(("ws://", "wss://"))
-            ),
-            None,
-        )
-        if blank_target and _remember_owned_cdp_target(args, blank_target):
-            args._opened_tab = True
-            args._tab_label = ""
-            if _navigate_owned_cdp_tab(args, url):
-                return True
-            _forget_owned_cdp_target(args)
-
-        before_target_ids = {str(target.get("id") or "") for target in targets}
         with _CDPConnection.connect(_browser_cdp_websocket_url(args), timeout=10) as conn:
             result = conn.call("Target.createTarget", {"url": url, "background": True})
         target_id = str(result.get("targetId") or "")
+        if not target_id:
+            args._owned_tab_cdp_error = "Chrome did not return a created target ID"
+            return False
         deadline = time.time() + 10
         while time.time() < deadline:
             for target in _cdp_page_targets(args):
                 current_id = str(target.get("id") or "")
-                if current_id == target_id or current_id not in before_target_ids:
+                if current_id == target_id:
                     if _remember_owned_cdp_target(args, target):
                         args._owned_tab_cdp_target_id = current_id
                         args._opened_tab = True
@@ -2218,7 +2203,8 @@ def _ensure_expected_conversation(
             observed = _eval_json(args, cwd, r"""
 JSON.stringify((() => {
   const {users} = __CONVERSATION_DOM__;
-  return {latestUserText: users.length ? users[users.length - 1].textContent : ""};
+  const user = users.length ? users[users.length - 1] : null;
+  return {latestUserText: user ? (user.innerText || user.textContent || "") : ""};
 })())
 """.strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)) if expected_prompt else {}
             latest_user_text = " ".join(str(observed.get("latestUserText") or "").split())

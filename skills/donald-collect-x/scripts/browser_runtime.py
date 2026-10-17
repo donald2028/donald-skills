@@ -467,6 +467,15 @@ class BrowserSession:
                 for item in state.get("retained_targets") or []
                 if str(item.get("target_id") or "") != self.target_id
             ]
+            live_retained = []
+            for item in retained:
+                try:
+                    if cdp_target(self.port, str(item.get("target_id") or "")) is None:
+                        continue
+                except ProfileConfigError as error:
+                    errors.append(str(error))
+                live_retained.append(item)
+            retained = live_retained
             target_is_open = False
             if preserve and self.target_id:
                 try:
