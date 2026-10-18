@@ -191,15 +191,20 @@ errors such as `Failed to load subscription`,
 `Something went wrong`, or network/load failures are pre-submit recovery signals. A temporarily
 missing Create image control is also recoverable because ChatGPT may omit the tool while such an
 error is active; reload and replay the complete preparation transaction within the normal bounded
-page-recovery budget. A persistent missing control returns recovery-exhausted evidence to the
-caller. A control that was clicked but whose selected state cannot be verified remains a selector
-contract failure. Never silently submit through Work or fall back to ordinary chat. Reference
+page-recovery budget. A temporarily disabled control or an unverified selection after a click
+also gets a bounded wait (about 15 seconds) before entering page recovery. Recovery first tries a
+visible page-loading-error Retry/Try again control, excluding conversation messages and history;
+if that does not restore the page, it reloads the target URL. Persistent failures return
+recovery-exhausted evidence to the caller. Never silently submit through Work or fall back to ordinary chat. Reference
 uploads likewise require visible composer-attachment evidence before submission.
 
-The runner uploads references one at a time in manifest-array order. After every upload it requires
-a monotonic attachment count, records the numbered local-path sequence, and refuses to submit if it
-cannot prove that UI attachment order matches the compiled `Reference Image 1..N` map. Batch file
-selection is not used because its attachment order is not treated as reliable.
+The runner queues references in manifest-array order without waiting for each file to finish
+uploading before adding the next. Each selection only waits for its attachment card to appear so
+the composer accepts it before the file input changes again. After all files have been added, it
+waits until every attachment is visible and no upload progress remains, then verifies that
+visible attachment filenames or numbered labels match the compiled `Reference Image 1..N` map.
+Only after both checks pass does it paste and send the prompt. Missing, extra, reordered, or
+unverifiable attachments block submission; file selection alone is not proof of attachment order.
 
 The runner treats `--aspect-ratio` as an end-to-end output contract. If the current ChatGPT UI
 exposes a visible exact ratio control, it clicks that control and records the result. When the UI
@@ -223,7 +228,9 @@ Page recovery is state-aware and bounded (three attempts by default):
 - before submission, a confirmed page failure reopens ChatGPT and replays the complete preparation
   transaction: select `Chat`, select `Create image`, apply the ratio control when available, upload
   and verify every reference, and restore the prompt. Confirmed failures include visible
-  page-level load/network errors and a missing Create image control after its menu was opened;
+  page-level load/network errors, a missing or persistently disabled Create image control, and a
+  clicked mode that remains unverified after the bounded wait. Each recovery uses at most one
+  page-error Retry click before reloading. Chat is checked again after uploads and before submit;
 - after the submit control has been invoked, the session records `submission_committed=true` and
   recovery may only reopen the same conversation and continue observing or collecting it. It must
   never replay the prompt or submit a replacement request;

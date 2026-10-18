@@ -328,28 +328,33 @@ Create an image.
         self.assertEqual(job["compiled_model_reference_map"], "")
         self.assertNotIn("REFERENCE IMAGE MAP", job["chatgpt_batch_message"])
 
-    def test_runner_uploads_reference_files_sequentially_and_records_order(self) -> None:
+    def test_runner_queues_all_references_before_waiting_for_completion_and_records_order(self) -> None:
         references = ["C:/refs/one.png", "C:/refs/two.png", "C:/refs/three.png"]
         observations = [
             {
-                "attachment_count": index,
-                "blob_image_count": index,
+                "attachment_count": len(references),
+                "blob_image_count": len(references),
                 "ready": True,
                 "attachment_labels": [
                     f"Remove file {position}: {Path(path).name}"
-                    for position, path in enumerate(references[:index], start=1)
+                    for position, path in enumerate(references, start=1)
                 ],
             }
-            for index in range(1, 4)
         ]
+        events = mock.Mock()
         with (
             mock.patch.object(runner, "_upload_files") as upload,
             mock.patch.object(
                 runner,
                 "_wait_for_reference_uploads_ready",
-                side_effect=observations,
-            ),
+                side_effect=[
+                    {"attachment_count": index, "ready": False}
+                    for index in range(1, 4)
+                ] + observations,
+            ) as wait,
         ):
+            events.attach_mock(upload, "upload")
+            events.attach_mock(wait, "wait")
             result = runner._upload_references_in_order(
                 argparse.Namespace(),
                 Path.cwd(),
@@ -358,13 +363,21 @@ Create an image.
 
         self.assertEqual(
             [call.args[2] for call in upload.call_args_list],
-            [[references[0]], [references[1]], [references[2]]],
+            [[path] for path in references],
         )
+        self.assertEqual(
+            [call[0] for call in events.mock_calls],
+            ["upload", "wait", "upload", "wait", "upload", "wait", "wait"],
+        )
+        self.assertEqual(wait.call_args_list, [
+            mock.call(mock.ANY, Path.cwd(), references[:index], min_wait_s=0, require_complete=False)
+            for index in range(1, 4)
+        ] + [mock.call(mock.ANY, Path.cwd(), references)])
         self.assertTrue(result["order_verified"])
         self.assertTrue(result["attachment_label_order_verified"])
         self.assertEqual(
             result["order_verification_method"],
-            "visible_attachment_labels_and_sequential_file_input",
+            "visible_attachment_labels_and_ordered_file_input",
         )
         self.assertEqual(
             [(entry["index"], entry["path"]) for entry in result["upload_sequence"]],
@@ -374,12 +387,6 @@ Create an image.
     def test_runner_rejects_visible_attachment_order_mismatch(self) -> None:
         references = ["C:/refs/one.png", "C:/refs/two.png"]
         observations = [
-            {
-                "attachment_count": 1,
-                "blob_image_count": 1,
-                "ready": True,
-                "attachment_labels": ["Remove file 1: one.png"],
-            },
             {
                 "attachment_count": 2,
                 "blob_image_count": 2,
@@ -395,7 +402,7 @@ Create an image.
             mock.patch.object(
                 runner,
                 "_wait_for_reference_uploads_ready",
-                side_effect=observations,
+                return_value=observations[-1],
             ),
             self.assertRaises(runner.ReferenceUploadError) as raised,
         ):
@@ -413,10 +420,9 @@ Create an image.
             with (
                 self.subTest(names=names),
                 mock.patch.object(runner, "_upload_files"),
-                mock.patch.object(runner, "_wait_for_reference_uploads_ready", side_effect=[
-                    {"attachment_count": 1, "ready": True, "attachment_filenames": ["one(2).png"]},
-                    {"attachment_count": 2, "ready": True, "attachment_filenames": names},
-                ]),
+                mock.patch.object(runner, "_wait_for_reference_uploads_ready", return_value={
+                    "attachment_count": 2, "ready": True, "attachment_filenames": names,
+                }),
             ):
                 if expected:
                     result = runner._upload_references_in_order(argparse.Namespace(), Path.cwd(), references)
@@ -424,6 +430,52 @@ Create an image.
                 else:
                     with self.assertRaises(runner.ReferenceUploadError):
                         runner._upload_references_in_order(argparse.Namespace(), Path.cwd(), references)
+
+    def test_queued_upload_rejects_missing_order_evidence(self) -> None:
+        with (
+            mock.patch.object(runner, "_upload_files"),
+            mock.patch.object(runner, "_wait_for_reference_uploads_ready", return_value={
+                "attachment_count": 2, "ready": True,
+            }),
+            self.assertRaises(runner.ReferenceUploadError) as raised,
+        ):
+            runner._upload_references_in_order(
+                argparse.Namespace(), Path.cwd(), ["/refs/one.png", "/refs/two.png"],
+            )
+        self.assertEqual(raised.exception.failure["error_type"], "reference_upload_order_unverified")
+
+    def test_queued_upload_waits_until_all_attachments_finish(self) -> None:
+        references = ["/refs/one.png", "/refs/two.png", "/refs/three.png"]
+        observations = [
+            {"attachment_count": 1, "pending_attachment_count": 1, "ready": False},
+            {"attachment_count": 3, "pending_attachment_count": 2, "ready": False},
+            {"attachment_count": 3, "pending_attachment_count": 0, "ready": True},
+        ]
+        with (
+            mock.patch.object(runner, "_page_access_state", return_value={}),
+            mock.patch.object(runner, "_reference_upload_observation", side_effect=observations) as observe,
+            mock.patch.object(runner.time, "sleep"),
+        ):
+            result = runner._wait_for_reference_uploads_ready(
+                argparse.Namespace(), Path.cwd(), references, min_wait_s=0,
+            )
+        self.assertEqual(observe.call_count, 3)
+        self.assertTrue(result["ready"])
+
+    def test_queue_acknowledgement_does_not_wait_for_network_completion(self) -> None:
+        with (
+            mock.patch.object(runner, "_page_access_state", return_value={}),
+            mock.patch.object(runner, "_reference_upload_observation", return_value={
+                "attachment_count": 1, "pending_attachment_count": 1, "ready": False,
+            }),
+            mock.patch.object(runner.time, "sleep") as sleep,
+        ):
+            result = runner._wait_for_reference_uploads_ready(
+                argparse.Namespace(), Path.cwd(), ["/refs/one.png"],
+                min_wait_s=0, require_complete=False,
+            )
+        sleep.assert_not_called()
+        self.assertFalse(result["ready"])
 
     def test_run_summary_keeps_upload_and_model_reference_audits_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -532,7 +584,7 @@ Create an image.
         )
         self.assertEqual(result["verification"]["placeholderText"], "Create image")
 
-    def test_disabled_create_image_stops_without_page_recovery(self) -> None:
+    def test_disabled_create_image_requests_recovery_after_bounded_wait(self) -> None:
         with (
             mock.patch.object(runner, "_image_mode_state", return_value={"selected": False}),
             mock.patch.object(runner, "_find_create_image_control", return_value={"found": False}),
@@ -546,11 +598,54 @@ Create an image.
             ),
             mock.patch.object(runner, "_dispatch_owned_tab_click", return_value=True) as click,
             mock.patch.object(runner, "_poll_for_image_mode_selection") as poll,
-            self.assertRaisesRegex(runner.ImageModeSelectionError, "disabled"),
+            self.assertRaisesRegex(runner.RecoverablePageError, "disabled"),
         ):
             runner._enable_image_mode_if_available(argparse.Namespace(), Path.cwd(), "")
         self.assertEqual(click.call_count, 1)
         poll.assert_not_called()
+
+    def test_disabled_control_poll_waits_for_enabled_state_with_a_bound(self) -> None:
+        disabled = {"found": False, "disabled": True}
+        enabled = {"found": True, "label": "Create image"}
+        for states, expected in [([disabled, disabled, enabled], enabled), ([disabled] * 3, disabled)]:
+            with (
+                self.subTest(expected=expected),
+                mock.patch.object(runner, "_find_create_image_control", side_effect=states) as find,
+                mock.patch.object(runner, "_wait_ms") as wait,
+                mock.patch.object(runner, "_dispatch_owned_tab_click") as click,
+            ):
+                result = runner._poll_for_create_image_control(argparse.Namespace(), Path.cwd(), attempts=3)
+            self.assertEqual(result, expected)
+            self.assertEqual(find.call_count, 3)
+            self.assertEqual(wait.call_count, 2)
+            click.assert_not_called()
+
+    def test_disabled_create_image_can_become_enabled_before_refresh(self) -> None:
+        with (
+            mock.patch.object(runner, "_image_mode_state", return_value={"selected": False}),
+            mock.patch.object(runner, "_find_create_image_control", return_value={"found": False}),
+            mock.patch.object(runner, "_find_image_mode_add_menu_control", return_value={"found": True}),
+            mock.patch.object(runner, "_poll_for_create_image_control", side_effect=[
+                {"found": False, "disabled": True}, {"found": True, "label": "Create image"},
+            ]) as poll,
+            mock.patch.object(runner, "_dispatch_owned_tab_click", return_value=True),
+            mock.patch.object(runner, "_wait_ms"),
+            mock.patch.object(runner, "_poll_for_image_mode_selection", return_value={"selected": True}),
+        ):
+            result = runner._enable_image_mode_if_available(argparse.Namespace(), Path.cwd(), "")
+        self.assertTrue(result["verified"])
+        self.assertEqual(poll.call_args.kwargs["attempts"], 60)
+
+    def test_clicked_but_unselected_image_mode_requests_page_recovery(self) -> None:
+        with (
+            mock.patch.object(runner, "_image_mode_state", return_value={"selected": False}),
+            mock.patch.object(runner, "_find_create_image_control", return_value={"found": True}),
+            mock.patch.object(runner, "_dispatch_owned_tab_click", return_value=True),
+            mock.patch.object(runner, "_wait_ms"),
+            mock.patch.object(runner, "_poll_for_image_mode_selection", return_value={"selected": False}),
+            self.assertRaises(runner.RecoverablePageError),
+        ):
+            runner._enable_image_mode_if_available(argparse.Namespace(), Path.cwd(), "")
 
     def test_create_image_ui_contract_supports_current_plus_menu_and_placeholder(self) -> None:
         self.assertIn("data-placeholder", runner.IMAGE_MODE_STATE_JS)
@@ -606,54 +701,68 @@ Create an image.
         self.assertIn("chatgpt_transient_page_error", runner.PAGE_ACCESS_STATE_JS)
         self.assertIn("[data-message-author-role]", runner.PAGE_ACCESS_STATE_JS)
 
-    def test_image_mode_failure_stays_before_upload_prompt_and_submit(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            job = {
-                "job_name": "image-mode-gate",
-                "download_dir": temporary,
-                "prompt_card": str(Path(temporary) / "prompt.md"),
-                "variant_count": 1,
-                "output_aspect_ratio": "1:1",
-                "reference_images": [{"path": str(Path(temporary) / "reference.png")}],
-            }
-            args = argparse.Namespace(
-                page_recovery_attempts=3,
-                max_failure_retries=0,
-            )
-            with (
-                mock.patch.object(runner, "_wait_for_submit_throttle_slot", return_value={}),
-                mock.patch.object(runner, "_open_new_chat"),
-                mock.patch.object(runner, "_wait_for_prompt_box"),
-                mock.patch.object(
-                    runner,
-                    "_ensure_chat_surface",
-                    return_value={"selected_surface": "chat", "verified": True},
-                ),
-                mock.patch.object(runner, "_validate_account_lane", return_value={"ok": True}),
-                mock.patch.object(runner, "_screenshot"),
-                mock.patch.object(runner, "_owned_tab_cdp_url", return_value="ws://owned"),
-                mock.patch.object(
-                    runner,
-                    "_enable_image_mode_if_available",
-                    side_effect=runner.ImageModeSelectionError("not verified"),
-                ),
-                mock.patch.object(runner, "_upload_references_in_order") as upload,
-                mock.patch.object(runner, "_paste_prompt") as paste,
-                mock.patch.object(runner, "_submit_prompt") as submit,
-                self.assertRaises(runner.ImageModeSelectionError),
-            ):
-                runner._run_one_request(
-                    args,
-                    job,
-                    Path.cwd(),
-                    label="batch",
-                    message="Generate an image",
-                    resume=False,
+    def test_preparation_failure_blocks_prompt_and_submit(self) -> None:
+        for stage in ["image_mode", "reference_upload"]:
+            with self.subTest(stage=stage):
+                failure = (
+                    runner.ImageModeSelectionError("not verified")
+                    if stage == "image_mode"
+                    else runner.ReferenceUploadError({"error_type": "reference_upload_failed"})
                 )
+                with tempfile.TemporaryDirectory() as temporary:
+                    job = {
+                        "job_name": "image-mode-gate",
+                        "download_dir": temporary,
+                        "prompt_card": str(Path(temporary) / "prompt.md"),
+                        "variant_count": 1,
+                        "output_aspect_ratio": "1:1",
+                        "reference_images": [{"path": str(Path(temporary) / "reference.png")}],
+                    }
+                    args = argparse.Namespace(
+                        page_recovery_attempts=3,
+                        max_failure_retries=0,
+                    )
+                    with (
+                        mock.patch.object(runner, "_wait_for_submit_throttle_slot", return_value={}),
+                        mock.patch.object(runner, "_open_new_chat"),
+                        mock.patch.object(runner, "_wait_for_prompt_box"),
+                        mock.patch.object(
+                            runner,
+                            "_ensure_chat_surface",
+                            return_value={"selected_surface": "chat", "verified": True},
+                        ),
+                        mock.patch.object(runner, "_validate_account_lane", return_value={"ok": True}),
+                        mock.patch.object(runner, "_screenshot"),
+                        mock.patch.object(runner, "_owned_tab_cdp_url", return_value="ws://owned"),
+                        mock.patch.object(
+                            runner,
+                            "_enable_image_mode_if_available",
+                            side_effect=failure if stage == "image_mode" else None,
+                        ),
+                        mock.patch.object(runner, "_configure_aspect_ratio", return_value={}),
+                        mock.patch.object(
+                            runner, "_upload_references_in_order",
+                            side_effect=failure if stage == "reference_upload" else None,
+                        ) as upload,
+                        mock.patch.object(runner, "_paste_prompt") as paste,
+                        mock.patch.object(runner, "_submit_prompt") as submit,
+                        self.assertRaises(type(failure)),
+                    ):
+                        runner._run_one_request(
+                            args,
+                            job,
+                            Path.cwd(),
+                            label="batch",
+                            message="Generate an image",
+                            resume=False,
+                        )
 
-        upload.assert_not_called()
-        paste.assert_not_called()
-        submit.assert_not_called()
+                if stage == "image_mode":
+                    upload.assert_not_called()
+                else:
+                    upload.assert_called_once()
+                paste.assert_not_called()
+                submit.assert_not_called()
 
     def test_reference_upload_uses_visible_composer_attachment_as_evidence(self) -> None:
         reference = "C:/images/reference.png"

@@ -3212,7 +3212,7 @@ def _poll_for_create_image_control(
     last = {"found": False}
     for attempt in range(max(1, attempts)):
         last = _find_create_image_control(args, cwd)
-        if last.get("found") or last.get("disabled"):
+        if last.get("found"):
             return last
         if attempt + 1 < attempts:
             _wait_ms(args, cwd, 250)
@@ -3223,7 +3223,7 @@ def _poll_for_image_mode_selection(
     args: argparse.Namespace,
     cwd: Path,
     *,
-    attempts: int = 20,
+    attempts: int = 60,
 ) -> dict[str, Any]:
     last: dict[str, Any] = {"selected": False}
     for attempt in range(max(1, attempts)):
@@ -3274,10 +3274,14 @@ def _enable_image_mode_if_available(
             selected_label = str(menu_choice.get("label") or "")
 
     if direct.get("disabled") or menu_choice.get("disabled"):
-        raise ImageModeSelectionError(
-            "ChatGPT Create image control is disabled in the current session; "
-            "image generation cannot be selected."
-        )
+        available = _poll_for_create_image_control(args, cwd, attempts=60)
+        if not available.get("found"):
+            raise RecoverablePageError(
+                "ChatGPT Create image control remained disabled after the bounded wait; "
+                "retry the page error or reload before submission."
+            )
+        clicked = _dispatch_owned_tab_click(args, cwd, available)
+        selected_label = str(available.get("label") or "")
     if clicked:
         _wait_ms(args, cwd, 250)
     verification = _poll_for_image_mode_selection(args, cwd)
@@ -3292,8 +3296,8 @@ def _enable_image_mode_if_available(
             f"last_state={json.dumps(verification, ensure_ascii=False)}"
         )
     if not verification.get("selected"):
-        raise ImageModeSelectionError(
-            "ChatGPT Create image mode could not be selected and verified. "
+        raise RecoverablePageError(
+            "ChatGPT Create image mode could not be selected and verified after the bounded wait. "
             f"opened_add_menu={opened_add_menu} clicked_create_image={clicked} "
             f"direct={json.dumps(direct, ensure_ascii=False)} "
             f"menu={json.dumps(menu, ensure_ascii=False)} "
@@ -3596,6 +3600,36 @@ def _page_recovery_attempt_limit(args: argparse.Namespace) -> int:
     )
 
 
+def _click_page_error_retry(args: argparse.Namespace, cwd: Path) -> bool:
+    """Retry only a current page loading error, never a conversation message."""
+    control = _eval_json(args, cwd, r"""
+JSON.stringify((() => {
+  const visible = el => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+  };
+  const excluded = "[inert],#history,[aria-label='Chat history'],[data-sidebar-item]," +
+    "[data-message-author-role],[data-turn-key],[data-testid^='conversation-turn'],form";
+  const error = /failed to load|something went wrong|network error|unable to load|try again later|加载失败|网络错误/i;
+  for (const el of document.querySelectorAll("button,[role='button']")) {
+    if (!visible(el) || el.closest(excluded) || el.matches("[disabled],[aria-disabled='true']")) continue;
+    const label = (el.getAttribute("aria-label") || el.innerText || "").trim();
+    if (!/^(try again|retry|再试一次|重试)$/i.test(label)) continue;
+    let container = el.parentElement;
+    for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
+      const text = (container.innerText || "").trim();
+      if (text.length <= 800 && error.test(text) && !container.querySelector(excluded)) {
+        const r = el.getBoundingClientRect();
+        return {found: true, label, x: r.left + r.width / 2, y: r.top + r.height / 2};
+      }
+    }
+  }
+  return {found: false};
+})())
+""".strip())
+    return bool(control.get("found")) and _dispatch_owned_tab_click(args, cwd, control)
+
+
 def _recover_chatgpt_page(
     args: argparse.Namespace,
     cwd: Path,
@@ -3617,6 +3651,26 @@ def _recover_chatgpt_page(
 
     previous_target_id = str(getattr(args, "_owned_tab_cdp_target_id", "") or "")
     recovery_method = "navigate_owned_tab"
+    retry_clicked = False
+    if phase in ("pre_submit_prepare", "dry_upload_prepare"):
+        try:
+            retry_clicked = _click_page_error_retry(args, cwd)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            # An unreadable error surface must not prevent URL-based recovery.
+            retry_clicked = False
+        if retry_clicked:
+            try:
+                _wait_ms(args, cwd, 1000)
+                _wait_for_prompt_box(args, cwd, timeout_s=10)
+                return {
+                    "phase": phase, "attempt": attempt, "status": "page_recovered",
+                    "reason": reason, "target_url": target_url, "method": "page_error_retry",
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            except HumanAttentionRequired:
+                raise
+            except (RuntimeError, OSError, subprocess.SubprocessError):
+                pass
     if _owned_tab_cdp_url(args):
         navigated = _navigate_owned_cdp_tab(args, target_url)
         if not navigated:
@@ -3641,6 +3695,7 @@ def _recover_chatgpt_page(
         "reason": reason,
         "target_url": target_url,
         "method": recovery_method,
+        "page_retry_clicked": retry_clicked,
         "previous_target_id": previous_target_id,
         "current_target_id": str(getattr(args, "_owned_tab_cdp_target_id", "") or ""),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -3955,6 +4010,7 @@ def _wait_for_reference_uploads_ready(
     *,
     timeout_s: int = 90,
     min_wait_s: int = 1,
+    require_complete: bool = True,
 ) -> dict[str, Any]:
     if not references:
         return {"reference_count": 0, "blob_image_count": 0, "filename_mentions": {}}
@@ -3973,7 +4029,8 @@ def _wait_for_reference_uploads_ready(
         if observation.get("failure"):
             raise ReferenceUploadError(observation["failure"])
         elapsed = time.time() - started_at
-        if observation.get("ready") and elapsed >= observation_window_s:
+        accepted = int(observation.get("attachment_count") or 0) == len(references)
+        if accepted and (not require_complete or observation.get("ready")) and elapsed >= observation_window_s:
             return observation
         if (
             elapsed >= min(timeout_s, REFERENCE_UPLOAD_NO_EVIDENCE_RECOVERY_SECONDS)
@@ -4004,7 +4061,7 @@ def _upload_references_in_order(
     cwd: Path,
     references: list[str],
 ) -> dict[str, Any]:
-    """Upload each reference separately and prove a monotonic attachment sequence."""
+    """Queue references in order without per-file completion waits, then verify all uploads."""
     if not references:
         return {
             "reference_count": 0,
@@ -4017,33 +4074,27 @@ def _upload_references_in_order(
         }
 
     steps: list[dict[str, Any]] = []
-    final_observation: dict[str, Any] = {}
     for index, path in enumerate(references, start=1):
         _upload_files(args, cwd, [path])
-        final_observation = _wait_for_reference_uploads_ready(
-            args,
-            cwd,
-            references[:index],
+        # Let the composer accept this selection before changing the file input again.
+        # Its network upload may remain pending while the next reference is added.
+        accepted = _wait_for_reference_uploads_ready(
+            args, cwd, references[:index], min_wait_s=0, require_complete=False,
         )
-        observed_count = int(final_observation.get("attachment_count") or 0)
-        if observed_count != index:
-            raise RecoverablePageError(
-                "Sequential reference upload did not produce a monotonic attachment count: "
-                f"Reference Image {index}, observed_count={observed_count}"
-            )
-        steps.append(
-            {
-                "index": index,
-                "path": path,
-                "observed_attachment_count": int(
-                    final_observation.get("attachment_count") or 0
-                ),
-                "observed_blob_image_count": int(
-                    final_observation.get("blob_image_count") or 0
-                ),
-            }
+        steps.append({
+            "index": index,
+            "path": path,
+            "observed_attachment_count": int(accepted.get("attachment_count") or 0),
+            "observed_blob_image_count": int(accepted.get("blob_image_count") or 0),
+            "pending_attachment_count": int(accepted.get("pending_attachment_count") or 0),
+        })
+    final_observation = _wait_for_reference_uploads_ready(args, cwd, references)
+    observed_count = int(final_observation.get("attachment_count") or 0)
+    if not final_observation.get("ready") or observed_count != len(references):
+        raise RecoverablePageError(
+            "Queued reference uploads did not produce the expected completed attachment count: "
+            f"expected={len(references)}, observed_count={observed_count}"
         )
-
     attachment_label_order_verified: bool | None = None
     attachment_labels = [str(label) for label in final_observation.get("attachment_labels") or []]
     indexed_labels: list[tuple[int, str]] = []
@@ -4058,7 +4109,7 @@ def _upload_references_in_order(
             and all(_attachment_name_matches(path, label)
                     for path, label in zip(references, attachment_filenames))
         )
-    elif len(indexed_labels) >= len(references):
+    elif len(indexed_labels) == len(references):
         indexed_labels.sort(key=lambda item: item[0])
         expected_indices = list(range(1, len(references) + 1))
         attachment_label_order_verified = (
@@ -4071,15 +4122,19 @@ def _upload_references_in_order(
                 )
             )
         )
-    if attachment_label_order_verified is False:
+    if attachment_label_order_verified is not True:
         raise ReferenceUploadError(
             {
                 "status": "reference_upload_failed",
-                "error_type": "reference_upload_order_mismatch",
+                "error_type": (
+                    "reference_upload_order_mismatch"
+                    if attachment_label_order_verified is False
+                    else "reference_upload_order_unverified"
+                ),
                 "retryable": True,
                 "terminal": True,
                 "recommended_next_action": "rerun_same_job_after_inspecting_upload_trace",
-                "reason": "Visible ChatGPT attachment labels do not match manifest array order",
+                "reason": "Visible ChatGPT attachment labels must prove manifest array order",
                 "expected_upload_order": list(enumerate(references, start=1)),
                 "observed_attachment_labels": attachment_labels,
                 "observed_attachment_filenames": attachment_filenames,
@@ -4088,15 +4143,12 @@ def _upload_references_in_order(
 
     return {
         **final_observation,
+        "all_uploads_ready_at": time.time(),
         "upload_sequence": steps,
         "ordered_upload_paths": list(references),
         "order_verified": True,
         "attachment_label_order_verified": attachment_label_order_verified,
-        "order_verification_method": (
-            "visible_attachment_labels_and_sequential_file_input"
-            if attachment_label_order_verified
-            else "sequential_file_input_with_monotonic_attachment_count"
-        ),
+        "order_verification_method": "visible_attachment_labels_and_ordered_file_input",
     }
 
 
@@ -6408,6 +6460,7 @@ def _run_one_request(
         _screenshot(args, cwd, trace_dir / "02_after_upload.png")
         after_upload = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
         _paste_prompt(args, cwd, message)
+        upload_observation["prompt_pasted_at"] = time.time()
         _screenshot(args, cwd, trace_dir / "03_after_prompt.png")
         baseline_rows = _image_inventory(args, cwd)
         baseline = {row.get("src") for row in baseline_rows if row.get("src")}
@@ -6442,6 +6495,8 @@ def _run_one_request(
     baseline_message_counts = prepared["baseline_message_counts"]
     upload_mentions = {Path(path).name: Path(path).name in after_upload for path in references}
 
+    chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface, timeout_s=2)
+    upload_observation["submit_started_at"] = time.time()
     try:
         _submit_prompt(
             args,
@@ -6471,6 +6526,11 @@ def _run_one_request(
             "label": label,
             "submission_committed": True,
             "page_recoveries": page_recoveries,
+            "chat_surface": chat_surface,
+            "image_mode": image_mode,
+            "reference_upload": {
+                key: value for key, value in upload_observation.items() if key != "page_text"
+            },
             "attempt": {
                 "action": "submission_committed",
                 "label": label,

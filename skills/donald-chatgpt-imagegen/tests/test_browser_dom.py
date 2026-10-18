@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -171,6 +173,101 @@ class BrowserDomTests(unittest.TestCase):
                 "Array.from(el.files).map(file=>file.name))})",
             )
         self.assertEqual(result["names"], [[], [], ["reference.png"]])
+
+    def test_ordered_selections_overlap_uploads_and_wait_for_all(self) -> None:
+        self.load_html(
+            '<form><div contenteditable="true"></div>'
+            '<input type="file" multiple><div data-composer-attachments></div></form>'
+        )
+        runner._eval_js(self.args, self.cwd, """
+window.selectionPendingCounts = [];
+document.querySelector('input').onchange = (event) => {
+  window.selectionPendingCounts.push(document.querySelectorAll('[role=progressbar]').length);
+  const card = document.createElement('div');
+  card.setAttribute('role', 'button');
+  card.setAttribute('aria-label', event.target.files[0].name);
+  card.innerHTML = '<img width="100" height="100"><span role="progressbar">Uploading</span>';
+  document.querySelector('[data-composer-attachments]').append(card);
+  setTimeout(() => card.querySelector('[role=progressbar]').remove(), 3000);
+};
+""")
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(runner, "_page_access_state", return_value={}),
+        ):
+            references = [str(Path(temporary) / name) for name in ['third.png', 'first.png', 'second.png']]
+            for path in references:
+                Path(path).write_bytes(b'test attachment')
+            observation = runner._upload_references_in_order(self.args, self.cwd, references)
+        counts = runner._eval_json(
+            self.args, self.cwd, 'JSON.stringify({counts: window.selectionPendingCounts})',
+        )
+        self.assertEqual(counts["counts"], [0, 1, 2])
+        self.assertEqual(observation['attachment_filenames'], ['third.png', 'first.png', 'second.png'])
+        self.assertEqual(observation['pending_attachment_count'], 0)
+        self.assertTrue(observation['ready'])
+        self.assertTrue(observation['order_verified'])
+
+    def test_page_retry_ignores_history_and_current_message_buttons(self) -> None:
+        self.load_html(
+            '<div id="history"><p>Something went wrong</p><button onclick="document.body.dataset.wrong=1">Retry</button></div>'
+            '<div data-turn-key="assistant"><p>Something went wrong</p>'
+            '<button onclick="document.body.dataset.wrong=1">Try again</button></div>'
+            '<div role="alert"><p>Failed to load subscription</p>'
+            '<button onclick="document.body.dataset.recovered=1">Try again</button></div>'
+        )
+        self.assertTrue(runner._click_page_error_retry(self.args, self.cwd))
+        result = runner._eval_json(self.args, self.cwd, 'JSON.stringify({...document.body.dataset})')
+        self.assertEqual(result.get("recovered"), "1")
+        self.assertNotIn("wrong", result)
+        runner._eval_js(self.args, self.cwd, "document.querySelector('[role=alert]').remove()")
+        self.assertFalse(runner._click_page_error_retry(self.args, self.cwd))
+
+    def test_page_recovery_clicks_retry_or_reloads_in_real_chrome(self) -> None:
+        healthy = (
+            '<div role="group" aria-label="Composer mode">'
+            '<button aria-pressed="true">Chat</button><button aria-pressed="false">Work</button></div>'
+            '<form><div contenteditable="true">Ask ChatGPT</div></form>'
+        )
+        requests = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(handler):
+                requests[handler.path] = requests.get(handler.path, 0) + 1
+                if handler.path == '/retry':
+                    html = '<div role="alert">Network error <button onclick="document.body.innerHTML=' + json.dumps(healthy).replace('"', '&quot;') + '">Try again</button></div>'
+                elif requests[handler.path] == 1:
+                    html = '<div role="alert">Failed to load subscription</div>'
+                else:
+                    html = healthy
+                handler.send_response(200)
+                handler.send_header('Content-Type', 'text/html; charset=utf-8')
+                handler.end_headers()
+                handler.wfile.write(html.encode())
+
+            def log_message(handler, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for path, method in [('/retry', 'page_error_retry'), ('/refresh', 'navigate_owned_tab')]:
+                with self.subTest(path=path):
+                    url = f'http://127.0.0.1:{server.server_port}{path}'
+                    self.assertTrue(runner._navigate_owned_cdp_tab(self.args, url))
+                    result = runner._recover_chatgpt_page(
+                        self.args, self.cwd, url,
+                        phase='pre_submit_prepare', attempt=1, reason='injected load failure',
+                    )
+                    self.assertEqual(result['method'], method)
+                    self.assertTrue(runner._ensure_chat_surface(self.args, self.cwd)['verified'])
+            self.assertGreaterEqual(requests['/refresh'], 2)
+        finally:
+            runner._navigate_owned_cdp_tab(self.args, 'about:blank')
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_visible_cloudflare_error_without_frame_blocks_retry_after_long_prompt(self) -> None:
         self.load_html(

@@ -133,6 +133,44 @@ class PageRecoveryTests(unittest.TestCase):
 
         recover.assert_not_called()
 
+    def test_page_error_retry_precedes_refresh_and_falls_back_when_unsuccessful(self) -> None:
+        for retry_works in [True, False]:
+            with (
+                self.subTest(retry_works=retry_works),
+                mock.patch.object(runner, "_page_access_state", return_value={}),
+                mock.patch.object(runner, "_click_page_error_retry", return_value=True) as retry,
+                mock.patch.object(runner, "_owned_tab_cdp_url", return_value="ws://owned"),
+                mock.patch.object(runner, "_navigate_owned_cdp_tab", return_value=True) as navigate,
+                mock.patch.object(runner, "_wait_ms"),
+                mock.patch.object(runner, "_wait_for_prompt_box", side_effect=(
+                    [None] if retry_works else [runner.RecoverablePageError("still broken"), None]
+                )),
+            ):
+                result = runner._recover_chatgpt_page(
+                    self.args, self.cwd, "https://chatgpt.com/",
+                    phase="pre_submit_prepare", attempt=1, reason="mode not ready",
+                )
+            retry.assert_called_once()
+            self.assertEqual(navigate.call_count, 0 if retry_works else 1)
+            self.assertEqual(result["method"], "page_error_retry" if retry_works else "navigate_owned_tab")
+
+    def test_post_submit_recovery_never_clicks_page_retry_or_starts_new_chat(self) -> None:
+        url = "https://chatgpt.com/c/existing"
+        with (
+            mock.patch.object(runner, "_page_access_state", return_value={}),
+            mock.patch.object(runner, "_click_page_error_retry") as retry,
+            mock.patch.object(runner, "_owned_tab_cdp_url", return_value="ws://owned"),
+            mock.patch.object(runner, "_navigate_owned_cdp_tab", return_value=True) as navigate,
+            mock.patch.object(runner, "_wait_ms"),
+            mock.patch.object(runner, "_wait_for_prompt_box"),
+        ):
+            runner._recover_chatgpt_page(
+                self.args, self.cwd, url,
+                phase="post_submit_monitor:heartbeat", attempt=1, reason="network failure",
+            )
+        retry.assert_not_called()
+        navigate.assert_called_once_with(self.args, url)
+
     def test_prompt_gate_fails_fast_on_browser_error_page(self) -> None:
         with mock.patch.object(
             runner,
@@ -188,6 +226,7 @@ class PageRecoveryTests(unittest.TestCase):
                 "blob_image_count": 1,
                 "attachment_count": 1,
                 "filename_mentions": {"reference.png": True},
+                "attachment_filenames": ["reference.png"],
                 "ready": True,
             }
             recovery_event = {
@@ -220,7 +259,7 @@ class PageRecoveryTests(unittest.TestCase):
                 mock.patch.object(
                     runner,
                     "_wait_for_reference_uploads_ready",
-                    side_effect=[runner.RecoverablePageError("manual refresh"), upload_ready],
+                    side_effect=[runner.RecoverablePageError("manual refresh"), upload_ready, upload_ready],
                 ),
                 mock.patch.object(runner, "_owned_tab_cdp_url", return_value="ws://owned"),
                 mock.patch.object(runner, "_page_text", return_value="reference.png"),
@@ -308,6 +347,7 @@ class PageRecoveryTests(unittest.TestCase):
                     "_run_with_page_recovery",
                     return_value=(prepared, []),
                 ) as recoverable_prepare,
+                mock.patch.object(runner, "_ensure_chat_surface", return_value=prepared["chat_surface"]),
                 mock.patch.object(
                     runner,
                     "_submit_prompt",

@@ -39,9 +39,12 @@ it may reopen the saved conversation to observe or collect, but it must never se
 The run summary records request mode, variant results, image paths, status, and the same reference
 audit fields so numbering can be checked against local inputs without exposing those identifiers to
 the model. Each fresh upload observation records `upload_sequence`, `order_verified`, and
-`order_verification_method`. It checks visible numbered attachment labels when available and always
-requires sequential file input with a monotonic attachment count; the runner refuses submission
-when this evidence does not match the manifest order.
+`order_verification_method`. It queues files in order without per-file completion waits, then waits
+for the exact attachment count with no pending upload indicators. Visible attachment filenames or
+numbered labels must prove manifest order before the prompt is pasted or sent; missing order
+evidence or a mismatch blocks submission.
+Upload observations include Unix-second `all_uploads_ready_at`, `prompt_pasted_at`, and
+`submit_started_at` timestamps for fresh submissions; their order must be nondecreasing.
 Fresh-submit reports and summaries also record the verified `chat_surface` (`Chat`, never `Work`),
 the verified `image_mode`, reference-upload evidence, requested aspect-ratio delivery
 (`ui_control_and_prompt_text` or `prompt_text`), and an actual-dimensions ratio check for every
