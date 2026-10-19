@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,12 +31,15 @@ except ImportError as error:  # pragma: no cover - depends on the local Python e
 else:
     PIL_IMPORT_ERROR = None
 
+from run_health import RunHeartbeat, SubmissionCircuit, atomic_json, heartbeat_status
 from browser_runtime import BrowserSession, process_is_alive
 from output_paths import resolve_tool_state_root
 from profile_config import (
     ProfileConfigError,
     activate_browser,
     chrome_environment,
+    cdp_target,
+    create_background_page,
     configured_browser,
     ensure_agent_browser,
     restore_frontmost_process,
@@ -180,6 +184,20 @@ class ReferenceUploadError(RuntimeError):
     def __init__(self, failure: dict[str, Any]):
         super().__init__(json.dumps(failure, ensure_ascii=False))
         self.failure = failure
+
+
+class QueuePausedError(RuntimeError):
+    def __init__(self, state: dict[str, Any]):
+        self.report = {
+            "status": "queue_paused", "error_type": "chatgpt_queue_paused",
+            "retryable": False, "submission_committed": False,
+            "recommended_next_action": "wait_for_queue_health_check", "queue_health": state,
+        }
+        super().__init__("New submissions are paused for this browser environment")
+
+
+class OriginalConversationRequired(RuntimeError):
+    pass
 
 
 class ImageModeSelectionError(RuntimeError):
@@ -414,8 +432,9 @@ def _decode_ws_frame(buffer: bytes) -> tuple[int, bytes, int] | None:
 
 
 class _CDPConnection:
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: socket.socket, timeout: float = 30) -> None:
         self._sock = sock
+        self._timeout = timeout
         self._buffer = b""
         self._next_id = 0
 
@@ -425,6 +444,7 @@ class _CDPConnection:
         host = parts.hostname or "127.0.0.1"
         port = parts.port or 80
         path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+        deadline = time.monotonic() + timeout
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -440,20 +460,28 @@ class _CDPConnection:
                 "",
             ]
         ).encode("ascii")
-        sock.sendall(request)
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("CDP websocket closed during handshake")
-            response += chunk
-        head, _, rest = response.partition(b"\r\n\r\n")
-        if b"101" not in head.split(b"\r\n", 1)[0]:
-            raise ConnectionError("CDP websocket handshake failed")
-        expected = base64.b64encode(hashlib.sha1((key + _WS_MAGIC).encode("ascii")).digest()).decode("ascii")
-        if expected.encode("ascii") not in head:
-            raise ConnectionError("CDP websocket accept key mismatch")
-        conn = cls(sock)
+        try:
+            sock.sendall(request)
+            response = b""
+            while b"\r\n\r\n" not in response:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("CDP handshake deadline exceeded")
+                sock.settimeout(remaining)
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("CDP websocket closed during handshake")
+                response += chunk
+            head, _, rest = response.partition(b"\r\n\r\n")
+            if b"101" not in head.split(b"\r\n", 1)[0]:
+                raise ConnectionError("CDP websocket handshake failed")
+            expected = base64.b64encode(hashlib.sha1((key + _WS_MAGIC).encode("ascii")).digest()).decode("ascii")
+            if expected.encode("ascii") not in head:
+                raise ConnectionError("CDP websocket accept key mismatch")
+        except Exception:
+            sock.close()
+            raise
+        conn = cls(sock, timeout)
         conn._buffer = rest
         return conn
 
@@ -466,8 +494,12 @@ class _CDPConnection:
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
         self.close()
 
-    def _recv_frame(self) -> tuple[int, bytes]:
+    def _recv_frame(self, deadline: float) -> tuple[int, bytes]:
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("CDP response deadline exceeded")
+            self._sock.settimeout(remaining)
             parsed = _decode_ws_frame(self._buffer)
             if parsed:
                 opcode, payload, consumed = parsed
@@ -482,9 +514,11 @@ class _CDPConnection:
         self._next_id += 1
         msg_id = self._next_id
         payload = json.dumps({"id": msg_id, "method": method, "params": params or {}}).encode("utf-8")
+        deadline = time.monotonic() + self._timeout
+        self._sock.settimeout(self._timeout)
         self._sock.sendall(_encode_ws_text_frame(payload))
         while True:
-            opcode, payload = self._recv_frame()
+            opcode, payload = self._recv_frame(deadline)
             if opcode != 0x1:
                 continue
             message = json.loads(payload.decode("utf-8"))
@@ -1115,6 +1149,35 @@ def _write_cdp_state_locked(args: argparse.Namespace, state: dict[str, Any]) -> 
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+class _ResumeImageBrowserSession(BrowserSession):
+    """Claim only this job's retained target, without navigating away from verification."""
+    def __init__(self, *args, original_target: str, require_target: bool, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.original_target = original_target
+        self.require_target = require_target
+
+    def _claim_target(self, state: dict[str, Any]) -> str:
+        if any(run.get("target_id") == self.original_target for run in state.get("active_runs", [])):
+            raise OriginalConversationRequired("The original request is still owned by another active runner")
+        for item in state.get("retained_targets", []):
+            if item.get("target_id") == self.original_target and item.get("scope") == self.scope:
+                if cdp_target(self.port, self.original_target):
+                    state["retained_targets"].remove(item)
+                    self.owned_target_ids.add(self.original_target)
+                    return self.original_target
+        if self.require_target:
+            raise OriginalConversationRequired("Original temporary conversation target is no longer available")
+        return super()._claim_target(state)
+
+
+class _HealthCheckBrowserSession(BrowserSession):
+    def _claim_target(self, state: dict[str, Any]) -> str:
+        # Never navigate a retained request just to inspect account health.
+        target = create_background_page(self.port, self.url)
+        self.owned_target_ids.add(target)
+        return target
+
+
 def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
     del cwd
     original_transport_session = _agent_browser_transport_session(args)
@@ -1130,7 +1193,22 @@ def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
                 "executable": args.executable_path,
             },
         }
-    browser_session = BrowserSession(
+    session_type = _HealthCheckBrowserSession if getattr(args, "mode", "") == "health-check" else BrowserSession
+    resume_options = {}
+    saved = getattr(args, "_resume_session", {})
+    if getattr(args, "mode", "") != "health-check" and saved.get("owned_target_id") and (
+        saved.get("submission_committed") in (True, "unknown")
+        or saved.get("reason") in ("anti_automation_verification", "login_required")
+    ):
+        session_type = _ResumeImageBrowserSession
+        url = str(saved.get("canonical_conversation_url") or saved.get("conversation_url") or "")
+        resume_options = {
+            "original_target": saved["owned_target_id"],
+            "require_target": saved.get("submission_committed") in (True, "unknown")
+                and (not url or _temporary_conversation_id(_conversation_id_from_url(url))),
+        }
+    browser_session = session_type(
+        **resume_options,
         scope="donald-chatgpt-imagegen",
         session=original_transport_session,
         url="about:blank",
@@ -1582,7 +1660,7 @@ def _write_session_patch(job: dict[str, Any], patch: dict[str, Any]) -> dict[str
     if session.get("submission_committed") is True and _conversation_id_from_url(str(session.get("conversation_url") or "")):
         session.setdefault("initial_committed_conversation_url", session["conversation_url"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_json(path, session)
     return session
 
 
@@ -1731,6 +1809,7 @@ def _wait_for_submit_throttle_slot(
     label: int | str,
     expected_count: int,
 ) -> dict[str, Any]:
+    _run_phase(args, "submit_throttle")
     if getattr(args, "no_submit_throttle", False):
         return {"enabled": False, "reason": "disabled"}
     limits = _submit_throttle_limits(args)
@@ -2090,6 +2169,9 @@ def _wait_for_conversation_url(args: argparse.Namespace, cwd: Path, timeout_s: i
     deadline = time.time() + timeout_s
     current = _current_url(args, cwd)
     while time.time() < deadline:
+        state = _page_access_state(args, cwd)
+        if state.get("humanReason"):
+            _activate_for_human_attention(args, str(state["humanReason"]))
         current = _current_url(args, cwd)
         if _conversation_id_from_url(current):
             return current
@@ -2170,6 +2252,8 @@ def _ensure_expected_conversation(
         current_url = _current_url(args, cwd)
     except RuntimeError as error:
         event["previous_error"] = f"{type(error).__name__}: {error}"
+        if _temporary_conversation_id(expected_id):
+            raise OriginalConversationRequired("Original temporary conversation target is unreadable") from error
         _forget_owned_cdp_target(args)
         restored_url = _open_conversation(args, cwd, expected_conversation_url)
         restored_id = _conversation_id_from_url(restored_url)
@@ -2223,6 +2307,9 @@ JSON.stringify((() => {
     access_state = _page_access_state(args, cwd)
     if access_state.get("humanReason"):
         _activate_for_human_attention(args, str(access_state["humanReason"]))
+        return _ensure_expected_conversation(args, cwd, expected_conversation_url, baseline_user_message_count)
+    if _temporary_conversation_id(expected_id):
+        raise OriginalConversationRequired("ChatGPT conversation changed; the original temporary request cannot be located safely")
     restored_url = _open_conversation(args, cwd, expected_conversation_url)
     restored_id = _conversation_id_from_url(restored_url)
     event.update(
@@ -2261,6 +2348,7 @@ def _persist_canonical_conversation(
             "label": label,
             "conversation_id": current_id,
             "conversation_url": current_url,
+            "canonical_conversation_url": current_url,
             "conversation_guard": event,
         },
     )
@@ -2799,6 +2887,7 @@ def _retry_conversation_rename(
 
 
 def _open_new_chat(args: argparse.Namespace, cwd: Path) -> None:
+    _run_phase(args, "page_loading")
     _open_url(args, cwd, "https://chatgpt.com/")
     _wait_ms(args, cwd, 2000)
     if _owned_tab_cdp_url(args):
@@ -2944,6 +3033,7 @@ def _ensure_chat_surface(
     recorded: dict[str, Any] | None = None,
     timeout_s: float = 10,
 ) -> dict[str, Any]:
+    _run_phase(args, "chat_mode_check")
     deadline = time.time() + max(0, timeout_s)
     initial: dict[str, Any] = {}
     while True:
@@ -3242,6 +3332,7 @@ def _enable_image_mode_if_available(
 ) -> dict[str, Any]:
     del snapshot
 
+    _run_phase(args, "image_mode_selection")
     initial = _image_mode_state(args, cwd)
     if initial.get("selected"):
         return {
@@ -3447,7 +3538,7 @@ JSON.stringify((() => {
   let humanReason = "";
   if (challengeFrame || challengeText) humanReason = "anti_automation_verification";
   else if (loginPath || loginControl) humanReason = "login_required";
-  const transientPageErrorPattern = /failed to load subscription|something went wrong|network error|failed to load|unable to load|try again later/i;
+  const transientPageErrorPattern = /failed to load subscription|something went wrong|network error|failed to load|unable to load|try again later|we couldn.t load your account|browser check couldn.t finish/i;
   const transientPageErrorTexts = Array.from(document.querySelectorAll("body *"))
     .filter(visible)
     .filter((el) => !el.closest(
@@ -3590,7 +3681,237 @@ def _activate_for_human_attention(args: argparse.Namespace, reason: str) -> None
         activation = activate_browser(configured_browser(), int(_cdp_launch_port(args)))
     except (OSError, ProfileConfigError, subprocess.SubprocessError, ValueError) as error:
         activation = {"status": "error", "error": str(error)}
+    job = getattr(args, "_health_job", None)
+    if not job:
+        raise HumanAttentionRequired(reason, activation)
+    circuit = _queue_context(args)
+    if circuit:
+        with _queue_lock(args):
+            circuit.verification(args._job_id, time.time())
+    label = getattr(args, "_active_request_label", "batch")
+    _write_session_patch(job, {
+        "label": label, "status": "waiting_for_human", "reason": reason,
+        "owned_target_id": getattr(args, "_owned_tab_cdp_target_id", ""),
+    })
+    previous_phase = getattr(getattr(args, "_health", None), "phase", "page_loading")
+    _run_phase(args, "waiting_for_human", "complete verification in the preserved browser; no automatic clicks")
+    deadline = time.monotonic() + getattr(args, "human_wait_timeout", 600)
+    healthy_checks = 0
+    while time.monotonic() < deadline:
+        try:
+            state = _page_access_state(args, Path.cwd())
+        except (RuntimeError, OSError):
+            state = {}
+        if state.get("crashReason") and not state.get("humanReason"):
+            if circuit:
+                with _queue_lock(args):
+                    circuit.verified(args._job_id)
+            session = _read_json_if_exists(_session_path(job, label)) or {}
+            if session.get("submission_committed") in (True, "unknown"):
+                raise OriginalConversationRequired("Browser verification ended in a page error after Send; locate the original request before retrying")
+            args.keep_browser_open = getattr(args, "_original_keep_browser_open", False)
+            args._preserve_owned_tab = False
+            _write_session_patch(job, {"label": label, "status": "page_error", "reason": ""})
+            raise RecoverablePageError("Browser verification ended in a reloadable page error")
+        if state.get("hasPrompt") and not state.get("humanReason") and not state.get("crashReason"):
+            healthy_checks += 1
+        else:
+            healthy_checks = 0
+        if healthy_checks >= 2:
+            session = _read_json_if_exists(_session_path(job, label)) or {}
+            if session.get("submission_committed") in (True, "unknown"):
+                original = _require_original_conversation(args, Path.cwd(), session)
+                if _current_url(args, Path.cwd()) != original:
+                    restored = _open_conversation(args, Path.cwd(), original)
+                    if _conversation_id_from_url(restored) != _conversation_id_from_url(original):
+                        raise OriginalConversationRequired("Verification cleared but the original request did not reopen")
+                patch = {"label": label, "conversation_url": original}
+                if not _temporary_conversation_id(_conversation_id_from_url(original)):
+                    patch["canonical_conversation_url"] = original
+                _write_session_patch(job, patch)
+            if circuit:
+                with _queue_lock(args):
+                    circuit.verified(args._job_id)
+            args.keep_browser_open = getattr(args, "_original_keep_browser_open", False)
+            args._preserve_owned_tab = False
+            _write_session_patch(job, {"label": label, "status": "verification_resolved", "reason": ""})
+            health = getattr(args, "_health", None)
+            if health:
+                with health.lock:
+                    health.page = state
+                    health.failures = 0
+            _run_phase(args, previous_phase, "human verification cleared in original target")
+            return
+        time.sleep(5)
     raise HumanAttentionRequired(reason, activation)
+
+
+def _run_phase(args: argparse.Namespace, phase: str, detail: str = "") -> None:
+    health = getattr(args, "_health", None)
+    if health:
+        health.set_phase(phase, detail)
+
+
+def _heartbeat_probe(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    target = _owned_tab_cdp_url(args)
+    if not target:
+        return {"status": "browser_startup"}
+    # Separate read-only CDP connection: never focus, click, navigate, or acquire command locks.
+    script = PAGE_ACCESS_STATE_JS.replace(
+        "return {\n    hasPrompt,",
+        "return {\n    attachmentCount: document.querySelectorAll('[data-composer-attachments] img').length,"
+        " pendingCount: document.querySelectorAll('[role=progressbar],[aria-busy=true]').length,"
+        " userTurnCount: (() => {const {users} = __CONVERSATION_DOM__; return users.length;})(),"
+        " hasPrompt,",
+    ).replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
+    script = "JSON.stringify({...JSON.parse((" + script + ")), chatSurface: JSON.parse((" + CHAT_SURFACE_STATE_JS + "))})"
+    deadline = time.monotonic() + 5
+    with _CDPConnection.connect(target, timeout=5) as conn:
+        conn._timeout = max(0.001, deadline - time.monotonic())
+        result = conn.call("Runtime.evaluate", {"expression": script, "returnByValue": True})
+    page = json.loads(result["result"]["value"])
+    job = getattr(args, "_health_job", None)
+    if job:
+        session = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or {}
+        page["submission_committed"] = session.get("submission_committed", False)
+        page["job_status"] = session.get("status", "preparing")
+        page["recovery"] = session.get("page_recovery")
+    return page
+
+
+def _check_run_health(args: argparse.Namespace) -> None:
+    health = getattr(args, "_health", None)
+    if not health:
+        return
+    with health.lock:
+        page = dict(health.page)
+        failures = health.failures
+    if page.get("humanReason"):
+        _activate_for_human_attention(args, page["humanReason"])
+    elif failures >= 3:
+        raise RecoverablePageError("Independent heartbeat failed three consecutive page checks")
+
+
+def _queue_context(args: argparse.Namespace):
+    path = getattr(args, "_queue_path", None)
+    return SubmissionCircuit(path) if path else None
+
+
+@contextlib.contextmanager
+def _queue_lock(args: argparse.Namespace):
+    path = Path(args._queue_path).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                _try_file_lock(handle)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Queue-health lock timed out")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+
+def _queue_admit(args: argparse.Namespace, *, allow_probe: bool = False) -> str:
+    circuit = _queue_context(args)
+    if not circuit:
+        return "allow"
+    with _queue_lock(args):
+        action = circuit.admit(args._queue_owner, time.time(), allow_probe=allow_probe)
+        state = circuit.read()
+    if action == "paused":
+        raise QueuePausedError(state)
+    return action
+
+
+def _queue_probe(args: argparse.Namespace, cwd: Path) -> None:
+    _run_phase(args, "queue_health_check", "one leased check; no prompt submission")
+    healthy = False
+    try:
+        _open_new_chat(args, cwd)
+        _wait_for_prompt_box(args, cwd, timeout_s=15)
+        _ensure_chat_surface(args, cwd)
+        _enable_image_mode_if_available(args, cwd, "")
+        healthy = True
+    except HumanAttentionRequired:
+        raise
+    except (RuntimeError, OSError) as error:
+        with _queue_lock(args):
+            state = _queue_context(args).read()
+        raise QueuePausedError(state) from error
+    finally:
+        with _queue_lock(args):
+            _queue_context(args).probe_finished(args._queue_owner, time.time(), healthy)
+
+
+def run_health_check(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    """Resolve this job's verification pause without recovering or submitting its request."""
+    _run_phase(args, "queue_health_check", "read-only account checks; no uploads or submission")
+    _open_new_chat(args, cwd)
+    deadline = time.monotonic() + 30
+    healthy_checks = 0
+    while time.monotonic() < deadline:
+        state = _page_access_state(args, cwd)
+        if state.get("humanReason") or state.get("crashReason"):
+            args.keep_browser_open = True
+            args._preserve_owned_tab = True
+            return {"status": "needs_ops", "reason": state.get("humanReason") or state["crashReason"],
+                    "submission_attempted": False}
+        if state.get("hasPrompt"):
+            healthy_checks += 1
+            if healthy_checks == 2:
+                circuit = _queue_context(args)
+                queue = {"state": "running"}
+                if circuit:
+                    with _queue_lock(args):
+                        circuit.verified(args._job_id)
+                        queue = circuit.read()
+                saved = _read_json_if_exists(_session_path(job)) or {}
+                return {"status": "health_checked" if queue["state"] == "running" else "queue_paused",
+                        "queue_health": queue, "submission_attempted": False,
+                        "submission_committed": saved.get("submission_committed", False)}
+            time.sleep(5)
+        else:
+            healthy_checks = 0
+            time.sleep(1)
+    return {"status": "needs_ops", "reason": "page_health_check_timed_out", "submission_attempted": False}
+
+
+def _require_original_conversation(args: argparse.Namespace, cwd: Path, session: dict[str, Any]) -> str:
+    """A temporary URL cannot be reopened. Accept only the same verified user turn."""
+    saved = str(session.get("canonical_conversation_url") or session.get("conversation_url") or "")
+    saved_id = _conversation_id_from_url(saved)
+    access = _page_access_state(args, cwd)
+    if access.get("humanReason"):
+        _activate_for_human_attention(args, str(access["humanReason"]))
+    if saved_id and not _temporary_conversation_id(saved_id):
+        return saved
+    current = _current_url(args, cwd)
+    current_id = _conversation_id_from_url(current)
+    if (saved_id and current_id == saved_id
+            and session.get("owned_target_id")
+            and session["owned_target_id"] == getattr(args, "_owned_tab_cdp_target_id", None)):
+        return current  # Observe this retained target in place; never reopen its temporary URL.
+    if current_id and not _temporary_conversation_id(current_id):
+        observed = _eval_json(args, cwd, r"""
+JSON.stringify((() => {
+ const {users} = __CONVERSATION_DOM__;
+ const user = users.at(-1);
+ return {text: user ? (user.innerText || user.textContent || '') : ''};
+})())
+""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS))
+        expected = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
+        if expected and expected in " ".join(str(observed.get("text") or "").split()):
+            return current
+    raise OriginalConversationRequired(
+        "The request may already be submitted, but its original canonical conversation cannot "
+        "be verified. Keep the original job; locate its conversation before collecting."
+    )
 
 
 def _page_recovery_attempt_limit(args: argparse.Namespace) -> int:
@@ -3610,11 +3931,11 @@ JSON.stringify((() => {
   };
   const excluded = "[inert],#history,[aria-label='Chat history'],[data-sidebar-item]," +
     "[data-message-author-role],[data-turn-key],[data-testid^='conversation-turn'],form";
-  const error = /failed to load|something went wrong|network error|unable to load|try again later|加载失败|网络错误/i;
+  const error = /failed to load|something went wrong|network error|unable to load|try again later|we couldn.t load your account|browser check couldn.t finish|加载失败|网络错误/i;
   for (const el of document.querySelectorAll("button,[role='button']")) {
     if (!visible(el) || el.closest(excluded) || el.matches("[disabled],[aria-disabled='true']")) continue;
     const label = (el.getAttribute("aria-label") || el.innerText || "").trim();
-    if (!/^(try again|retry|再试一次|重试)$/i.test(label)) continue;
+    if (!/^(try again|retry|reload|再试一次|重试|重新加载)$/i.test(label)) continue;
     let container = el.parentElement;
     for (let depth = 0; container && container !== document.body && depth < 4; depth++, container = container.parentElement) {
       const text = (container.innerText || "").trim();
@@ -3639,6 +3960,11 @@ def _recover_chatgpt_page(
     attempt: int,
     reason: str,
 ) -> dict[str, Any]:
+    _run_phase(args, "page_recovery", reason)
+    health = getattr(args, "_health", None)
+    if health:
+        with health.lock:
+            health.failures = 0
     target_url = target_url or "https://chatgpt.com/"
     try:
         state = _page_access_state(args, cwd)
@@ -3648,6 +3974,9 @@ def _recover_chatgpt_page(
         state = {}
     if state.get("humanReason"):
         _activate_for_human_attention(args, str(state["humanReason"]))
+    if phase.startswith("post_submit") and getattr(args, "_health_job", None):
+        saved = _read_json_if_exists(_session_path(args._health_job, getattr(args, "_active_request_label", "batch"))) or {}
+        target_url = _require_original_conversation(args, cwd, saved)
 
     previous_target_id = str(getattr(args, "_owned_tab_cdp_target_id", "") or "")
     recovery_method = "navigate_owned_tab"
@@ -3741,6 +4070,8 @@ def _run_with_page_recovery(
         ChatSurfaceSelectionError,
         ImageModeSelectionError,
         ReferenceUploadError,
+        QueuePausedError,
+        OriginalConversationRequired,
     )
     recoverable_errors = (
         RecoverablePageError,
@@ -3761,6 +4092,7 @@ def _run_with_page_recovery(
             _activate_for_human_attention(args, str(state["humanReason"]))
 
     try:
+        _check_run_health(args)
         return operation(), []
     except HumanAttentionRequired:
         raise
@@ -3913,7 +4245,7 @@ def _attachment_name_matches(path: str, label: str) -> bool:
     if actual.name.casefold() == expected.name.casefold():
         return True
     # ChatGPT may append a numeric suffix when the same reference was uploaded before.
-    stem = re.sub(r"\(\d+\)$", "", actual.stem).rstrip()
+    stem = re.sub(r"\((?:\d+|\d{8}-\d{6})\)$", "", actual.stem).rstrip()
     return stem.casefold() == expected.stem.casefold() and actual.suffix.casefold() == expected.suffix.casefold()
 
 
@@ -4062,6 +4394,7 @@ def _upload_references_in_order(
     references: list[str],
 ) -> dict[str, Any]:
     """Queue references in order without per-file completion waits, then verify all uploads."""
+    _run_phase(args, "reference_upload")
     if not references:
         return {
             "reference_count": 0,
@@ -4073,6 +4406,22 @@ def _upload_references_in_order(
             "order_verification_method": "no_references",
         }
 
+    original_references = list(references)
+    aliases = []
+    job = getattr(args, "_health_job", None)
+    if job:
+        root = Path(job["download_dir"]) / "upload_refs"
+        root.mkdir(parents=True, exist_ok=True)
+        job_key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+        references = []
+        for index, source in enumerate(original_references, start=1):
+            data = Path(source).read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            alias = root / f"ref-{index:02d}-{job_key}-{digest[:12]}{Path(source).suffix}"
+            alias.write_bytes(data)
+            references.append(str(alias))
+            aliases.append({"index": index, "source_path": source, "upload_path": str(alias), "sha256": digest})
+        atomic_json(root / "mapping.json", {"references": aliases})
     steps: list[dict[str, Any]] = []
     for index, path in enumerate(references, start=1):
         _upload_files(args, cwd, [path])
@@ -4083,7 +4432,8 @@ def _upload_references_in_order(
         )
         steps.append({
             "index": index,
-            "path": path,
+            "path": original_references[index - 1],
+            "upload_path": path,
             "observed_attachment_count": int(accepted.get("attachment_count") or 0),
             "observed_blob_image_count": int(accepted.get("blob_image_count") or 0),
             "pending_attachment_count": int(accepted.get("pending_attachment_count") or 0),
@@ -4145,7 +4495,9 @@ def _upload_references_in_order(
         **final_observation,
         "all_uploads_ready_at": time.time(),
         "upload_sequence": steps,
-        "ordered_upload_paths": list(references),
+        "ordered_upload_paths": original_references,
+        "effective_upload_paths": references,
+        "upload_aliases": aliases,
         "order_verified": True,
         "attachment_label_order_verified": attachment_label_order_verified,
         "order_verification_method": "visible_attachment_labels_and_ordered_file_input",
@@ -4322,6 +4674,7 @@ def run_dry_upload(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> 
 
 
 def _paste_prompt(args: argparse.Namespace, cwd: Path, message: str) -> None:
+    _run_phase(args, "prompt_insertion")
     if _owned_tab_cdp_url(args):
         try:
             with _CDPConnection.connect(_owned_tab_cdp_url(args), timeout=180) as conn:
@@ -4569,6 +4922,27 @@ def _composer_state_has_submission_evidence(
     return True
 
 
+def _remember_submitted_url(args: argparse.Namespace, cwd: Path) -> None:
+    job = getattr(args, "_health_job", None)
+    if not job:
+        return
+    try:
+        url = _current_url(args, cwd)
+    except RuntimeError:
+        return
+    cid = _conversation_id_from_url(url)
+    if not cid:
+        return
+    patch: dict[str, Any] = {
+        "label": getattr(args, "_active_request_label", "batch"),
+        "conversation_url": url,
+        "owned_target_id": getattr(args, "_owned_tab_cdp_target_id", ""),
+    }
+    if not _temporary_conversation_id(cid):
+        patch["canonical_conversation_url"] = url
+    _write_session_patch(job, patch)
+
+
 def _submit_prompt(
     args: argparse.Namespace,
     cwd: Path,
@@ -4576,114 +4950,61 @@ def _submit_prompt(
     timeout_s: int = 240,
     trace_dir: Path | None = None,
 ) -> None:
-    last_state: dict[str, Any] = {}
-    states: list[dict[str, Any]] = []
-    deadline = time.time() + timeout_s
-    iteration = 0
-    enter_presses = 0
+    _run_phase(args, "submitting", "at most one send action; then observe only")
+    args._submit_dispatched = False
+    job = getattr(args, "_health_job", None)
+    if job:
+        _write_session_patch(job, {"label": getattr(args, "_active_request_label", "batch"),
+                                   "submission_committed": False, "dispatch_started": False})
+    deadline = time.monotonic() + timeout_s
+    dispatched = False
     saw_prompt = False
-    max_enter_presses = 5
-
-    while time.time() < deadline:
-        iteration += 1
-        last_state = _composer_submit_state(args, cwd, message)
-        saw_prompt = saw_prompt or bool(last_state.get("editorHasPromptTail"))
-        states.append({"iteration": iteration, "state": last_state, "time": time.time()})
+    states = []
+    while time.monotonic() < deadline:
+        if dispatched:
+            _remember_submitted_url(args, cwd)
+        _check_run_health(args)
+        access = _page_access_state(args, cwd)
+        if access.get("humanReason"):
+            waiting_at = time.monotonic()
+            _activate_for_human_attention(args, str(access["humanReason"]))
+            deadline += time.monotonic() - waiting_at
+        if dispatched:
+            _remember_submitted_url(args, cwd)
+        state = _composer_submit_state(args, cwd, message)
+        saw_prompt = saw_prompt or bool(state.get("editorHasPromptTail"))
+        states.append({"state": state, "time": time.time()})
         if trace_dir:
-            (trace_dir / "send_button_states.json").write_text(
-                json.dumps(states[-80:], ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        if _composer_state_has_submission_evidence(
-            last_state,
-            saw_prompt=saw_prompt,
-            enter_presses=enter_presses,
-        ):
+            atomic_json(trace_dir / "send_button_states.json", {"observations": states[-80:]})
+        if _composer_state_has_submission_evidence(state, saw_prompt=saw_prompt, enter_presses=int(dispatched)):
             return
-        if last_state.get("readyToSubmit"):
-            if enter_presses >= max_enter_presses:
-                break
-            click_state = _click_composer_send_button(args, cwd, message)
-            states.append(
-                {
-                    "iteration": iteration,
-                    "action": "click_send",
-                    "state": click_state,
-                    "time": time.time(),
-                }
-            )
+        if not dispatched and state.get("readyToSubmit"):
+            if job:
+                saved = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or {}
+                chat = _ensure_chat_surface(args, cwd, recorded=saved.get("chat_surface"), timeout_s=2)
+                if chat.get("clicked_chat"):
+                    raise RecoverablePageError("Chat surface changed after preparation; rebuild attachments and prompt before Send")
+            _queue_admit(args)
+            # Mark before the call: a transport exception cannot prove that Send was not invoked.
+            dispatched = True
+            args._submit_dispatched = True
+            if job:
+                _write_session_patch(job, {"label": getattr(args, "_active_request_label", "batch"),
+                                           "submission_committed": "unknown", "dispatch_started": True,
+                                           "dispatch_started_at": time.time()})
+            states.append({"action": "dispatch_started", "time": time.time()})
             if trace_dir:
-                (trace_dir / "send_button_states.json").write_text(
-                    json.dumps(states[-80:], ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-            if click_state.get("clicked"):
-                time.sleep(1)
-                after_click = _composer_submit_state(args, cwd, message)
-                saw_prompt = saw_prompt or bool(after_click.get("editorHasPromptTail"))
-                states.append(
-                    {
-                        "iteration": iteration,
-                        "action": "after_click_send",
-                        "state": after_click,
-                        "time": time.time(),
-                    }
-                )
-                if trace_dir:
-                    (trace_dir / "send_button_states.json").write_text(
-                        json.dumps(states[-80:], ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8",
-                    )
-                if _composer_state_has_submission_evidence(
-                    after_click,
-                    saw_prompt=saw_prompt,
-                    enter_presses=enter_presses,
-                ):
-                    return
-            enter_presses += 1
-            _press_composer_enter(args, cwd)
-            time.sleep(1)
-            after_enter = _composer_submit_state(args, cwd, message)
-            saw_prompt = saw_prompt or bool(after_enter.get("editorHasPromptTail"))
-            states.append(
-                {
-                    "iteration": iteration,
-                    "action": "press_enter",
-                    "enter_press": enter_presses,
-                    "state": after_enter,
-                    "time": time.time(),
-                }
-            )
+                atomic_json(trace_dir / "send_button_states.json", {"observations": states[-80:]})
+            clicked = _click_composer_send_button(args, cwd, message)
+            states.append({"action": "click_send", "state": clicked, "time": time.time()})
+            if not clicked.get("clicked"):
+                _press_composer_enter(args, cwd)
+                states.append({"action": "press_enter", "time": time.time()})
+            _remember_submitted_url(args, cwd)
             if trace_dir:
-                (trace_dir / "send_button_states.json").write_text(
-                    json.dumps(states[-80:], ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-            if _composer_state_has_submission_evidence(
-                after_enter,
-                saw_prompt=saw_prompt,
-                enter_presses=enter_presses,
-            ):
-                return
+                atomic_json(trace_dir / "send_button_states.json", {"observations": states[-80:]})
         time.sleep(0.5)
-
-    if _composer_state_has_submission_evidence(
-        last_state,
-        saw_prompt=saw_prompt,
-        enter_presses=enter_presses,
-    ):
-        return
-
-    if trace_dir:
-        _screenshot(args, cwd, trace_dir / "submit_failed_still_in_composer.png")
-        (trace_dir / "send_button_states.json").write_text(
-            json.dumps(states, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    raise RuntimeError(
-        "Prompt did not clear from the composer after Enter submit attempts.\n"
-        f"Last send state:\n{json.dumps(last_state, ensure_ascii=False, indent=2)}\n"
-    )
+    raise RuntimeError("Submission could not be confirmed after one dispatch; inspect original request before retrying")
 
 
 def _image_inventory(args: argparse.Namespace, cwd: Path) -> list[dict[str, Any]]:
@@ -5133,6 +5454,7 @@ def _download_url_with_browser(
         if delay:
             time.sleep(delay)
         try:
+            _check_run_health(args)
             output = _eval_js(args, cwd, script, timeout=240).strip()
             try:
                 payload = json.loads(output)
@@ -5149,6 +5471,8 @@ def _download_url_with_browser(
                 raise RuntimeError("browser fetch did not return a data URL")
             output_path.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
             return
+        except (HumanAttentionRequired, OriginalConversationRequired):
+            raise
         except Exception as error:
             errors.append(f"attempt {attempt}: {type(error).__name__}: {error}")
     raise RuntimeError("browser-authenticated image download failed after 4 attempts: " + " | ".join(errors))
@@ -5166,6 +5490,7 @@ def _download_urls(
     output_dir: Path,
     prefix: str,
 ) -> list[dict[str, Any]]:
+    _run_phase(args, "download")
     output_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
     for index, url in enumerate(urls, start=1):
@@ -5173,6 +5498,8 @@ def _download_urls(
         method = "browser_fetch"
         try:
             _download_url_with_browser(args, cwd, url, output_path)
+        except (HumanAttentionRequired, OriginalConversationRequired):
+            raise
         except Exception:
             if _url_requires_browser_credentials(url):
                 raise
@@ -5208,6 +5535,8 @@ def _download_candidates(
         url = candidate.get("src") or ""
         try:
             item = _download_urls(args, cwd, [url], output_dir, f"{prefix}_{index:02d}_fetch")[0]
+        except (HumanAttentionRequired, OriginalConversationRequired):
+            raise
         except Exception as error:
             if failures is not None:
                 failures.append(
@@ -5284,6 +5613,7 @@ def _collect_generated_images_with_retries(
     expected_count = _expected_image_count(job, label)
     download_limit = _candidate_download_limit(expected_count, references)
     file_prefix = f"{job['job_name']}_agent_browser_{_variant_prefix(label)}_generated"
+    _run_phase(args, "generation_wait")
     started_at = time.time()
     progress_interval = max(5, int(getattr(args, "progress_interval", 20)))
     refresh_interval_s = max(
@@ -6310,13 +6640,21 @@ def _run_one_request(
     )
 
     references = [ref["path"] for ref in job.get("reference_images", [])]
-    existing_session = (_read_json_if_exists(_session_path(job, label)) or {}) if resume else {}
-    if existing_session.get("error_type") == "reference_upload_failed" or existing_session.get("status") == "reference_upload_failed":
+    saved_session = _read_json_if_exists(_session_path(job, label)) or {}
+    existing_session = saved_session if resume or saved_session.get("submission_committed") in (True, "unknown") else {}
+    if (existing_session.get("submission_committed") not in (True, "unknown")
+            and (existing_session.get("error_type") == "reference_upload_failed"
+                 or existing_session.get("status") == "reference_upload_failed")):
         existing_session = {}
+    if existing_session.get("submission_committed") in (True, "unknown"):
+        existing_session["conversation_url"] = _require_original_conversation(args, cwd, existing_session)
     existing_conversation_url = existing_session.get("conversation_url")
     if existing_conversation_url:
         _validate_session_reference_mapping(job, existing_session)
-        _open_conversation(args, cwd, existing_conversation_url)
+        if _current_url(args, cwd) != existing_conversation_url:
+            restored = _open_conversation(args, cwd, existing_conversation_url)
+            if _conversation_id_from_url(restored) != _conversation_id_from_url(existing_conversation_url):
+                raise OriginalConversationRequired("Original conversation did not reopen; refusing replacement submission")
         conversation_url = existing_conversation_url
         _wait_until_idle(args, cwd)
         chat_surface = _ensure_chat_surface(
@@ -6402,6 +6740,7 @@ def _run_one_request(
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return {**report, "report_path": str(report_path), "resumed": True}
 
+    _queue_admit(args)
     expected_count = _expected_image_count(job, label)
     continued_from: dict[str, Any] | None = None
     if conversation_session_path is not None:
@@ -6496,7 +6835,18 @@ def _run_one_request(
     upload_mentions = {Path(path).name: Path(path).name in after_upload for path in references}
 
     chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface, timeout_s=2)
+    _queue_admit(args)
     upload_observation["submit_started_at"] = time.time()
+    _write_session_patch(job, {
+        "label": label, "status": "submitting", "submission_committed": "unknown",
+        "owned_target_id": getattr(args, "_owned_tab_cdp_target_id", ""),
+        "prompt_sha256": hashlib.sha256(message.encode()).hexdigest(),
+        "baseline_user_message_count": baseline_message_counts["user_message_count"],
+        "baseline_asset_urls": sorted(baseline),
+        **reference_audit_fields(job),
+        "reference_upload": {key: value for key, value in upload_observation.items() if key != "page_text"},
+        "chat_surface": chat_surface, "image_mode": image_mode,
+    })
     try:
         _submit_prompt(
             args,
@@ -6517,6 +6867,10 @@ def _run_one_request(
             "label": label,
             "reason": f"{type(error).__name__}: {error}",
         }
+        if getattr(args, "_submit_dispatched", None) is False:
+            submission_report.update(status="generation_failed", error_type="chatgpt_submit_preparation_failed",
+                                     submission_committed=False, retryable=True,
+                                     recommended_next_action="rerun_same_job")
         _write_session_patch(job, submission_report)
         raise SubmissionStateUnknownError(submission_report) from error
     _write_session_patch(
@@ -6539,6 +6893,10 @@ def _run_one_request(
             },
         },
     )
+    circuit = _queue_context(args)
+    if circuit:
+        with _queue_lock(args):
+            circuit.submitted()
     try:
         post_submit_target_url = _current_url(args, cwd)
     except RuntimeError:
@@ -6555,6 +6913,10 @@ def _run_one_request(
             )
         _screenshot(args, cwd, trace_dir / "04_after_submit.png")
         after_submit = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
+        binding = {"label": label, "conversation_url": conversation_url}
+        if not _temporary_conversation_id(_conversation_id_from_url(conversation_url)):
+            binding["canonical_conversation_url"] = conversation_url
+        _write_session_patch(job, binding)
         return {"conversation_url": conversation_url, "after_submit": after_submit}
 
     submitted_turn, post_submit_recoveries = _run_with_page_recovery(
@@ -6840,6 +7202,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         existing_session=existing_session,
         summary=existing_summary,
     )
+    if existing_session.get("submission_committed") in (True, "unknown"):
+        target_conversation_url = _require_original_conversation(args, cwd, existing_session)
     if not _conversation_id_from_url(target_conversation_url):
         raise RuntimeError(
             "collect-current is not on a ChatGPT conversation page and no resumable "
@@ -6884,7 +7248,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
             )
             break
         rows = _image_inventory(args, cwd)
-        candidates = _generated_image_candidates(rows, set())
+        candidates = _vertical_images(rows, set(existing_session.get("baseline_asset_urls") or []),
+                                      existing_session.get("baseline_user_message_count"))
         if time.time() >= next_progress_at:
             page_health = _generation_page_health(args, cwd, conversation_url, page_text)
             if page_health.get("human_reason") or page_health.get("challenge_frame"):
@@ -7138,7 +7503,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["dry-upload", "single-batch-submit", "conversation-followup", "collect-current"],
+        choices=["dry-upload", "single-batch-submit", "conversation-followup", "collect-current", "status", "health-check"],
         default="dry-upload",
         help=(
             "Start with dry-upload to compare attachment behavior without submitting prompts. "
@@ -7216,7 +7581,14 @@ def main() -> int:
             "screenshots are always preserved."
         ),
     )
+    parser.add_argument("--human-wait-timeout", type=int, default=600,
+                        help="Seconds to observe manual verification; never click verification controls.")
     args = parser.parse_args()
+    if args.mode == "status":
+        job = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+        print(json.dumps({"heartbeat": heartbeat_status(Path(job["download_dir"])),
+                          "session": _read_json_if_exists(_session_path(job)) or {}}, ensure_ascii=False, indent=2))
+        return 0
 
     if PIL_IMPORT_ERROR is not None:
         print(
@@ -7254,12 +7626,12 @@ def main() -> int:
     cwd = Path.cwd()
     manifest_path = Path(args.manifest).resolve()
     job = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if job.get("reuse_conversation_references") and args.mode not in {"conversation-followup", "collect-current"}:
+    if job.get("reuse_conversation_references") and args.mode not in {"conversation-followup", "collect-current", "health-check"}:
         raise ValueError(
             "This job reuses existing conversation references and must run with "
             "--mode conversation-followup (or collect-current after submission)."
         )
-    if args.mode != "collect-current":
+    if args.mode not in {"collect-current", "health-check"}:
         _validate_manifest_reference_mapping(job)
     if not args.download_path:
         args.download_path = Path(job["download_dir"]).resolve()
@@ -7267,12 +7639,43 @@ def main() -> int:
     if not args.cdp and not args.auto_connect:
         args.cdp = args.cdp_port
     report: dict[str, Any] | None = None
+    args._health_job = job
+    args._job_id = hashlib.sha256(str(_session_path(job).resolve()).encode()).hexdigest()
+    args._queue_owner = uuid.uuid4().hex
+    args._original_keep_browser_open = args.keep_browser_open
+    if args.user_data_dir and args.profile:
+        lane = hashlib.sha256(f"{Path(args.user_data_dir).expanduser().resolve()}:{args.profile}".encode()).hexdigest()[:20]
+        args._queue_path = resolve_tool_state_root("chatgpt-web") / f"queue-{lane}.json"
+    args._health = RunHeartbeat(Path(job["download_dir"]), lambda: _heartbeat_probe(args, cwd))
+    args._health.start()
+    saved = _read_json_if_exists(_session_path(job)) or {}
+    args._resume_session = saved
+    args._submitted_prompt = str(job.get("chatgpt_batch_message") or job.get("chatgpt_message") or "")
+    resume_human = saved.get("reason") in ("anti_automation_verification", "login_required") and bool(saved.get("owned_target_id"))
+    resume_only = args.mode in {"collect-current", "health-check"} or saved.get("submission_committed") in (True, "unknown") or resume_human
+    queue_action = "allow"
     try:
+        if not resume_only:
+            queue_action = _queue_admit(args, allow_probe=True)
         _prepare_browser_lane(args, cwd)
         _validate_profile(args)
+        if queue_action == "probe":
+            _queue_probe(args, cwd)
+    except OriginalConversationRequired as error:
+        args._health.close("needs_ops")
+        print(json.dumps({"status": "needs_ops", "error_type": "original_conversation_required",
+                          "reason": str(error), "submission_committed": saved.get("submission_committed", "unknown"),
+                          "retryable": False}, ensure_ascii=False, indent=2))
+        return 2
+    except QueuePausedError as error:
+        _cleanup_agent_browser(args, cwd)
+        args._health.close("queue_paused")
+        print(json.dumps(error.report, ensure_ascii=False, indent=2))
+        return 2
     except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError, RuntimeError) as error:
         if getattr(args, "_browser_session", None) is not None:
             _cleanup_agent_browser(args, cwd)
+        args._health.close("browser_startup_failed")
         print(
             json.dumps(
                 {
@@ -7287,7 +7690,12 @@ def main() -> int:
         return 2
     exit_code = 0
     try:
-        if args.mode == "single-batch-submit":
+        if resume_human and args.mode != "health-check":
+            _activate_for_human_attention(args, str(saved["reason"]))
+        if args.mode == "health-check":
+            report = run_health_check(args, job, cwd)
+            exit_code = 0 if report["status"] == "health_checked" else 2
+        elif args.mode == "single-batch-submit":
             report = run_submit(args, job, cwd)
         elif args.mode == "conversation-followup":
             report = run_conversation_followup(args, job, cwd)
@@ -7295,8 +7703,25 @@ def main() -> int:
             report = run_collect_current(args, job, cwd)
         else:
             report = run_dry_upload(args, job, cwd)
+    except QueuePausedError as error:
+        report = error.report
+        exit_code = 2
+    except OriginalConversationRequired as error:
+        args.keep_browser_open = True
+        args._preserve_owned_tab = True
+        current_session = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or saved
+        report = {"status": "needs_ops", "error_type": "original_conversation_required",
+                  "submission_committed": current_session.get("submission_committed", "unknown"),
+                  "retryable": False, "reason": str(error),
+                  "recommended_next_action": "locate_original_conversation_then_collect"}
+        exit_code = 2
     except PageRecoveryExhaustedError as error:
         report = error.report
+        if _queue_context(args) and report.get("submission_committed") is False:
+            with _queue_lock(args):
+                state = _queue_context(args).failure(args._job_id, time.time())
+            if state["state"] == "paused":
+                report.update(queue_health=state, recommended_next_action="wait_for_queue_health_check", retryable=False)
         exit_code = 2
     except SubmissionStateUnknownError as error:
         report = error.report
@@ -7354,6 +7779,11 @@ def main() -> int:
         }
         exit_code = 2
     finally:
+        terminal_status = (report or {}).get("status")
+        if not terminal_status and (report or {}).get("variants"):
+            statuses = [v.get("downloaded", {}).get("status") or "stopped" for v in report["variants"]]
+            terminal_status = next((status for status in statuses if status != "downloaded"), "downloaded")
+        args._health.close(terminal_status or "stopped")
         _cleanup_agent_browser(args, cwd)
     if report is not None:
         retention = _prune_success_trace_screenshots(

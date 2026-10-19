@@ -124,3 +124,27 @@ with the terminal `status`, `error_type`, internal retry history (`page_recoveri
 `failure_retries`, or download failures), the caller action attempted, conversation URL, retained
 artifact paths, and `recommended_next_action`. Do not silently stop at the first transient error,
 wait indefinitely, or create an unbounded retry loop.
+
+## Whole-run health and recovery
+
+- `chatgpt_heartbeat.json` is the latest atomic snapshot; `chatgpt_heartbeat.jsonl` is the event
+  journal. Both cover browser startup, throttle waits, mode selection, upload, prompt insertion,
+  submission, generation, download, manual verification, and terminal outcomes.
+- `--mode status` reads the heartbeat and session without controlling Chrome. It reports stopped
+  processes and stale observations separately from completed or paused tasks.
+- `--mode health-check` uses a separate tab and returns `health_checked` after two healthy account
+  checks five seconds apart, without uploads or submission. It clears only this job's verification
+  pause and preserves its session, including unknown submission state. Remaining pause owners or
+  service-failure pauses return `queue_paused`; an unusable account returns `needs_ops`.
+- Sessions persist `dispatch_started`, `dispatch_started_at`, `owned_target_id`, `prompt_sha256`,
+  and `canonical_conversation_url` as evidence becomes available. Send is attempted once; unknown
+  outcomes require original-conversation inspection. A retained temporary target can be observed
+  in place, but a temporary URL alone is never reopened for recovery.
+- `waiting_for_human` continues observation for at most 600 seconds. Two healthy checks five seconds
+  apart resume the same task. `needs_ops` means observation ended and human action/recovery remains.
+- `queue_paused` blocks fresh submissions, with `queue_health` describing the reason and next check.
+  Two distinct exhausted pre-submit jobs within 600 seconds pause the lane; a cooldown of 300 seconds
+  permits one health probe. Already-submitted collection is permitted while the queue is paused.
+- `upload_refs/mapping.json` maps each original reference to its byte-identical upload alias and full
+  SHA-256. Upload observations keep original order and separately record `effective_upload_paths`
+  and `upload_aliases`; filename normalization never replaces attachment-count/order verification.

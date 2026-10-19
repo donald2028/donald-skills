@@ -56,9 +56,11 @@ On macOS, keep the automatically launched headed Chrome visible behind the activ
 normal automation; this is not headless mode and does not make Chrome frontmost. The shared
 runtime launches the window in the background without hiding it because macOS stops servicing CDP
 screenshots for a fully hidden application. Do not activate it during normal
-generation. When the runner detects login or anti-automation verification, it returns `needs_ops`,
-activates only the configured CDP Chrome, and leaves it open for the user. Explain the required
-action and continue after the user confirms completion. Policy refusals are reported without
+generation. When the runner detects login or anti-automation verification, it activates only the
+configured CDP Chrome and observes the preserved task page for up to 10 minutes. Tell the user to
+complete verification manually. The runner never clicks verification controls or refreshes an
+active challenge. Two healthy checks five seconds apart resume the original task. A timeout returns
+`needs_ops` and leaves the browser open; rerun the same job to recover its original request. Policy refusals are reported without
 activating Chrome because they are not an interactive login or verification state. After an
 ordinary terminal result, the runner closes its tab and exits the Donald Chrome when no other run
 is active. `needs_ops` and explicit `--keep-browser-open` runs keep Chrome open.
@@ -166,12 +168,18 @@ reporting it:
   prompt was not submitted;
 - for `timeout_no_images`, preserve the current conversation and try `collect-current` once rather
   than opening a new request immediately;
-- for `submit_new_request` after an explicit terminal generation error and exhausted in-page Retry
-  attempts, rerun the same manifest once with `--no-resume` to create a fresh request;
+- for `submit_new_request` after a terminal generation error and exhausted in-page Retry attempts,
+  report the failure. Prepare a separate replacement job only when the user authorizes another
+  submission; never reuse a committed manifest to bypass recovery;
 - for `inspect_session_and_rerun_if_not_submitted`, inspect `chatgpt_session.json`: rerun only when
   it proves the prompt was not submitted; otherwise collect the current conversation first;
-- for `policy_refused`, `retryable=false`, login, MFA, CAPTCHA, verification, or account
-  restrictions, do not retry unchanged. Report or request the required user action immediately.
+- for `queue_paused`, stop dispatching new jobs to this browser environment; do not create new
+  manifests to bypass the pause. After the five-minute cooldown, one runner may perform a health
+  check without submitting a prompt; a successful check releases the queue;
+- for `original_conversation_required` or an unknown submission, locate the original conversation
+  before collecting. A missing/temporary URL is not proof that Send did not happen;
+- for `policy_refused`, `retryable=false`, unresolved verification, or account restrictions, report
+  or request the required user action. Do not loop unchanged submissions.
 
 Never loop caller-level retries indefinitely and never resubmit when commit state is unknown. If
 the one recovery cycle fails or no safe automatic action exists, promptly return the structured
@@ -205,6 +213,10 @@ waits until every attachment is visible and no upload progress remains, then ver
 visible attachment filenames or numbered labels match the compiled `Reference Image 1..N` map.
 Only after both checks pass does it paste and send the prompt. Missing, extra, reordered, or
 unverifiable attachments block submission; file selection alone is not proof of attachment order.
+The runner creates byte-identical, job-specific numbered upload aliases in `upload_refs/` and records
+source paths plus SHA-256 hashes in `upload_refs/mapping.json`. Visible filenames may add a numeric
+or `YYYYMMDD-HHMMSS` parenthesized suffix; unknown renames and ambiguous mappings still fail. Aliases
+never enter the model-facing reference map.
 
 The runner treats `--aspect-ratio` as an end-to-end output contract. If the current ChatGPT UI
 exposes a visible exact ratio control, it clicks that control and records the result. When the UI
@@ -215,11 +227,33 @@ a 2% tolerance. Never report a ratio UI click when the control was unavailable.
 The runner reuses an existing session URL by default. Do not use `--no-resume` unless the saved
 conversation is unavailable or the user explicitly requests a fresh conversation.
 
-During generation the runner records a structured page-health observation every 20 seconds in
-`chatgpt_progress.jsonl`: target-conversation continuity, composer/challenge state, message counts,
-the compact latest-turn excerpt, and any recognized current-turn error text, visible error surface,
-or Retry control. Deep page-health inspection runs on that heartbeat, not on the shorter
-candidate-collection loop.
+A read-only observer records the entire run in `chatgpt_heartbeat.json` and
+`chatgpt_heartbeat.jsonl`, immediately on phase changes and every 20 seconds during long operations.
+It uses a separate bounded CDP connection, so a busy worker cannot stop status reporting. It never
+clicks or navigates. Heartbeats distinguish process liveness, page-read failures, phase age, last
+observable progress, and submission state. Three consecutive unreadable checks request recovery;
+a slow but healthy generation continues until its normal timeout. Browser calls have absolute
+response deadlines even when unrelated CDP events keep arriving.
+
+Inspect a running or exited job without opening a browser:
+
+```bash
+python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest>" --mode status
+```
+
+After a restart loses the original target, check the account without touching that request:
+
+```bash
+python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest>" --mode health-check
+```
+
+This opens a separate tab, uploads nothing, and sends nothing. Two healthy checks five seconds
+apart clear only that job's human-verification pause; other verification owners and service-failure
+pauses remain. The original session and its unknown submission state stay unchanged. A healthy
+account does not prove the old prompt was unsubmitted or authorize sending it again.
+
+The existing `chatgpt_progress.jsonl` additionally records generation-specific observations:
+conversation continuity, message counts, current-turn errors, and Retry controls.
 Message counts and generated-image ownership support both legacy author-role markers and the newer
 turn-key, user-bubble, and assistant-heading structure. A missing legacy marker alone is not
 evidence that the submitted turn disappeared.
@@ -231,16 +265,26 @@ Page recovery is state-aware and bounded (three attempts by default):
   page-level load/network errors, a missing or persistently disabled Create image control, and a
   clicked mode that remains unverified after the bounded wait. Each recovery uses at most one
   page-error Retry click before reloading. Chat is checked again after uploads and before submit;
-- after the submit control has been invoked, the session records `submission_committed=true` and
-  recovery may only reopen the same conversation and continue observing or collecting it. It must
-  never replay the prompt or submit a replacement request;
+- before invoking the submit control, the session records `dispatch_started=true` and
+  `submission_committed=unknown`; confirmed submission changes it to `true`. After dispatch,
+  recovery may only observe or collect the original conversation, never replay the prompt;
 - a normally slow generation is not a recovery signal. Time-based generation refresh is disabled
   by default; post-submit recovery begins only after three consecutive page/DOM heartbeat failures
   or an explicit browser error page;
 - after candidates exist, download recovery operates on the existing conversation and never starts
   generation again;
-- login, CAPTCHA, Turnstile, Cloudflare, or other human-verification evidence bypasses automatic
-  recovery, activates and preserves the visible browser, and returns `needs_ops` for a human click.
+- login, CAPTCHA, Turnstile, Cloudflare, or other human verification suspends new submissions and
+  enters the bounded manual-verification wait above. It never causes automatic verification clicks.
+  After submission, recovery observes the retained original target or reopens a verified canonical
+  conversation. It must not reopen a temporary conversation URL as though it were durable.
+
+Queue health is shared across projects using the same browser data directory and Profile. Two
+distinct jobs that exhaust pre-submit page recovery within 10 minutes pause new submissions. A
+same-job caller retry counts once. Attachment and content errors do not trip this circuit. A paused
+queue still allows recovery/collection of already-submitted requests. The cooldown is five minutes;
+only one live process may probe the page and image mode, without sending a prompt. Human-verification
+pauses clear only after that task's verification resolves. Circuit files live in the existing native
+`chatgpt-web` state directory; they do not contain browser credentials.
 
 After the bounded attempts fail, return `chatgpt_page_recovery_exhausted` to the caller instead of
 waiting indefinitely. If the submit action itself errors and the runner cannot prove whether the

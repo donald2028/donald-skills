@@ -85,6 +85,15 @@ class BrowserDomTests(unittest.TestCase):
         self.assertTrue(result["clicked_chat"])
         self.assertEqual(result["selected_surface"], "chat")
 
+    def test_independent_heartbeat_counts_current_user_turn_structure(self) -> None:
+        self.load_html(
+            '<div data-turn-key="1"><h5>You said:</h5>'
+            '<div data-user-message-bubble>draw a fox</div>'
+            '<h6>ChatGPT said:</h6><div>Generating image</div></div>'
+        )
+        state = runner._heartbeat_probe(self.args, self.cwd)
+        self.assertEqual(state['userTurnCount'], 1)
+
     def test_create_image_menu_structures(self) -> None:
         cases = [
             (
@@ -268,6 +277,75 @@ document.querySelector('input').onchange = (event) => {
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_manual_verification_after_send_keeps_original_page_and_single_submission(self) -> None:
+        self.load_html(
+            '<div role="group" aria-label="Composer mode"><button aria-pressed="true">Chat</button>'
+            '<button aria-pressed="false">Work</button></div>'
+            '<form onsubmit="return false"><div id="prompt-textarea" role="textbox" contenteditable="true">draw a fox</div>'
+            '<button type="button" data-testid="send-button">Send</button></form>'
+            '<div id="verification" style="display:none">Verify you are human</div>'
+        )
+        runner._eval_js(self.args, self.cwd, """
+window.submissionCount = 0;
+document.querySelector('[data-testid=send-button]').onclick = () => {
+  window.submissionCount++;
+  document.querySelector('#verification').style.display = 'block';
+  document.querySelector('#prompt-textarea').textContent = '';
+  // Test fixture simulates an external human finishing verification; runner never clicks it.
+  setTimeout(() => document.querySelector('#verification').remove(), 1200);
+};
+""")
+        actual_access = runner._page_access_state
+        verification_observations = []
+
+        def access(args, cwd):
+            state = actual_access(args, cwd)
+            # This fixture uses about:blank; retain real DOM verification detection.
+            if state.get('crashReason') == 'unexpected_blank_page':
+                state['crashReason'] = ''
+            verification_observations.append(bool(state.get('humanReason')))
+            return state
+
+        with tempfile.TemporaryDirectory() as temporary:
+            queue_path = Path(temporary) / 'queue.json'
+            args = argparse.Namespace(
+                _owned_tab_cdp_url=self.browser.target_url,
+                _owned_tab_cdp_target_id=self.browser.target_id,
+                _health_job={'job_name': 'injected-challenge', 'prompt_card': 'prompt.md', 'download_dir': temporary},
+                _queue_path=queue_path, _job_id='injected-challenge', _queue_owner='test-runner',
+                _original_keep_browser_open=False, human_wait_timeout=30,
+            )
+            with (
+                mock.patch.object(runner, '_page_access_state', side_effect=access),
+                mock.patch.object(runner, 'activate_browser', return_value={'status': 'active'}),
+                mock.patch.object(runner, 'configured_browser', return_value={}),
+                mock.patch.object(runner, '_cdp_launch_port', return_value=1),
+                mock.patch.object(runner, '_current_url', return_value='https://chatgpt.com/c/injected-original'),
+                mock.patch.object(runner, '_open_conversation') as navigate,
+            ):
+                runner._submit_prompt(args, self.cwd, 'draw a fox', timeout_s=30)
+            count = runner._eval_json(args, self.cwd, 'JSON.stringify({count: window.submissionCount})')
+            self.assertEqual(count['count'], 1)
+            self.assertIn(True, verification_observations)
+            self.assertEqual(verification_observations[-2:], [False, False])
+            self.assertEqual(runner.SubmissionCircuit(queue_path).read()['state'], 'running')
+            self.assertTrue(runner._ensure_chat_surface(args, self.cwd)['verified'])
+            navigate.assert_not_called()
+            self.assertEqual(args._owned_tab_cdp_target_id, self.browser.target_id)
+
+    def test_failed_browser_check_with_reload_is_not_an_active_verification(self) -> None:
+        self.load_html(
+            '<div role="alert"><h2>We couldn’t load your account</h2>'
+            '<p>The browser check couldn’t finish. Reload this page to try again</p>'
+            '<button onclick="document.body.dataset.reloadClicked=1">Reload</button></div>'
+        )
+        state = runner._page_access_state(self.args, self.cwd)
+        self.assertFalse(state['humanReason'])
+        self.assertEqual(state['crashReason'], 'chatgpt_transient_page_error')
+        self.assertTrue(runner._click_page_error_retry(self.args, self.cwd))
+        clicked = runner._eval_json(self.args, self.cwd, 'JSON.stringify({...document.body.dataset})')
+        self.assertEqual(clicked['reloadClicked'], '1')
 
     def test_visible_cloudflare_error_without_frame_blocks_retry_after_long_prompt(self) -> None:
         self.load_html(

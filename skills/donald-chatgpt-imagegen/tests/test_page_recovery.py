@@ -372,7 +372,8 @@ class PageRecoveryTests(unittest.TestCase):
             raised.exception.report["recommended_next_action"],
             "inspect_or_collect_current_before_resubmitting",
         )
-        write_session.assert_called_once()
+        self.assertEqual(write_session.call_count, 2)
+        self.assertEqual(write_session.call_args_list[0].args[1]["submission_committed"], "unknown")
 
 
 if __name__ == "__main__":
