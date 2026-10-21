@@ -125,7 +125,7 @@ class BrowserRuntimeTests(unittest.TestCase):
                 mock.patch.object(
                     runtime,
                     "close_cdp_browser",
-                    side_effect=lambda *_args: events.append("browser_close")
+                    side_effect=lambda *_args, **_kwargs: events.append("browser_close")
                     or {"status": "closed"},
                 ) as close_browser,
                 mock.patch.object(
@@ -174,7 +174,9 @@ class BrowserRuntimeTests(unittest.TestCase):
         ):
             session = self._open_session(temporary)
             session.keep_open_for_human = True
+            session._transport_executable = "agent-browser"
             with (
+                mock.patch.object(runtime, "run_agent_browser", return_value=mock.Mock(returncode=0)) as release,
                 mock.patch.object(runtime, "cdp_target", return_value={"id": "open"}),
                 mock.patch.object(runtime, "close_background_page") as close_target,
                 mock.patch.object(runtime, "close_cdp_browser") as close_browser,
@@ -185,6 +187,9 @@ class BrowserRuntimeTests(unittest.TestCase):
         self.assertEqual(cleanup["status"], "kept_open_for_human")
         self.assertEqual([call.args[1] for call in close_target.call_args_list], ["attach-blank"])
         self.assertEqual(state["retained_targets"][0]["target_id"], "owned-target")
+        release.assert_called_once_with(
+            ["agent-browser", "--session", session.transport_session, "close"], timeout=10,
+        )
         close_browser.assert_not_called()
 
     def test_failed_open_rolls_back_the_target_and_browser_under_the_lane_lock(self) -> None:

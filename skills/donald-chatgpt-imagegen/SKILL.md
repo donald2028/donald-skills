@@ -63,7 +63,9 @@ active challenge. Two healthy checks five seconds apart resume the original task
 `needs_ops` and leaves the browser open; rerun the same job to recover its original request. Policy refusals are reported without
 activating Chrome because they are not an interactive login or verification state. After an
 ordinary terminal result, the runner closes its tab and exits the Donald Chrome when no other run
-is active. `needs_ops` and explicit `--keep-browser-open` runs keep Chrome open.
+is active. Cleanup releases the run's agent-browser connection and confirms the macOS Chrome process
+has exited, with bounded termination of only the verified Donald process if normal shutdown stalls.
+`needs_ops` and explicit `--keep-browser-open` runs keep Chrome open while releasing that connection.
 
 ## Prepare A Job
 

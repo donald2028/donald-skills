@@ -71,12 +71,16 @@ Every normal business runner uses `BrowserSession` for the same lifecycle:
 1. Read the caller skill's saved binding and start or attach only to its verified Chrome/CDP lane.
 2. Create or reclaim one target owned by that run, then prove `agent-browser --cdp` can attach.
 3. Let the business code operate only on the owned target ID; never select an arbitrary matching tab.
-4. In `finally`, close the owned target and any blank target created during attach. Do not sweep
+4. In `finally`, release this run's agent-browser transport session, including on attach failure or
+   operator handoff; a CDP transport close leaves Chrome itself open. Close the owned target and
+   any blank target created during attach. Do not sweep
    pre-existing user tabs. On macOS, sample the foreground app at cleanup time and restore it only
    if closing a target made Chrome frontmost; never reactivate a stale session-start PID after
    Chrome exits.
 5. Remove the run from cross-skill state. When no other run or retained operator target exists,
-   close Chrome only if the shared runtime originally launched that process.
+   close Chrome only if the shared runtime originally launched that process. On macOS, confirm
+   that its PID exited even if CDP stopped responding. Bounded shutdown may escalate from
+   `Browser.close` to SIGTERM and SIGKILL only after rechecking that process's binding and identity.
 
 Only a recognized `needs_ops` state retains the owned target and browser for the operator. A later
 run reclaims that retained target instead of opening another page. Successful completion then

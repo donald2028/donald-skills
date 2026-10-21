@@ -234,6 +234,7 @@ class BrowserSession:
         self.opened = False
         self.cleanup: dict[str, Any] = {"status": "not_opened"}
         self._atexit_callback: Any | None = None
+        self._transport_executable = ""
 
     def _navigate(self, target_id: str, url: str) -> None:
         call_background_page(
@@ -288,6 +289,7 @@ class BrowserSession:
     def _verify_attach(self, own_new_blank_targets: bool) -> None:
         executable = ensure_agent_browser(auto_install=True)["executable"]
         before = _target_ids(self.port)
+        self._transport_executable = executable
         result = run_agent_browser(
             [
                 executable,
@@ -320,6 +322,19 @@ class BrowserSession:
                 "Chrome CDP is reachable, but agent-browser could not attach: "
                 f"{result.stdout.strip()}"
             )
+
+    def _release_transport(self) -> None:
+        if not self._transport_executable:
+            return
+        # Closing a CDP-attached CLI session disconnects its daemon, not Chrome.
+        # Omit --cdp so cleanup cannot reconnect to a browser that is exiting.
+        result = run_agent_browser(
+            [self._transport_executable, "--session", self.transport_session, "close"],
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise ProfileConfigError(f"Could not release agent-browser session: {result.stdout.strip()}")
+        self._transport_executable = ""
 
     def _open_locked(self) -> None:
         state = _read_state(self.state_path)
@@ -379,6 +394,10 @@ class BrowserSession:
         return self
 
     def _cleanup_failed_open(self) -> None:
+        try:
+            self._release_transport()
+        except (ProfileConfigError, OSError, subprocess.SubprocessError):
+            pass
         cleanup_frontmost_pid: int | None = None
         try:
             cleanup_frontmost_pid = frontmost_process_id()
@@ -400,7 +419,7 @@ class BrowserSession:
                 pass
         if self.launched:
             try:
-                close_cdp_browser(self.config, self.port)
+                close_cdp_browser(self.config, self.port, expected_pid=self.browser_pid)
             except ProfileConfigError:
                 pass
         self.owned_target_ids.clear()
@@ -430,6 +449,10 @@ class BrowserSession:
             self._atexit_callback = None
         preserve = self.keep_open_for_human if preserve is None else preserve
         errors: list[str] = []
+        try:
+            self._release_transport()
+        except (ProfileConfigError, OSError, subprocess.SubprocessError) as error:
+            errors.append(str(error))
         cleanup_frontmost_pid: int | None = None
         if not preserve:
             try:
@@ -500,7 +523,7 @@ class BrowserSession:
             )
             if close_browser:
                 try:
-                    browser_cleanup = close_cdp_browser(self.config, self.port)
+                    browser_cleanup = close_cdp_browser(self.config, self.port, expected_pid=self.browser_pid)
                     state["launched_by_runtime"] = False
                     state["browser_pid"] = None
                 except ProfileConfigError as error:

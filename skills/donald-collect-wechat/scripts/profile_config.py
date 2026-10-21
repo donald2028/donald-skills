@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -890,6 +891,7 @@ def _decode_ws_frame(buffer: bytes) -> tuple[int, bytes, int] | None:
 class _CDPConnection:
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
+        self._timeout = sock.gettimeout() or 30.0
         self._buffer = b""
         self._next_id = 0
         self.events: list[dict[str, Any]] = []
@@ -943,8 +945,12 @@ class _CDPConnection:
     def close(self) -> None:
         self._sock.close()
 
-    def _recv_frame(self) -> tuple[int, bytes]:
+    def _recv_frame(self, deadline: float) -> tuple[int, bytes]:
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("CDP response deadline exceeded")
+            self._sock.settimeout(remaining)
             parsed = _decode_ws_frame(self._buffer)
             if parsed:
                 opcode, payload, consumed = parsed
@@ -961,9 +967,11 @@ class _CDPConnection:
         payload = json.dumps(
             {"id": message_id, "method": method, "params": params or {}}
         ).encode("utf-8")
+        deadline = time.monotonic() + self._timeout
+        self._sock.settimeout(self._timeout)
         self._sock.sendall(_encode_ws_text_frame(payload))
         while True:
-            opcode, response = self._recv_frame()
+            opcode, response = self._recv_frame(deadline)
             if opcode != 0x1:
                 continue
             message = json.loads(response.decode("utf-8"))
@@ -1167,6 +1175,10 @@ def _listening_process_id(port: int) -> str:
 
 def _listening_process_command(port: int) -> str:
     pid = _listening_process_id(port)
+    return _process_command(pid)
+
+
+def _process_command(pid: str) -> str:
     if not pid:
         return ""
     if sys.platform == "win32":
@@ -1257,28 +1269,71 @@ def start_cdp_browser(
     }
 
 
-def close_cdp_browser(config: dict[str, Any], port: int, timeout: int = 10) -> dict[str, Any]:
+def close_cdp_browser(
+    config: dict[str, Any], port: int, timeout: int = 10, *, expected_pid: int | None = None,
+) -> dict[str, Any]:
+    listener_pid = _listening_process_id(port)
+    pid = str(expected_pid or listener_pid or "")
+    if expected_pid and listener_pid and listener_pid != pid:
+        raise ProfileConfigError("Refusing to close a CDP port now owned by a different process")
+    command = _process_command(pid) if sys.platform == "darwin" else ""
     version = _cdp_version(port)
-    if not version:
+    if not version and not command:
         return {"status": "already_closed", "cdp_port": port}
-    _verify_existing_cdp_owner(config, port)
-    pid = _listening_process_id(port)
-    websocket_url = str(version.get("webSocketDebuggerUrl") or "")
-    if not websocket_url:
-        raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
+    if command:
+        expected_args = (
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={config['chrome']['cdp_user_data_dir']}",
+            f"--profile-directory={config['profile']['directory']}",
+        )
+        if not all(re.search(re.escape(arg) + r"(?=\s--|$)", command) for arg in expected_args):
+            raise ProfileConfigError("Refusing to close a different or unverifiable Chrome process")
+    elif version:
+        _verify_existing_cdp_owner(config, port)
+    websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
     close_error = ""
-    try:
-        with _CDPConnection.connect(websocket_url, timeout=10) as connection:
-            connection.call("Browser.close")
-    except (ConnectionError, OSError, ValueError, json.JSONDecodeError, ProfileConfigError) as error:
-        close_error = str(error)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not _cdp_version(port):
-            return {"status": "closed", "cdp_port": port, "pid": int(pid) if pid else None}
-        time.sleep(0.2)
+    if websocket_url:
+        try:
+            with _CDPConnection.connect(websocket_url, timeout=timeout) as connection:
+                connection.call("Browser.close")
+        except (ConnectionError, OSError, ValueError, json.JSONDecodeError, ProfileConfigError) as error:
+            close_error = str(error)
+
+    def exited() -> bool:
+        # CDP can stop answering before the macOS app has actually exited.
+        return _process_command(pid) != command if command else not _cdp_version(port)
+
+    def wait_for_exit() -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if exited():
+                return True
+            time.sleep(0.2)
+        return exited()
+
+    method = "Browser.close"
+    closed = wait_for_exit()
+    if not closed and command and sys.platform == "darwin":
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            # Recheck the original command before each signal to guard PID reuse.
+            if exited():
+                closed = True
+                break
+            try:
+                os.kill(int(pid), sig)
+            except ProcessLookupError:
+                closed = True
+                break
+            except OSError as error:
+                raise ProfileConfigError(f"Could not stop Chrome process {pid}: {error}") from error
+            method = sig.name
+            if wait_for_exit():
+                closed = True
+                break
+    if closed:
+        return {"status": "closed", "cdp_port": port, "pid": int(pid) if pid else None, "method": method}
     detail = f": {close_error}" if close_error else ""
-    raise ProfileConfigError(f"Chrome CDP on port {port} did not exit after preflight{detail}")
+    raise ProfileConfigError(f"Chrome on CDP port {port} did not exit after cleanup{detail}")
 
 
 def activate_browser(config: dict[str, Any], port: int) -> dict[str, Any]:
