@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
 import sys
@@ -18,6 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import agent_browser_runner as runner  # noqa: E402
+from PIL import Image, PngImagePlugin  # noqa: E402
 
 
 @unittest.skipUnless(
@@ -44,6 +47,51 @@ class BrowserDomTests(unittest.TestCase):
             self.cwd,
             "document.body.innerHTML = " + json.dumps(html),
         )
+
+    def test_conversation_load_error_retry_is_page_scoped(self) -> None:
+        self.load_html('<main><p>Could not load this ChatGPT conversation</p><button>Try again</button></main>')
+        access = runner._page_access_state(self.args, self.cwd)
+        health = runner._generation_page_health(self.args, self.cwd, None, 'Try again')
+        self.assertEqual(access['crashReason'], 'chatgpt_transient_page_error')
+        self.assertEqual(health['status'], 'page_error')
+        self.assertNotIn('generation_error', health)
+
+    def test_native_blob_is_collected_without_composer_viewer_or_download_button(self) -> None:
+        native = io.BytesIO()
+        metadata = PngImagePlugin.PngInfo()
+        metadata.add_text('native-blob', 'preserve original compressed bytes')
+        Image.new('RGB', (300, 420), 'coral').save(native, format='PNG', pnginfo=metadata)
+        data = native.getvalue()
+        self.load_html('<div data-turn-key="current"><div data-user-message-bubble>Draw a fox</div>'
+                       '<div data-conversation-role="assistant">ChatGPT said:</div>'
+                       '<button aria-label="Generated image 1"><img alt="Generated image 1"></button></div>')
+        runner._eval_js(self.args, self.cwd, '''(async () => {
+            const data = Uint8Array.from(atob(''' + json.dumps(base64.b64encode(data).decode()) + '''), c => c.charCodeAt(0));
+            const image = document.querySelector('img');
+            image.src = URL.createObjectURL(new Blob([data], {type: 'image/png'}));
+            await image.decode(); return 'loaded';
+        })()''')
+        args = argparse.Namespace(**vars(self.args))
+        args._submitted_prompt = 'Draw a fox'
+        args.timeout, args.progress_interval = 5, 5
+        url = 'https://chatgpt.com/c/fixture'
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'blob', 'prompt_card': 'fixture.md', 'download_dir': temporary, 'variant_count': 1}
+            with (
+                mock.patch.object(runner, '_ensure_expected_conversation', return_value={'current_url': url}),
+                mock.patch.object(runner, '_persist_canonical_conversation', return_value=url),
+                mock.patch.object(runner, '_write_timing_sample'),
+                mock.patch.object(runner, '_screenshot'),
+                mock.patch.object(runner, '_submit_prompt') as submit,
+                mock.patch.object(runner.time, 'sleep', side_effect=AssertionError('A loaded idle asset must enter download immediately')),
+            ):
+                result = runner._collect_generated_images_with_retries(args, job, self.cwd, Path(temporary),
+                    set(), [], label='batch', mode='collect_current', resumed=True, max_failure_retries=0,
+                    expected_conversation_url=url, baseline_user_message_count=0)
+            self.assertEqual(result['status'], 'downloaded')
+            self.assertEqual(Path(result['images'][0]['path']).read_bytes(), data)
+            self.assertTrue(result['images'][0]['image_validation'].get('ok'))
+            submit.assert_not_called()
 
     def test_chat_surface_structures_and_ambiguous_selection(self) -> None:
         cases = [

@@ -312,6 +312,15 @@ authenticated ChatGPT URL must not fall back to an unauthenticated HTTP request.
 fail, preserve the conversation and candidates and return structured `download_failed` with
 `recommended_next_action=collect_current_first` instead of raising a traceback.
 
+Collection reclaims the saved live target without navigating it. A different tab with the same
+conversation URL is only a recovery candidate: verify the submitted prompt and its generated image
+before adopting it. `Could not load this ChatGPT conversation` and its page-level Try again are
+page loading failures, not generation failures. A loaded generated image can be collected without
+a composer, viewer, or Download button when no explicit generation control is active. Read visible
+Blob assets in their owning browser target; retain that target after an unresolved download and
+avoid reloading it. Valid native PNGs keep their original bytes, with SHA-256 and
+`image_validation.native_bytes_preserved` recorded after download.
+
 If ChatGPT completed generation but a candidate was not downloaded, collect from the saved
 conversation without sending the prompt again:
 

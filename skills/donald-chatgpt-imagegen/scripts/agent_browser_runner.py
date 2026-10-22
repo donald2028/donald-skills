@@ -954,6 +954,8 @@ def _terminate_owned_cdp_chrome(args: argparse.Namespace, cwd: Path) -> None:
 def _cleanup_agent_browser(args: argparse.Namespace, cwd: Path) -> None:
     browser_session = getattr(args, "_browser_session", None)
     if browser_session is not None:
+        if getattr(args, "_retain_generated_assets", False):
+            args.keep_browser_open = True
         args._browser_cleanup = browser_session.close(preserve=bool(args.keep_browser_open))
         return
 
@@ -1159,15 +1161,23 @@ class _ResumeImageBrowserSession(BrowserSession):
     def _claim_target(self, state: dict[str, Any]) -> str:
         if any(run.get("target_id") == self.original_target for run in state.get("active_runs", [])):
             raise OriginalConversationRequired("The original request is still owned by another active runner")
-        for item in state.get("retained_targets", []):
-            if item.get("target_id") == self.original_target and item.get("scope") == self.scope:
-                if cdp_target(self.port, self.original_target):
-                    state["retained_targets"].remove(item)
-                    self.owned_target_ids.add(self.original_target)
-                    return self.original_target
+        if cdp_target(self.port, self.original_target):
+            state["retained_targets"] = [item for item in state.get("retained_targets", [])
+                                         if item.get("target_id") != self.original_target]
+            self.owned_target_ids.add(self.original_target)
+            return self.original_target
         if self.require_target:
             raise OriginalConversationRequired("Original temporary conversation target is no longer available")
-        return super()._claim_target(state)
+        target = create_background_page(self.port, self.url)
+        self.owned_target_ids.add(target)
+        return target
+
+    def _cleanup_failed_open(self) -> None:
+        # Attach failure must not destroy a retained request before business recovery starts.
+        if self.original_target in self.owned_target_ids:
+            self.owned_target_ids.remove(self.original_target)
+            self.launched = False
+        super()._cleanup_failed_open()
 
 
 class _HealthCheckBrowserSession(BrowserSession):
@@ -1499,7 +1509,7 @@ GENERATION_BUTTON_STATE_JS = r"""
     || buttons.find((button) => /send-button|composer-submit/i.test(labelFor(button)))
     || buttons.find((button) => button.type === "submit")
     || null;
-  const editor = document.querySelector("[contenteditable='true']");
+  const editor = Array.from(document.querySelectorAll("[contenteditable='true']")).find(visible);
   const sendDisabled = sendButton
     ? Boolean(sendButton.disabled || sendButton.getAttribute("aria-disabled") === "true" || sendButton.closest("[aria-disabled='true']"))
     : true;
@@ -1632,8 +1642,8 @@ def _write_session_patch(job: dict[str, Any], patch: dict[str, Any]) -> dict[str
     previous = _read_json_if_exists(path) or {}
     patch = dict(patch)
     previous_url = str(previous.get("conversation_url") or "")
-    if (previous.get("submission_committed") is True
-            and patch.get("submission_committed", True) is True
+    if (previous.get("submission_committed") in (True, "unknown")
+            and patch.get("submission_committed", "unknown") in (True, "unknown")
             and _conversation_id_from_url(previous_url)
             and "conversation_url" in patch
             and not _conversation_id_from_url(str(patch.get("conversation_url") or ""))):
@@ -1657,6 +1667,11 @@ def _write_session_patch(job: dict[str, Any], patch: dict[str, Any]) -> dict[str
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     session.pop("attempt", None)
+    if "generation_error" in patch and patch["generation_error"] is None:
+        session.pop("generation_error", None)
+    if patch.get("status") == "downloaded":
+        for key in ("error_type", "generation_error", "retryable", "terminal"):
+            session.pop(key, None)
     if session.get("submission_committed") is True and _conversation_id_from_url(str(session.get("conversation_url") or "")):
         session.setdefault("initial_committed_conversation_url", session["conversation_url"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1955,15 +1970,32 @@ CONVERSATION_DOM_JS = r"""
 (() => {
   const legacyUsers = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
   const legacyAssistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
-  const users = legacyUsers.length ? legacyUsers
-    : Array.from(document.querySelectorAll('[data-user-message-bubble]'));
-  const assistants = legacyAssistants.length ? legacyAssistants
-    : Array.from(document.querySelectorAll('[data-conversation-role="assistant"]'))
-        .map((el) => el.parentElement).filter(Boolean);
+  const merge = (legacy, current) => [...legacy, ...current.filter(
+    (el) => !legacy.some((node) => node === el || node.contains(el) || el.contains(node))
+  )].sort((a, b) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+  const users = merge(legacyUsers, Array.from(document.querySelectorAll('[data-user-message-bubble]')));
+  const assistants = merge(legacyAssistants,
+    Array.from(document.querySelectorAll('[data-conversation-role="assistant"]'))
+      .map((el) => el.parentElement).filter(Boolean));
   const turnSelector = 'section[data-testid^="conversation-turn-"],[data-turn-key]';
-  const turns = Array.from(document.querySelectorAll(turnSelector));
-  const turnFor = (el) => el?.closest(turnSelector) || el?.closest('article,section') || null;
-  return {users, assistants, turns, turnFor};
+  const allTurns = Array.from(document.querySelectorAll(turnSelector));
+  const turns = allTurns.filter((el) => !allTurns.some((other) => other !== el && other.contains(el)));
+  const turnFor = (el) => turns.find((turn) => turn.contains(el))
+    || (turns.length ? null : el?.closest('article,section')) || null;
+  const userFor = (el) => el ? users.filter((user) => user.contains(el) || el.contains(user)
+    || (user.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)).at(-1) || null : null;
+  const submittedUserFor = (prompt) => {
+    const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+    const expected = normalize(prompt);
+    const matches = expected ? users.filter((user) => normalize(user.innerText || user.textContent).includes(expected)) : [];
+    const messages = new Map();
+    for (const user of matches) {
+      const turn = turnFor(user);
+      messages.set(turn || user, turn ? users.filter((node) => turnFor(node) === turn).at(-1) : user);
+    }
+    return messages.size === 1 ? messages.values().next().value : null;
+  };
+  return {users, assistants, turns, turnFor, userFor, submittedUserFor};
 })()
 """.strip()
 
@@ -1979,17 +2011,23 @@ def _generation_page_health(
         cwd,
         r"""
 JSON.stringify((() => {
-  const {users, assistants, turns, turnFor} = __CONVERSATION_DOM__;
-  const latest = assistants.length ? assistants[assistants.length - 1] : null;
+  const {users, assistants, turns, turnFor, userFor, submittedUserFor} = __CONVERSATION_DOM__;
+  const expectedPrompt = __EXPECTED_PROMPT__;
+  const submittedUser = submittedUserFor(expectedPrompt);
+  const currentUser = submittedUser || (!expectedPrompt ? users.at(-1) : null);
+  const currentTurns = currentUser ? turns.filter((turn) => userFor(turn) === currentUser) : [];
+  const latestTurn = currentTurns.at(-1) || (!expectedPrompt ? turns.at(-1) : null);
+  const latest = assistants.filter((el) => currentUser ? userFor(el) === currentUser
+    : latestTurn?.contains(el)).at(-1) || null;
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
-  const latestTurn = turns.length ? turns[turns.length - 1] : turnFor(latest);
   const belongsToCurrentTurn = (el) => {
+    if (el.closest("nav,aside,[role='navigation'],#history,[aria-label='Chat history'],[data-sidebar-item]")) return false;
     const owner = turnFor(el);
-    return !owner || owner === latestTurn;
+    return Boolean(owner && (currentUser ? userFor(owner) === currentUser : owner === latestTurn));
   };
   const labelParts = (el) => [
     el.getAttribute("aria-label"),
@@ -2015,6 +2053,9 @@ JSON.stringify((() => {
   const challengeFrame = Array.from(document.querySelectorAll('iframe'))
     .some((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
   const pageText = (document.body?.innerText || "").toLowerCase();
+  const pageLoadingError = Array.from(document.querySelectorAll('body *')).filter(visible)
+    .filter((el) => !turnFor(el) && !el.querySelector('[data-turn-key],[data-testid^="conversation-turn-"]'))
+    .some((el) => /could not load (?:this |the )?(?:chatgpt )?conversation/i.test(el.innerText || el.textContent || ''));
   const challengeText = [
     "verify you are human", "verifying you are human", "confirm you are human",
     "checking your browser before accessing", "performing security verification",
@@ -2025,6 +2066,9 @@ JSON.stringify((() => {
     href: window.location.href,
     userMessageCount: users.length,
     assistantMessageCount: assistants.length,
+    submittedPromptChecked: Boolean(expectedPrompt),
+    submittedPromptPresent: Boolean(submittedUser),
+    submittedTurnKey: turnFor(submittedUser)?.getAttribute('data-turn-key') || '',
     latestAssistantMessage: latest ? (latest.innerText || latest.textContent || "") : "",
     latestAssistantIsCurrent: Boolean(latest && (!latestTurn || latestTurn.contains(latest))),
     latestTurnText: latestTurn ? (latestTurn.innerText || latestTurn.textContent || "") : "",
@@ -2032,10 +2076,12 @@ JSON.stringify((() => {
     errorSurfaceTexts,
     hasComposer,
     challengeFrame,
+    pageLoadingError,
     humanReason: challengeFrame || challengeText ? "anti_automation_verification" : "",
   };
 })())
-""".strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS),
+""".strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
+        .replace("__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", "")))),
         timeout=30,
     )
     current_url = str(observation.get("href") or "")
@@ -2065,12 +2111,10 @@ JSON.stringify((() => {
             "matched_marker": retry_control_labels[0],
             "message": (scoped_error_text or retry_control_labels[0])[-800:],
         }
-    if not generation_error and not scoped_error_text:
-        generation_error = _generation_error_from_text(page_text)
     human_reason = str(observation.get("humanReason") or "")
     if observation.get("challengeFrame") or "cloudflare_challenge" in scoped_error_text.lower():
         human_reason = "anti_automation_verification"
-    if human_reason:
+    if human_reason or observation.get("pageLoadingError"):
         generation_error = None
     conversation_ok = bool(
         current_id
@@ -2080,7 +2124,8 @@ JSON.stringify((() => {
             or (_temporary_conversation_id(expected_id) and not _temporary_conversation_id(current_id))
         )
     )
-    status = "needs_ops" if human_reason else ("generation_error" if generation_error else ("ok" if conversation_ok else "unexpected_page"))
+    status = "needs_ops" if human_reason else ("page_error" if observation.get("pageLoadingError") else
+             ("generation_error" if generation_error else ("ok" if conversation_ok else "unexpected_page")))
     return {
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "status": status,
@@ -2090,6 +2135,9 @@ JSON.stringify((() => {
         "human_reason": human_reason,
         "user_message_count": max(0, int(observation.get("userMessageCount") or 0)),
         "assistant_message_count": max(0, int(observation.get("assistantMessageCount") or 0)),
+        "submitted_prompt_checked": bool(observation.get("submittedPromptChecked")),
+        "submitted_prompt_present": bool(observation.get("submittedPromptPresent")),
+        "submitted_turn_key": str(observation.get("submittedTurnKey") or ""),
         "generation_active": _is_busy(page_text),
         "latest_turn_excerpt": latest_turn[-500:],
         "retry_control_labels": retry_control_labels,
@@ -2107,7 +2155,11 @@ def _missing_submitted_turn_error(
 ) -> dict[str, str] | None:
     expected_minimum = max(1, int(baseline_user_message_count or 0) + 1)
     actual_count = max(0, int(page_health.get("user_message_count") or 0))
-    submitted_turn_present = actual_count >= expected_minimum
+    submitted_turn_present = (
+        bool(page_health.get("submitted_prompt_present"))
+        if page_health.get("submitted_prompt_checked")
+        else actual_count >= expected_minimum
+    )
     missing = bool(
         page_health.get("conversation_ok")
         and page_health.get("has_composer")
@@ -2130,7 +2182,7 @@ def _missing_submitted_turn_error(
         "error_type": "chatgpt_submitted_turn_missing",
         "matched_marker": "submitted_turn_missing",
         "message": (
-            "The submitted ChatGPT turn disappeared from the expected conversation: "
+            "The submitted ChatGPT turn could not be identified in the rendered conversation: "
             f"expected at least {expected_minimum} user message(s), found {actual_count} "
             f"for {consecutive_heartbeats} consecutive page-health heartbeats."
         ),
@@ -2235,6 +2287,18 @@ def _ensure_expected_conversation(
 ) -> dict[str, Any]:
     expected_id = _conversation_id_from_url(expected_conversation_url or "")
     if not expected_id:
+        job = getattr(args, "_health_job", None)
+        if job:
+            label = getattr(args, "_active_request_label", "batch")
+            session = _read_json_if_exists(_session_path(job, label)) or {}
+            if session.get("submission_committed") in (True, "unknown"):
+                current = _require_original_conversation(args, cwd, session)
+                current_id = _conversation_id_from_url(current)
+                return {
+                    "checked": True, "restored": False, "current_url": current,
+                    "canonicalized": bool(current_id and not _temporary_conversation_id(current_id)),
+                    "reason": "verified_original_target_turn",
+                }
         return {
             "checked": False,
             "restored": False,
@@ -3527,24 +3591,26 @@ JSON.stringify((() => {
   const loginControl = Array.from(document.querySelectorAll("a,button"))
     .filter(visible)
     .some((el) => /^(log in|sign in|continue with|登录|登入)/i.test((el.innerText || "").trim()));
-  const challengeFrame = Array.from(document.querySelectorAll("iframe"))
-    .some((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
-  const challengeText = [
+  const challengeFrames = Array.from(document.querySelectorAll("iframe"))
+    .filter((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
+  const challengeFrame = challengeFrames.length > 0;
+  const challengeTextMarker = [
     "verify you are human", "verifying you are human", "confirm you are human",
     "checking your browser before accessing", "performing security verification",
     "complete the security check", "complete the challenge", "cloudflare ray id", "cloudflare_challenge",
     "验证码", "安全验证", "人机验证", "验证您是真人"
-  ].some((marker) => text.includes(marker));
+  ].find((marker) => text.includes(marker)) || "";
+  const challengeText = Boolean(challengeTextMarker);
   let humanReason = "";
   if (challengeFrame || challengeText) humanReason = "anti_automation_verification";
   else if (loginPath || loginControl) humanReason = "login_required";
-  const transientPageErrorPattern = /failed to load subscription|something went wrong|network error|failed to load|unable to load|try again later|we couldn.t load your account|browser check couldn.t finish/i;
+  const transientPageErrorPattern = /failed to load subscription|something went wrong|network error|failed to load|unable to load|could not load (?:this |the )?(?:chatgpt )?conversation|try again later|we couldn.t load your account|browser check couldn.t finish/i;
+  const errorExcluded = "nav,aside,[role='navigation'],[inert],#history,[aria-label='Chat history']," +
+    "[data-sidebar-item],[data-sidebar-chatgpt-conversation-key],[data-message-author-role]," +
+    "[data-turn-key],[data-testid^='conversation-turn'],#prompt-textarea";
   const transientPageErrorTexts = Array.from(document.querySelectorAll("body *"))
     .filter(visible)
-    .filter((el) => !el.closest(
-      "[inert],#history,[aria-label='Chat history'],[data-sidebar-item]," +
-      "[data-message-author-role],#prompt-textarea"
-    ))
+    .filter((el) => !el.closest(errorExcluded) && !el.querySelector(errorExcluded))
     .map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim())
     .filter((value) => value.length >= 8 && value.length <= 800 && transientPageErrorPattern.test(value))
     .sort((a, b) => a.length - b.length);
@@ -3564,6 +3630,11 @@ JSON.stringify((() => {
   return {
     hasPrompt,
     humanReason,
+    humanEvidence: {
+      challengeFrameCount: challengeFrames.length,
+      visibleChallengeFrameCount: challengeFrames.filter(visible).length,
+      challengeTextMarker, loginPath, loginControl,
+    },
     crashReason,
     transientPageErrorText,
     href: location.href,
@@ -3975,6 +4046,8 @@ def _recover_chatgpt_page(
     if state.get("humanReason"):
         _activate_for_human_attention(args, str(state["humanReason"]))
     if phase.startswith("post_submit") and getattr(args, "_health_job", None):
+        if getattr(args, "_retain_generated_assets", False):
+            raise OriginalConversationRequired("Generated Blob assets remain in the original target; collect them without reloading")
         saved = _read_json_if_exists(_session_path(args._health_job, getattr(args, "_active_request_label", "batch"))) or {}
         target_url = _require_original_conversation(args, cwd, saved)
 
@@ -5010,7 +5083,9 @@ def _submit_prompt(
 def _image_inventory(args: argparse.Namespace, cwd: Path) -> list[dict[str, Any]]:
     script = r"""
 JSON.stringify((() => {
-const {users, assistants, turns, turnFor} = __CONVERSATION_DOM__;
+const {users, assistants, turns, turnFor, userFor, submittedUserFor} = __CONVERSATION_DOM__;
+const expectedPrompt = __EXPECTED_PROMPT__;
+const submittedUser = submittedUserFor(expectedPrompt);
 return Array.from(document.images).map((img) => {
   const src = img.currentSrc || img.src;
   const alt = img.getAttribute('alt') || '';
@@ -5027,9 +5102,7 @@ return Array.from(document.images).map((img) => {
     || /Generated image|生成的图片|生成图/i.test(buttonLabel) || /Generated image/i.test(alt);
   const turnSection = turnFor(img);
   const article = img.closest('article');
-  const roleNode = img.closest('[data-message-author-role]')
-    || (turnSection ? turnSection.querySelector('[data-message-author-role]') : null)
-    || (article ? article.querySelector('[data-message-author-role]') : null);
+  const roleNode = img.closest('[data-message-author-role]');
   const role = roleNode ? roleNode.getAttribute('data-message-author-role')
     : users.some((el) => el.contains(img)) ? 'user'
     : assistants.some((el) => el.contains(img)) ? 'assistant' : '';
@@ -5057,13 +5130,17 @@ return Array.from(document.images).map((img) => {
     inNavigation: Boolean(img.closest('nav,[role="navigation"]')),
     role,
     messageUserTurn,
+    submittedPromptChecked: Boolean(expectedPrompt),
+    inSubmittedTurn: Boolean(submittedUser && userFor(img) === submittedUser),
     inAssistant,
     inUser,
     inComposer
   };
 });
 })())
-""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
+""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS).replace(
+        "__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", "")))
+    )
     output = _eval_js(args, cwd, script, timeout=120).strip()
     try:
         parsed = json.loads(output)
@@ -5078,6 +5155,9 @@ return Array.from(document.images).map((img) => {
         parsed = json.loads(parsed)
     if not isinstance(parsed, list):
         return []
+    if any(str(candidate.get("src") or "").startswith("blob:")
+           for candidate in _generated_image_candidates(parsed, set())):
+        args._retain_generated_assets = True
     return parsed
 
 
@@ -5127,10 +5207,11 @@ def _generated_image_candidates(
         height = int(row.get("height") or 0)
         if not src or src in baseline or src in seen:
             continue
-        if (
-            baseline_user_message_count is not None
-            and int(row.get("messageUserTurn") or 0) <= baseline_user_message_count
-        ):
+        if row.get("submittedPromptChecked"):
+            if not row.get("inSubmittedTurn"):
+                continue
+        elif (baseline_user_message_count is not None
+              and int(row.get("messageUserTurn") or 0) <= baseline_user_message_count):
             continue
         if row.get("inComposer") or row.get("inUser") or row.get("inNavigation"):
             continue
@@ -5397,6 +5478,12 @@ def _annotate_aspect_ratio_validation(
 
 def _normalize_image_to_png(source_path: Path, output_path: Path) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    validation = _validate_downloaded_image(source_path)
+    if validation.get("ok") and validation.get("format") == "PNG":
+        if source_path != output_path:
+            source_path.replace(output_path)
+        return {**validation, "path": str(output_path), "native_bytes_preserved": True,
+                "sha256": _sha256(output_path)}
     with Image.open(source_path) as image:
         mode = "RGBA" if image.mode in ("RGBA", "LA", "P") else "RGB"
         normalized = image.convert(mode)
@@ -5419,6 +5506,8 @@ def _candidate_debug(candidate: dict[str, Any]) -> dict[str, Any]:
         "height": int(candidate.get("height") or 0),
         "role": candidate.get("role") or "",
         "messageUserTurn": int(candidate.get("messageUserTurn") or 0),
+        "submittedPromptChecked": bool(candidate.get("submittedPromptChecked")),
+        "inSubmittedTurn": bool(candidate.get("inSubmittedTurn")),
         "inAssistant": bool(candidate.get("inAssistant")),
         "inGeneratedImageControl": bool(candidate.get("inGeneratedImageControl")),
         "recognition": candidate.get("recognition") or "",
@@ -5479,6 +5568,8 @@ def _download_url_with_browser(
 
 
 def _url_requires_browser_credentials(url: str) -> bool:
+    if url.startswith("blob:"):
+        return True
     host = (urllib.parse.urlsplit(url).hostname or "").lower()
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
 
@@ -5553,7 +5644,7 @@ def _download_candidates(
         if item_path != output_path:
             item_path.replace(output_path)
             item["path"] = str(output_path)
-            item["image_validation"] = _validate_downloaded_image(output_path)
+            item["image_validation"] = {**item.get("image_validation", {}), **_validate_downloaded_image(output_path)}
         item.update(
             {
                 "download_method": f"{item.get('download_method', 'url_fetch')}_generated_url",
@@ -5733,6 +5824,16 @@ def _collect_generated_images_with_retries(
             if len(candidates) > best_candidate_count:
                 best_candidate_count = len(candidates)
                 last_candidate_growth_at = time.time()
+            button_state = monitored_page_call(
+                lambda: _checked_generation_button_state(args, cwd),
+                "composer_controls",
+            )
+            generation_active = _generation_active_from_button_state(button_state)
+            if (any(int(candidate.get("width") or 0) >= 256 and int(candidate.get("height") or 0) >= 256
+                    for candidate in candidates) and button_state.get("checked")
+                    and not button_state.get("generationActive") and not button_state.get("stopButtonVisible")):
+                # The composer may disappear after a tool result; loaded assets can still be collected.
+                generation_active = False
             if time.time() >= next_progress_at:
                 page_health = monitored_page_call(
                     lambda: _generation_page_health(
@@ -5743,6 +5844,10 @@ def _collect_generated_images_with_retries(
                     ),
                     "heartbeat",
                 )
+                page_health["text_generation_active"] = page_health.get("generation_active")
+                page_health["generation_active"] = generation_active
+                page_health["composer_controls"] = button_state
+                page_health["recognized_candidates"] = [_candidate_debug(candidate) for candidate in candidates]
                 if page_health.get("human_reason") or page_health.get("challenge_frame"):
                     _activate_for_human_attention(
                         args,
@@ -5761,7 +5866,7 @@ def _collect_generated_images_with_retries(
                 detected_generation_error = (
                     page_health.get("generation_error") or missing_turn_error
                 )
-                if detected_generation_error:
+                if detected_generation_error and not candidates:
                     page_health["status"] = "generation_error"
                     page_health["generation_error"] = detected_generation_error
                     _emit_progress(
@@ -5788,11 +5893,6 @@ def _collect_generated_images_with_retries(
                     page_health=page_health,
                 )
                 next_progress_at = time.time() + progress_interval
-            button_state = monitored_page_call(
-                lambda: _checked_generation_button_state(args, cwd),
-                "composer_controls",
-            )
-            generation_active = _generation_active_from_button_state(button_state)
             now = time.time()
             if _stale_generation_refresh_due(
                 generation_active=generation_active,
@@ -6044,7 +6144,7 @@ def _collect_generated_images_with_retries(
             )
             _screenshot(args, cwd, trace_dir / "05_policy_refused.png")
             return result
-        if best_candidates and not detected_generation_error:
+        if best_candidates:
             download_reason = (
                 "complete"
                 if len(best_candidates) >= expected_count
@@ -6075,18 +6175,24 @@ def _collect_generated_images_with_retries(
                 references,
             )
             downloaded = _keep_expected_downloads(downloaded, expected_count)
+            status = ("downloaded" if len(downloaded) >= expected_count else
+                      ("partial_downloaded" if downloaded else "download_failed"))
             completion_metadata = _generation_completion_metadata(
-                status="partial_downloaded",
+                status=status,
                 image_count=len(downloaded),
                 expected_count=expected_count,
                 download_reason=download_reason,
             )
+            if status == "download_failed":
+                completion_metadata.update(generation_state="complete_download_pending",
+                                           recommended_next_action="collect_current_first",
+                                           should_collect_current_first=True)
             elapsed_seconds = time.time() - started_at
             _write_timing_sample(expected_count, elapsed_seconds, len(downloaded))
             _write_session_patch(
                 job,
                 {
-                    "status": "partial_downloaded",
+                    "status": status,
                     "label": label,
                     "resumed": resumed,
                     "generation_elapsed_seconds": round(elapsed_seconds, 1),
@@ -6096,6 +6202,7 @@ def _collect_generated_images_with_retries(
                     "download_reason": download_reason,
                     "filtered_reference_downloads": filtered_reference_downloads,
                     "download_failures": download_failures,
+                    "generation_error": None,
                     "output_count": len(downloaded),
                     "expected_image_count": expected_count,
                     "shortfall_count": max(0, expected_count - len(downloaded)),
@@ -6109,7 +6216,7 @@ def _collect_generated_images_with_retries(
                         "action": "collect_generated_images",
                         "label": label,
                         "mode": mode,
-                        "status": "partial_downloaded",
+                        "status": status,
                         "output_count": len(downloaded),
                         "expected_count": expected_count,
                         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -6127,8 +6234,8 @@ def _collect_generated_images_with_retries(
                 "image_count": len(downloaded),
                 "images": downloaded,
                 "failure_retries": failures,
-                "status": "partial_downloaded",
-                "partial": len(downloaded) < expected_count,
+                "status": status,
+                "partial": bool(downloaded and len(downloaded) < expected_count),
                 "expected_image_count": expected_count,
                 "conversation_guard": conversation_guard,
                 "conversation_restores": conversation_restores,
@@ -6149,7 +6256,8 @@ def _collect_generated_images_with_retries(
             )
             raise TimeoutError("No generated image appeared before timeout")
 
-        retry_available = retry_index < max_failure_retries
+        turn_unconfirmed = detected_generation_error.get("error_type") == "chatgpt_submitted_turn_missing"
+        retry_available = not turn_unconfirmed and retry_index < max_failure_retries
         failure = {
             "retry_index": retry_index,
             "retry_available": retry_available,
@@ -6178,10 +6286,10 @@ def _collect_generated_images_with_retries(
                 ),
                 "retryable": True,
                 "terminal": True,
-                "recommended_next_action": "submit_new_request",
-                "generation_state": "failed",
+                "recommended_next_action": "collect_current_first" if turn_unconfirmed else "submit_new_request",
+                "generation_state": "unconfirmed" if turn_unconfirmed else "failed",
                 "safe_to_fallback": False,
-                "should_collect_current_first": False,
+                "should_collect_current_first": turn_unconfirmed,
                 "label": label,
                 "mode": mode,
                 "resumed": resumed,
@@ -7187,8 +7295,44 @@ def run_conversation_followup(args: argparse.Namespace, job: dict[str, Any], cwd
     )
 
 
+def _recover_generated_asset_target(args: argparse.Namespace, cwd: Path, session: dict[str, Any]) -> None:
+    """Same URL is only a candidate; the submitted turn must own the image."""
+    if not _owned_tab_cdp_url(args) or not getattr(args, "_submitted_prompt", ""):
+        return
+    try:
+        if _generated_image_candidates(_image_inventory(args, cwd), set(session.get("baseline_asset_urls") or [])):
+            return
+    except (RuntimeError, OSError, TimeoutError):
+        pass
+    expected_id = _conversation_id_from_url(str(session.get("canonical_conversation_url") or session.get("conversation_url") or ""))
+    if not expected_id:
+        return
+    browser_session = getattr(args, "_browser_session", None)
+    state = _read_json_if_exists(browser_session.state_path) if browser_session is not None else {}
+    busy_targets = {item.get("target_id") for item in (state or {}).get("active_runs", [])
+                    if item.get("run_id") != getattr(browser_session, "run_id", None)}
+    targets = sorted(_cdp_page_targets(args), key=lambda target: target.get("id") != session.get("owned_target_id"))
+    for target in targets:
+        if (target.get("id") in busy_targets
+                or target.get("id") == getattr(args, "_owned_tab_cdp_target_id", "")
+                or _conversation_id_from_url(str(target.get("url") or "")) != expected_id):
+            continue
+        probe = argparse.Namespace(**vars(args))
+        probe._browser_session = None
+        if not _remember_owned_cdp_target(probe, target):
+            continue
+        try:
+            candidates = _generated_image_candidates(_image_inventory(probe, cwd), set(session.get("baseline_asset_urls") or []))
+        except (RuntimeError, OSError, TimeoutError):
+            continue
+        if any(candidate.get("submittedPromptChecked") and candidate.get("inSubmittedTurn") for candidate in candidates):
+            _remember_owned_cdp_target(args, target)
+            args._retain_generated_assets = bool(getattr(probe, "_retain_generated_assets", False))
+            return
+
+
 def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any]:
-    args._submitted_prompt = str(job.get("chatgpt_message") or job.get("chatgpt_batch_message") or "")
+    args._submitted_prompt = str(job.get("chatgpt_batch_message") or job.get("chatgpt_message") or "")
     trace_dir = Path(job["download_dir"]) / "agent_browser_trace_collect"
     trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -7196,6 +7340,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     account_guard = _validate_account_lane(args, cwd, job)
     existing_session = _read_json_if_exists(_session_path(job, "batch")) or {}
     existing_summary = _read_json_if_exists(_summary_path(job)) or {}
+    _recover_generated_asset_target(args, cwd, existing_session)
     current_url = _current_url(args, cwd)
     target_conversation_url = _collect_current_target_url(
         current_url=current_url,
@@ -7204,7 +7349,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     )
     if existing_session.get("submission_committed") in (True, "unknown"):
         target_conversation_url = _require_original_conversation(args, cwd, existing_session)
-    if not _conversation_id_from_url(target_conversation_url):
+    if not _conversation_id_from_url(target_conversation_url) and existing_session.get("submission_committed") not in (True, "unknown"):
         raise RuntimeError(
             "collect-current is not on a ChatGPT conversation page and no resumable "
             "conversation_url exists in chatgpt_session.json or chatgpt_web_run_summary.json"
@@ -7223,31 +7368,28 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     detected_generation_error: dict[str, str] | None = None
     conversation_guard: dict[str, Any] | None = None
     conversation_restores: list[dict[str, Any]] = []
-    while time.time() < deadline:
-        conversation_guard = _ensure_expected_conversation(
+    page_recoveries: list[dict[str, Any]] = []
+
+    def observe_current_page() -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+        access = _page_access_state(args, cwd)
+        if access.get("humanReason"):
+            _activate_for_human_attention(args, str(access["humanReason"]))
+        if access.get("crashReason"):
+            raise RecoverablePageError(f"collect-current page failure: {access['crashReason']}")
+        guard = _ensure_expected_conversation(
             args, cwd, conversation_url, existing_session.get("baseline_user_message_count"),
         )
+        return guard, _page_text(args, cwd), _image_inventory(args, cwd)
+
+    while time.time() < deadline:
+        (conversation_guard, page_text, rows), recovered = _run_with_page_recovery(
+            args, cwd, observe_current_page, phase="post_submit_monitor:collect_current",
+            target_url=conversation_url, job=job, failure_confirmations=3,
+        )
+        page_recoveries.extend(recovered)
         conversation_url = _persist_canonical_conversation(job, "batch", conversation_guard, conversation_url) or conversation_url
         if conversation_guard.get("restored"):
             conversation_restores.append(conversation_guard)
-        page_text = _page_text(args, cwd)
-        detected_generation_error = _generation_error_from_text(page_text)
-        if detected_generation_error:
-            page_health = _generation_page_health(args, cwd, conversation_url, page_text)
-            if page_health.get("human_reason") or page_health.get("challenge_frame"):
-                _activate_for_human_attention(args, str(page_health.get("human_reason") or "anti_automation_verification"))
-            detected_generation_error = page_health.get("generation_error") or detected_generation_error
-            _emit_progress(
-                job,
-                label="batch",
-                phase="generation_error",
-                status="generation_failed",
-                started_at=started_at,
-                expected_count=expected_count,
-                page_health=page_health,
-            )
-            break
-        rows = _image_inventory(args, cwd)
         candidates = _vertical_images(rows, set(existing_session.get("baseline_asset_urls") or []),
                                       existing_session.get("baseline_user_message_count"))
         if time.time() >= next_progress_at:
@@ -7266,9 +7408,10 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
                 page_health=page_health,
             )
             next_progress_at = time.time() + progress_interval
-            if detected_generation_error:
+            if detected_generation_error and not candidates:
                 break
         if candidates:
+            detected_generation_error = None
             break
         _scroll_down(args, cwd, 700)
         time.sleep(2)
@@ -7285,6 +7428,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     )
     downloaded, filtered_reference_downloads = _filter_reference_downloads(downloaded_all, references)
     downloaded = _keep_expected_downloads(downloaded, expected_count)
+    if len(downloaded) >= expected_count:
+        args._retain_generated_assets = False
     status = (
         "downloaded"
         if len(downloaded) >= expected_count
@@ -7320,6 +7465,20 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
                 "missing_image_followup_message": "",
             }
             if status == "download_failed"
+            else {
+                "error_type": "chatgpt_collection_no_images",
+                "generation_state": "stale_or_unknown",
+                "safe_to_fallback": False,
+                "should_collect_current_first": False,
+                "missing_image_count": expected_count,
+                "recommended_next_action": "inspect_original_conversation_before_manual_recovery",
+                "retryable": False,
+                "terminal": False,
+                "safe_to_request_missing_batch": False,
+                "missing_batch_request_count": 0,
+                "missing_image_followup_message": "",
+            }
+            if status == "collect_current_no_new_images"
             else _generation_completion_metadata(
                 status=status,
                 image_count=len(downloaded),
@@ -7334,6 +7493,11 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
     )
     session_patch = {
         "status": status,
+        "image_count": len(downloaded),
+        "raw_image_count": len(downloaded_all),
+        "expected_image_count": expected_count,
+        "images": downloaded,
+        "partial": bool(downloaded and len(downloaded) < expected_count),
         "resumed": True,
         "conversation_id": _conversation_id_from_url(conversation_url),
         "conversation_url": conversation_url,
@@ -7345,7 +7509,8 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "recognized_candidates": recognized_candidates,
         "conversation_guard": conversation_guard,
         "conversation_restores": conversation_restores,
-        **({"generation_error": detected_generation_error} if detected_generation_error else {}),
+        "page_recoveries": page_recoveries,
+        "generation_error": detected_generation_error,
         **({"download_failures": download_failures} if download_failures else {}),
         **completion_metadata,
         "aspect_ratio_validation": aspect_ratio_validation,
@@ -7388,6 +7553,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         "recognized_candidates": recognized_candidates,
         "conversation_guard": conversation_guard,
         "conversation_restores": conversation_restores,
+        "page_recoveries": page_recoveries,
         **({"generation_error": detected_generation_error} if detected_generation_error else {}),
         **({"download_failures": download_failures} if download_failures else {}),
         "filtered_reference_downloads": filtered_reference_downloads,
@@ -7783,6 +7949,8 @@ def main() -> int:
         if not terminal_status and (report or {}).get("variants"):
             statuses = [v.get("downloaded", {}).get("status") or "stopped" for v in report["variants"]]
             terminal_status = next((status for status in statuses if status != "downloaded"), "downloaded")
+        if terminal_status == "downloaded":
+            args._retain_generated_assets = False
         args._health.close(terminal_status or "stopped")
         _cleanup_agent_browser(args, cwd)
     if report is not None:

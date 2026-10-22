@@ -70,8 +70,8 @@ class GenerationHealthTests(unittest.TestCase):
                     "_generation_button_state",
                     return_value={
                         "checked": True,
-                        "generationActive": True,
-                        "readyForNextPrompt": False,
+                        "generationActive": page_health_states[0].get("generation_active", True),
+                        "readyForNextPrompt": not page_health_states[0].get("generation_active", True),
                     },
                 ),
                 mock.patch.object(runner, "_scroll_down"),
@@ -257,6 +257,28 @@ class GenerationHealthTests(unittest.TestCase):
         self.assertEqual(second_health["expected_minimum_user_message_count"], 1)
         self.assertIsNone(present_error)
         self.assertTrue(present_health["submitted_turn_present"])
+
+    def test_matching_prompt_prevents_missing_turn_when_dom_count_drops(self) -> None:
+        health = {
+            "conversation_ok": True, "has_composer": True, "user_message_count": 4,
+            "generation_active": False, "submitted_prompt_checked": True,
+            "submitted_prompt_present": True, "latest_turn_excerpt": "Adding final touches 90%",
+        }
+        error = runner._missing_submitted_turn_error(
+            health, baseline_user_message_count=4, candidate_count=0, consecutive_heartbeats=2,
+        )
+        self.assertIsNone(error)
+        self.assertTrue(health["submitted_turn_present"])
+
+    def test_empty_current_turn_does_not_fall_back_to_page_wide_retry(self) -> None:
+        with mock.patch.object(runner, "_eval_json", return_value={
+            "href": "https://chatgpt.com/c/test", "hasComposer": True,
+            "latestTurnText": "", "latestAssistantMessage": "", "retryControlLabels": [],
+        }):
+            health = runner._generation_page_health(
+                argparse.Namespace(), Path.cwd(), "https://chatgpt.com/c/test", "Try again Something went wrong",
+            )
+        self.assertNotIn("generation_error", health)
 
     def test_generation_wait_checks_retry_health_on_progress_heartbeat(self) -> None:
         healthy = {

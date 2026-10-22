@@ -70,6 +70,15 @@ screenshots remain. Pass `--keep-success-trace-screenshots` for an explicit debu
 must retain every checkpoint. Partial, failed, timed-out, login, and verification outcomes never
 trigger successful-trace cleanup.
 
+Collection reuses the saved live target without navigating it. Another same-URL target is
+a recovery candidate only after verifying the submitted prompt and generated asset ownership.
+`Could not load this ChatGPT conversation` and its page-level Retry are loading failures.
+Existing assets take priority over stale Retry text; unresolved Blob downloads retain their
+owning page and never cause a new-request recommendation. Loaded assets can be collected
+without a composer, viewer, or Download button when no explicit generation control is active.
+Valid native PNGs preserve their bytes; `image_validation.native_bytes_preserved=true` and
+`image_validation.sha256` record that output.
+
 Important terminal or recoverable states include:
 
 - `downloaded`: requested outputs were recognized and saved;
