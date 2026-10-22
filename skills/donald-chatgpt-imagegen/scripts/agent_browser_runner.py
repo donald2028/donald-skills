@@ -1643,12 +1643,15 @@ def _write_session_patch(job: dict[str, Any], patch: dict[str, Any]) -> dict[str
     path = _session_path(job, label)
     previous = _read_json_if_exists(path) or {}
     patch = dict(patch)
-    previous_url = str(previous.get("conversation_url") or "")
+    previous_url = str(previous.get("canonical_conversation_url") or previous.get("conversation_url") or "")
+    previous_id = _conversation_id_from_url(previous_url)
+    incoming_id = _conversation_id_from_url(str(patch.get("conversation_url") or ""))
     if (previous.get("submission_committed") in (True, "unknown")
             and patch.get("submission_committed", "unknown") in (True, "unknown")
-            and _conversation_id_from_url(previous_url)
+            and previous_id
             and "conversation_url" in patch
-            and not _conversation_id_from_url(str(patch.get("conversation_url") or ""))):
+            and (not incoming_id or (not _temporary_conversation_id(previous_id)
+                                     and _temporary_conversation_id(incoming_id)))):
         patch["observed_page_url"] = patch["conversation_url"]
         patch["conversation_url"] = previous_url
         patch["conversation_id"] = _conversation_id_from_url(previous_url)
@@ -1989,7 +1992,8 @@ CONVERSATION_DOM_JS = r"""
   const submittedUserFor = (prompt) => {
     const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
     const expected = normalize(prompt);
-    const matches = expected ? users.filter((user) => normalize(user.innerText || user.textContent).includes(expected)) : [];
+    const matches = expected ? users.filter((user) => [user.innerText, user.textContent]
+      .some((text) => normalize(text).includes(expected))) : [];
     const messages = new Map();
     for (const user of matches) {
       const turn = turnFor(user);
@@ -2002,15 +2006,46 @@ CONVERSATION_DOM_JS = r"""
 """.strip()
 
 
+def _expand_submitted_prompt(args: argparse.Namespace, cwd: Path) -> bool:
+    prompt = str(getattr(args, "_submitted_prompt", ""))
+    if not prompt:
+        return False
+    observed = _eval_json(args, cwd, r"""
+(async () => {
+  const {users, turnFor, submittedUserFor} = __CONVERSATION_DOM__;
+  const prompt = __EXPECTED_PROMPT__;
+  if (submittedUserFor(prompt)) return JSON.stringify({expanded: false});
+  const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+  const prefix = normalize(prompt).slice(0, 100);
+  if (prefix.length < 80) return JSON.stringify({expanded: false});
+  const candidates = new Map();
+  for (const user of users) {
+    if (!normalize(user.innerText || user.textContent).includes(prefix)) continue;
+    const root = turnFor(user) || user;
+    const button = Array.from(root.querySelectorAll('button,[role="button"]')).find((el) =>
+      /^(show more|展开|显示更多)$/i.test(normalize(el.innerText || el.textContent))
+      && el.getClientRects().length);
+    if (button) candidates.set(root, button);
+  }
+  if (candidates.size !== 1) return JSON.stringify({expanded: false});
+  candidates.values().next().value.click();
+  for (let i = 0; i < 10; i++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    if (submittedUserFor(prompt)) break;
+  }
+  return JSON.stringify({expanded: true});
+})()
+""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS).replace("__EXPECTED_PROMPT__", json.dumps(prompt)))
+    return bool(observed.get("expanded"))
+
+
 def _generation_page_health(
     args: argparse.Namespace,
     cwd: Path,
     expected_conversation_url: str | None,
     page_text: str,
 ) -> dict[str, Any]:
-    observation = _eval_json(
-        args,
-        cwd,
+    script = (
         r"""
 JSON.stringify((() => {
   const {users, assistants, turns, turnFor, userFor, submittedUserFor} = __CONVERSATION_DOM__;
@@ -2083,9 +2118,12 @@ JSON.stringify((() => {
   };
 })())
 """.strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
-        .replace("__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", "")))),
-        timeout=30,
+        .replace("__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", ""))))
     )
+    observation = _eval_json(args, cwd, script, timeout=30)
+    if (observation.get("submittedPromptChecked") and not observation.get("submittedPromptPresent")
+            and _expand_submitted_prompt(args, cwd)):
+        observation = _eval_json(args, cwd, script, timeout=30)
     current_url = str(observation.get("href") or "")
     current_id = _conversation_id_from_url(current_url)
     expected_id = _conversation_id_from_url(expected_conversation_url or "")
@@ -2227,7 +2265,8 @@ def _wait_for_conversation_url(args: argparse.Namespace, cwd: Path, timeout_s: i
         if state.get("humanReason"):
             _activate_for_human_attention(args, str(state["humanReason"]))
         current = _current_url(args, cwd)
-        if _conversation_id_from_url(current):
+        if (_conversation_id_from_url(current)
+                and not _temporary_conversation_id(_conversation_id_from_url(current))):
             return current
         time.sleep(1)
     return current
@@ -2350,15 +2389,16 @@ def _ensure_expected_conversation(
             and message_counts["user_message_count"] > baseline_user_message_count
         ):
             expected_prompt = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
+            _expand_submitted_prompt(args, cwd)
             observed = _eval_json(args, cwd, r"""
 JSON.stringify((() => {
   const {users} = __CONVERSATION_DOM__;
   const user = users.length ? users[users.length - 1] : null;
-  return {latestUserText: user ? (user.innerText || user.textContent || "") : ""};
+  return {latestUserText: user?.innerText || "", latestUserFullText: user?.textContent || ""};
 })())
 """.strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)) if expected_prompt else {}
-            latest_user_text = " ".join(str(observed.get("latestUserText") or "").split())
-            if expected_prompt and expected_prompt in latest_user_text:
+            if expected_prompt and any(expected_prompt in " ".join(str(observed.get(key) or "").split())
+                                       for key in ("latestUserText", "latestUserFullText")):
                 event.update(
                     {
                         "canonicalized": True,
@@ -3971,15 +4011,16 @@ def _require_original_conversation(args: argparse.Namespace, cwd: Path, session:
             and session["owned_target_id"] == getattr(args, "_owned_tab_cdp_target_id", None)):
         return current  # Observe this retained target in place; never reopen its temporary URL.
     if current_id and not _temporary_conversation_id(current_id):
+        _expand_submitted_prompt(args, cwd)
         observed = _eval_json(args, cwd, r"""
 JSON.stringify((() => {
  const {users} = __CONVERSATION_DOM__;
  const user = users.at(-1);
- return {text: user ? (user.innerText || user.textContent || '') : ''};
+ return {text: user?.innerText || '', fullText: user?.textContent || ''};
 })())
 """.replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS))
         expected = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
-        if expected and expected in " ".join(str(observed.get("text") or "").split()):
+        if expected and any(expected in " ".join(str(observed.get(key) or "").split()) for key in ("text", "fullText")):
             return current
     raise OriginalConversationRequired(
         "The request may already be submitted, but its original canonical conversation cannot "
@@ -7021,12 +7062,12 @@ def _run_one_request(
             raise RecoverablePageError(
                 "The prompt was submitted, but its ChatGPT conversation URL did not become available."
             )
-        _screenshot(args, cwd, trace_dir / "04_after_submit.png")
-        after_submit = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
         binding = {"label": label, "conversation_url": conversation_url}
         if not _temporary_conversation_id(_conversation_id_from_url(conversation_url)):
             binding["canonical_conversation_url"] = conversation_url
         _write_session_patch(job, binding)
+        _screenshot(args, cwd, trace_dir / "04_after_submit.png")
+        after_submit = _page_text(args, cwd) if _owned_tab_cdp_url(args) else _snapshot(args, cwd)
         return {"conversation_url": conversation_url, "after_submit": after_submit}
 
     submitted_turn, post_submit_recoveries = _run_with_page_recovery(

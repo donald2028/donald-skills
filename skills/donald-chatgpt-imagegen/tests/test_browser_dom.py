@@ -48,6 +48,53 @@ class BrowserDomTests(unittest.TestCase):
             "document.body.innerHTML = " + json.dumps(html),
         )
 
+    def test_collapsed_prompt_expands_before_health_and_url_verification(self) -> None:
+        prompt = 'Reference image map with exact roles and constraints. ' * 20 + 'Distinct final instruction.'
+        self.load_html('<div data-turn-key="ours"><div data-user-message-bubble>'
+            '<span id="message">' + prompt[:210] + '...</span><button id="expand">Show more</button>'
+            '</div><div data-conversation-role="assistant">ChatGPT said:</div>'
+            '<button aria-label="Generated image 1"><img alt="Generated image 1" src="/output.png" width="300" height="420"></button>'
+            '</div><div contenteditable="true"></div>')
+        runner._eval_js(self.args, self.cwd, 'document.getElementById("expand").onclick = () => {'
+            'document.getElementById("message").textContent = ' + json.dumps(prompt) + ';};')
+        args = argparse.Namespace(**vars(self.args), _submitted_prompt=prompt)
+        self.assertTrue(runner._generation_page_health(args, self.cwd, None, '')['submitted_prompt_present'])
+        runner._eval_js(self.args, self.cwd, 'document.getElementById("message").textContent = '
+            + json.dumps(prompt[:210] + '...'))
+        canonical = 'https://chatgpt.com/c/canonical'
+        with mock.patch.object(runner, '_current_url', return_value=canonical), mock.patch.object(
+            runner, '_open_conversation', side_effect=AssertionError('Must verify in the original target')
+        ):
+            event = runner._ensure_expected_conversation(args, self.cwd,
+                'https://chatgpt.com/c/local-chatgpt%3Atest', 0)
+        self.assertTrue(event['canonicalized'])
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'collapsed', 'prompt_card': 'prompt.md', 'download_dir': temporary}
+            runner._persist_canonical_conversation(job, 'batch', event, None)
+            saved = runner._read_json_if_exists(runner._session_path(job))
+            self.assertEqual(saved['canonical_conversation_url'], canonical)
+        health = runner._generation_page_health(args, self.cwd, None, '')
+        self.assertTrue(health['submitted_prompt_present'])
+        self.assertTrue(any(item.get('inSubmittedTurn') for item in runner._image_inventory(args, self.cwd)))
+
+    def test_full_dom_text_matches_hidden_tail_without_expanding(self) -> None:
+        prompt = 'Draw a fox with a distinct instruction hidden in the collapsed section.'
+        self.load_html('<div data-turn-key="ours"><div data-user-message-bubble>'
+            'Draw a fox <span style="display:none">with a distinct instruction hidden in the collapsed section.</span>'
+            '</div></div><div contenteditable="true"></div>')
+        args = argparse.Namespace(**vars(self.args), _submitted_prompt=prompt)
+        self.assertTrue(runner._generation_page_health(args, self.cwd, None, '')['submitted_prompt_present'])
+
+    def test_expansion_never_accepts_only_a_prefix_or_ambiguous_turns(self) -> None:
+        prefix = 'Reference image map with exact roles and constraints. ' * 4
+        for copies in (1, 2):
+            self.load_html(''.join('<div data-turn-key="turn-' + str(i) + '"><div data-user-message-bubble>'
+                + prefix + '<button onclick="this.textContent=\'Show less\'">Show more</button></div></div>'
+                for i in range(copies)) + '<div contenteditable="true"></div>')
+            args = argparse.Namespace(**vars(self.args), _submitted_prompt=prefix + 'Different hidden instruction.')
+            self.assertEqual(runner._expand_submitted_prompt(args, self.cwd), copies == 1)
+            self.assertFalse(runner._generation_page_health(args, self.cwd, None, '')['submitted_prompt_present'])
+
     def test_conversation_load_error_retry_is_page_scoped(self) -> None:
         self.load_html('<main><p>Could not load this ChatGPT conversation</p><button>Try again</button></main>')
         access = runner._page_access_state(self.args, self.cwd)
