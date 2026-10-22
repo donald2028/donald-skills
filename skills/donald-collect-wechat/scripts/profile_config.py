@@ -1137,9 +1137,14 @@ def chrome_launch_command(config: dict[str, Any], port: int, url: str = "about:b
         f"--profile-directory={profile['directory']}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--no-startup-window",
         "--disable-features=OptimizationGuideOnDeviceModel",
     ]
+    # On macOS, suppressing startup leaves native Quit pending even after CDP
+    # creates a window. Let Chrome complete normal window startup instead.
+    if sys.platform == "darwin":
+        launch_args.append(url)
+    else:
+        launch_args.append("--no-startup-window")
     executable = str(chrome["executable"])
     if sys.platform == "darwin" and executable == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome":
         return ["open", "-g", "-n", "-a", "Google Chrome", "--args", *launch_args]

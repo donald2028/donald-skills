@@ -55,6 +55,7 @@ class BrowserRuntimeTests(unittest.TestCase):
                 return_value={"launched": True, "pid": 1234},
             ),
             mock.patch.object(session, "_claim_target", return_value="owned-target"),
+            mock.patch.object(runtime, "list_cdp_targets", return_value=[]),
             mock.patch.object(session, "_verify_attach") as attach,
             mock.patch.object(
                 runtime,
@@ -66,6 +67,29 @@ class BrowserRuntimeTests(unittest.TestCase):
             attach.side_effect = lambda _own_blanks: session.owned_target_ids.add("attach-blank")
             session.open()
         return session
+
+    def test_macos_owns_startup_blank_only_when_it_launched_chrome(self) -> None:
+        for launched in (True, False):
+            with self.subTest(launched=launched), tempfile.TemporaryDirectory() as temporary:
+                session = runtime.BrowserSession(session="startup", config=_config(Path(temporary)))
+                with (
+                    mock.patch.object(runtime.sys, "platform", "darwin"),
+                    mock.patch.object(runtime, "start_cdp_browser", return_value={"launched": launched, "pid": 1234}),
+                    mock.patch.object(runtime, "_read_state", return_value={"active_runs": [], "retained_targets": []}),
+                    mock.patch.object(runtime, "_write_state"),
+                    mock.patch.object(runtime, "_target_ids", return_value=set()),
+                    mock.patch.object(session, "_claim_target", return_value="owned-target"),
+                    mock.patch.object(runtime, "cdp_target", return_value={}),
+                    mock.patch.object(session, "_verify_attach"),
+                    mock.patch.object(runtime, "show_browser_without_focus"),
+                    mock.patch.object(runtime, "list_cdp_targets", return_value=[
+                        {"id": "startup-blank", "type": "page", "url": "about:blank"},
+                        {"id": "other-page", "type": "page", "url": "https://example.com"},
+                    ]),
+                ):
+                    session._open_locked()
+                expected = {"owned-target", "startup-blank"} if launched else {"owned-target"}
+                self.assertEqual(session.owned_target_ids, expected)
 
     def test_closes_only_owned_targets_and_the_browser_it_launched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(

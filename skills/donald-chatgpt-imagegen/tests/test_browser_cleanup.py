@@ -16,6 +16,21 @@ import agent_browser_runner as runner  # noqa: E402
 
 
 class BrowserCleanupTests(unittest.TestCase):
+    def test_macos_legacy_launch_completes_normal_window_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(
+                cdp_port=9333, cdp=None, user_data_dir=temporary, profile="Default",
+                browser_args="", launch_background=True, executable_path=runner.DEFAULT_CHROME,
+            )
+            with mock.patch.object(runner.sys, "platform", "darwin"), mock.patch.object(
+                runner.subprocess, "Popen"
+            ) as launch:
+                runner._launch_chrome_for_cdp(args, Path(temporary))
+        command = launch.call_args.args[0]
+        self.assertNotIn("--no-startup-window", command)
+        self.assertNotIn("-j", command)
+        self.assertEqual(command[-1], "about:blank")
+
     def test_replacement_claims_only_the_target_created_by_this_run(self) -> None:
         session = argparse.Namespace(owned_target_ids=set())
         args = argparse.Namespace(_browser_session=session)

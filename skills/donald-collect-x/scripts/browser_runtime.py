@@ -361,6 +361,12 @@ class BrowserSession:
         self.target_url = str(target.get("webSocketDebuggerUrl") or "")
         if self.verify_agent_browser:
             self._verify_attach(not state["active_runs"])
+        if startup.get("launched") and sys.platform == "darwin":
+            # Normal macOS startup opens a blank tab before the business target.
+            self.owned_target_ids.update(
+                str(target["id"]) for target in list_cdp_targets(self.port)
+                if target.get("type") == "page" and target.get("url") == "about:blank" and target.get("id")
+            )
         show_browser_without_focus(
             self.config,
             self.port,

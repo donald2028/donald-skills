@@ -1252,15 +1252,17 @@ def _launch_chrome_for_cdp(args: argparse.Namespace, cwd: Path) -> None:
         f"--profile-directory={args.profile}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--no-startup-window",
         *_split_browser_args(args.browser_args),
     ]
+    if sys.platform == "darwin":
+        launch_args.append("about:blank")
+    else:
+        launch_args.append("--no-startup-window")
 
     if args.launch_background and args.executable_path == DEFAULT_CHROME:
         command = [
             "open",
             "-g",
-            "-j",
             "-n",
             "-a",
             "Google Chrome",

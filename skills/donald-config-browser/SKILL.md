@@ -219,8 +219,10 @@ python3 "$SKILL_DIR/scripts/profile_config.py" --scope <skill-name> preflight \
 The preflight follows this exact sequence:
 
 1. Start real Chrome with `--remote-debugging-address=127.0.0.1`,
-   `--remote-debugging-port`, `--user-data-dir`, `--profile-directory`, and
-   `--no-startup-window`, with `OptimizationGuideOnDeviceModel` disabled. Do not add `--headless`
+   `--remote-debugging-port`, `--user-data-dir`, and `--profile-directory`, with
+   `OptimizationGuideOnDeviceModel` disabled. On macOS, open `about:blank` through normal window
+   startup; `--no-startup-window` can leave native Quit and shutdown pending even after CDP creates
+   a window. Other platforms use `--no-startup-window`. Do not add `--headless`
    unless the user explicitly requests it.
 2. Wait for `http://127.0.0.1:<port>/json/version`.
 3. Create the page through browser-level CDP with `Target.createTarget({background: true})`.

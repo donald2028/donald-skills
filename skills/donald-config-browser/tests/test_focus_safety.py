@@ -33,6 +33,8 @@ class FocusSafetyTests(unittest.TestCase):
 
         self.assertEqual(command[:2], ["open", "-g"])
         self.assertNotIn("-j", command)
+        self.assertNotIn("--no-startup-window", command)
+        self.assertEqual(command[-1], "about:blank")
 
     def test_launch_disables_the_unused_multi_gigabyte_on_device_model(self) -> None:
         command = profile_config.chrome_launch_command(_config(), 9244)
