@@ -33,13 +33,11 @@ from archive_store import (
 )
 from profile_config import (
     ProfileConfigError,
-    activate_browser,
     call_background_page,
     close_background_page,
     configured_browser,
     create_background_page,
-    frontmost_process_id,
-    restore_frontmost_process_if_browser_active,
+    show_browser_without_focus,
     wait_for_background_page_url,
 )
 
@@ -391,10 +389,7 @@ def fetch_article_with_cdp(
         if keep_open_for_human:
             article["browser_tab_cleanup"] = "kept_open_for_human"
         elif owns_target:
-            cleanup_frontmost_pid = frontmost_process_id()
             close_background_page(port, target_id)
-            if cleanup_frontmost_pid:
-                restore_frontmost_process_if_browser_active(cleanup_frontmost_pid, port)
             if article is not None:
                 article["browser_tab_cleanup"] = "closed"
         elif article is not None:
@@ -406,7 +401,7 @@ def fetch_article_with_cdp(
         "WeChat login page",
     }:
         try:
-            article["browser_activation"] = activate_browser(configured_browser(), int(cdp))
+            article["browser_activation"] = show_browser_without_focus(configured_browser(), int(cdp))
         except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError) as error:
             article["browser_activation"] = {"status": "error", "error": str(error)}
     return article

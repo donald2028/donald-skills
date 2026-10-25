@@ -16,7 +16,6 @@ import fetch_public_article_bodies as body_runner  # noqa: E402
 class FocusSafetyTests(unittest.TestCase):
     def test_article_body_target_does_not_hide_or_reactivate_chrome(self) -> None:
         with (
-            mock.patch.object(body_runner, "frontmost_process_id", return_value=111),
             mock.patch.object(body_runner, "create_background_page", return_value="article-target"),
             mock.patch.object(body_runner, "wait_for_background_page_url"),
             mock.patch.object(body_runner, "call_background_page"),
@@ -32,7 +31,6 @@ class FocusSafetyTests(unittest.TestCase):
             ),
             mock.patch.object(body_runner, "close_background_page"),
             mock.patch.object(body_runner, "hide_browser_without_focus", create=True) as legacy_hide,
-            mock.patch.object(body_runner, "restore_frontmost_process_if_browser_active"),
         ):
             article = body_runner.fetch_article_with_cdp(
                 "https://mp.weixin.qq.com/s/example",
@@ -77,25 +75,40 @@ class FocusSafetyTests(unittest.TestCase):
             timeout=45,
         )
 
-    def test_opening_editor_guards_the_current_app_from_the_ui_click(self) -> None:
-        connection = mock.Mock()
+    def test_editor_opens_in_an_owned_background_target_without_a_foreground_popup(self) -> None:
         with (
-            mock.patch.object(account_runner, "frontmost_process_id", return_value=111),
             mock.patch.object(account_runner, "_click_exact_text") as click,
-            mock.patch.object(account_runner, "_wait_for_editor_target", return_value="editor-target"),
-            mock.patch.object(account_runner, "restore_frontmost_process_if_browser_active") as guard,
+            mock.patch.object(account_runner, "create_background_page", return_value="editor-target") as create,
         ):
             target_id = account_runner._open_editor_target(
-                connection,
                 port=9244,
-                before_ids={"home-target"},
-                home_target_id="home-target",
                 home_url="https://mp.weixin.qq.com/cgi-bin/home?t=home/index&token=abc",
             )
 
         self.assertEqual(target_id, "editor-target")
-        click.assert_called_once_with(connection, "文章")
-        guard.assert_called_once_with(111, 9244)
+        click.assert_not_called()
+        self.assertEqual(create.call_args.args[0], 9244)
+        self.assertIn('/cgi-bin/appmsg?', create.call_args.args[1])
+        self.assertIn('token=abc', create.call_args.args[1])
+
+    def test_blocked_article_retains_background_browser_without_activation(self) -> None:
+        with (
+            mock.patch.object(body_runner, 'create_background_page', return_value='article'),
+            mock.patch.object(body_runner, 'wait_for_background_page_url'),
+            mock.patch.object(body_runner, 'call_background_page'),
+            mock.patch.object(body_runner, '_evaluate_background_page', return_value={'content_chars': 20}),
+            mock.patch.object(body_runner, '_article_from_cdp_payload', return_value={
+                'blocked_reason': 'WeChat login page', 'fetch_status': 'blocked'}),
+            mock.patch.object(body_runner, 'configured_browser', return_value={}),
+            mock.patch.object(body_runner, 'show_browser_without_focus', create=True,
+                              return_value={'status': 'visible_in_background'}) as show,
+            mock.patch.object(body_runner, 'activate_browser', create=True) as activate,
+        ):
+            article = body_runner.fetch_article_with_cdp('https://mp.weixin.qq.com/s/example', '9244')
+        self.assertEqual(article['browser_tab_cleanup'], 'kept_open_for_human')
+        self.assertEqual(article['browser_activation']['status'], 'visible_in_background')
+        show.assert_called_once_with({}, 9244)
+        activate.assert_not_called()
 
 
 if __name__ == "__main__":

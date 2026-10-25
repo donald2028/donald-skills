@@ -27,7 +27,7 @@ class AccountUiTests(unittest.TestCase):
     def test_optional_editor_tip_is_not_required_for_the_flow(self) -> None:
         self.assertEqual(runner.EDITOR_TIP_ACKNOWLEDGEMENTS, ("我知道了", "知道了"))
 
-    def test_interactive_target_selects_only_its_owned_page_target(self) -> None:
+    def test_interactive_target_emulates_focus_without_activating_the_tab(self) -> None:
         calls: list[tuple[str, dict[str, object]]] = []
 
         class Connection:
@@ -39,7 +39,6 @@ class AccountUiTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("Page.bringToFront", {}),
                 ("Emulation.setFocusEmulationEnabled", {"enabled": True}),
             ],
         )

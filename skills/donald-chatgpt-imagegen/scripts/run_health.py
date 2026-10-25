@@ -76,7 +76,7 @@ class RunHeartbeat:
                 'last_progress_at': self.progress_at, 'detail': self.detail,
                 'last_page_check_at': self.page_at, 'page': self.page,
                 'consecutive_page_failures': self.failures,
-                'recovery_required': self.failures >= 3 or bool(self.page.get('crashReason')),
+                'recovery_required': self.failures >= 3 or bool(self.page.get('crashReason') or self.page.get('responseError')),
             }
             atomic_json(self.root / 'chatgpt_heartbeat.json', value)
             with (self.root / 'chatgpt_heartbeat.jsonl').open('a', encoding='utf-8') as handle:
@@ -139,13 +139,15 @@ class SubmissionCircuit:
         atomic_json(self.path, state)
         return state
 
-    def verification(self, job_id: str, now: float) -> None:
+    def verification(self, job_id: str, now: float, *, manifest: str | None = None) -> None:
         state = self.read()
         owners = state.get('verification_owners', [state['owner']] if state.get('owner') else [])
         if state['state'] == 'paused' and state.get('reason') != 'human_verification':
             state['prior_pause'] = dict(state)
         if job_id not in owners:
             owners.append(job_id)
+        if manifest:
+            state.setdefault('verification_manifests', {})[job_id] = manifest
         state.update(state='paused', reason='human_verification',
                      verification_owners=owners, next_check_at=now + 300)
         atomic_json(self.path, state)
@@ -156,6 +158,7 @@ class SubmissionCircuit:
         if state.get('reason') != 'human_verification' or job_id not in owners:
             return
         owners.remove(job_id)
+        state.get('verification_manifests', {}).pop(job_id, None)
         if owners:
             state['verification_owners'] = owners
         else:

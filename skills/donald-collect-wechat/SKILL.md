@@ -50,14 +50,18 @@ runtime launches it in the background without hiding it so every browser skill u
 renderable lifecycle. When
 login, verification, risk control, or anti-automation requires operator interaction, return
 `needs_ops`, explain the required action, and keep Chrome open until the user confirms completion.
-The bundled runners activate only the configured Chrome when they recognize such a page.
+The bundled runners leave the configured Chrome in the background when they recognize such a
+page. Bring it forward only after an explicit user request.
 
-After their runner startup proves `agent-browser --cdp` can attach, the bundled collectors use
+After their runner startup proves `agent-browser connect <port>` can attach, the bundled collectors use
 runner-owned browser-level CDP targets, enable focus emulation, and use trusted CDP input. The body
 collector starts its session on the first selected article and reuses that target for later
 articles; it does not leave an `about:blank` lifecycle placeholder open. The collectors never call
 focus-stealing `agent-browser tab new`, `tab`, `open`, or input commands on the normal path. Treat
 Chrome becoming frontmost as a collection failure.
+The account collector opens its editor as a background target using the authenticated backend
+home URL's editor token, avoiding the UI's foreground popup. Input uses focus emulation without
+`Page.bringToFront` or tab activation.
 
 Startup and teardown use the same shared Donald `BrowserSession` as other browser skills. The
 runner records the exact target IDs it creates, closes them in `finally`, and closes Chrome only
@@ -77,8 +81,8 @@ remains a process-level compatibility override. Pass `--output-root <path>` to r
 root for one capture; it has the highest precedence. Never default to the installed skill or
 current working directory.
 
-The collector starts from the backend home page and drives this visible UI flow in a background CDP
-target: open `文章`, open `超链接`, then use `选择账号文章` (when that intermediate control is
+The collector starts from the backend home page, opens its article editor in an owned background
+target, and drives this visible UI flow: open `超链接`, then use `选择账号文章` (when that intermediate control is
 rendered), click `选择其他账号`, search the exact account nickname (or its WeChat ID when supplied),
 and select the exact result. It then captures the browser-produced `appmsgpublish` responses while
 paging. It never replays that endpoint itself. `账号名片` is a separate insertion feature: it can
@@ -134,8 +138,8 @@ only a WeChat-generated copy/preview of `content`: leave the semantic title empt
 
 Ordinary articles reuse the body collector's single runner-owned CDP target, which starts on the
 first selected article instead of `about:blank` and is closed by `BrowserSession` after the run. It
-deliberately keeps only a recognized login or verification target open, activates Chrome for the
-operator, and records `browser_tab_cleanup: kept_open_for_human`. Public interaction counts are best-effort: record
+deliberately keeps only a recognized login or verification target open in the background and
+records `browser_tab_cleanup: kept_open_for_human`. Public interaction counts are best-effort: record
 reading, like, or share counts only when the public page exposes them; otherwise write
 `interaction_metrics.status: unavailable` instead of treating page defaults such as `0` as real
 measurements. 图文 already materialized from backend `content` does not open a redundant public

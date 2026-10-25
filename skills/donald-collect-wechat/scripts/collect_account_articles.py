@@ -22,9 +22,7 @@ from profile_config import (
     close_background_page,
     connect_cdp_target,
     create_background_page,
-    frontmost_process_id,
     list_cdp_targets,
-    restore_frontmost_process_if_browser_active,
 )
 
 
@@ -140,14 +138,7 @@ def _click_exact_text_if_visible(
 
 
 def _prepare_interactive_target(connection: Any) -> None:
-    """Make this runner-owned tab interactive without activating Chrome's window.
-
-    Recent WeChat editor builds ignore trusted CDP pointer events until their
-    page target is the selected Chrome tab. ``Page.bringToFront`` switches
-    only that owned tab; the caller still restores the foreground app, so it
-    does not steal operating-system focus.
-    """
-    connection.call("Page.bringToFront", {})
+    """Enable trusted input on the owned background page without selecting its tab."""
     connection.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
 
 
@@ -228,19 +219,6 @@ return nickname === account || label === account || label.startsWith(account + "
     return _element_rect_expression(predicate, "li,[role=radio],[role=listitem]")
 
 
-def _wait_for_editor_target(port: int, before_ids: set[str], home_target_id: str, timeout: float = 8.0) -> str:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        targets = list_cdp_targets(port)
-        for target in targets:
-            url = str(target.get("url") or "")
-            target_id = str(target.get("id") or "")
-            if "cgi-bin/appmsg" in url and "action=edit" in url and (target_id not in before_ids or target_id == home_target_id):
-                return target_id
-        time.sleep(0.2)
-    return ""
-
-
 def _response_begin(url: str) -> str:
     return parse_qs(urlsplit(url).query).get("begin", [""])[0]
 
@@ -292,32 +270,18 @@ def _close_if_open(port: int, target_id: str) -> None:
     if not target_id:
         return
     if any(str(target.get("id") or "") == target_id for target in list_cdp_targets(port)):
-        previous_frontmost_pid = frontmost_process_id()
         close_background_page(port, target_id)
-        if previous_frontmost_pid:
-            restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
 
 
 def _open_editor_target(
-    connection: Any,
     *,
     port: int,
-    before_ids: set[str],
-    home_target_id: str,
     home_url: str,
 ) -> str:
-    previous_frontmost_pid = frontmost_process_id()
-    try:
-        _click_exact_text(connection, "文章")
-    finally:
-        if previous_frontmost_pid:
-            restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
-    target_id = _wait_for_editor_target(port, before_ids, home_target_id)
-    if target_id:
-        return target_id
+    """Open the editor in an owned background tab instead of triggering the UI's popup."""
     token = parse_qs(urlsplit(home_url).query).get("token", [""])[0]
     if not token:
-        raise RuntimeError("Could not open the article editor or derive its token")
+        raise RuntimeError("The authenticated backend home URL did not expose the article editor token")
     return create_background_page(
         port,
         "https://mp.weixin.qq.com/cgi-bin/appmsg"
@@ -389,12 +353,8 @@ def main() -> int:
             print(json.dumps({"status": "needs_ops", "run_dir": str(run_dir), "browser_activation": activation}, ensure_ascii=False, indent=2))
             return 2
 
-        before_ids = {str(target.get("id") or "") for target in list_cdp_targets(args.cdp)}
         editor_target_id = _open_editor_target(
-            home_connection,
             port=args.cdp,
-            before_ids=before_ids,
-            home_target_id=home_target_id,
             home_url=str(state.get("url") or ""),
         )
         editor_connection = connect_cdp_target(args.cdp, editor_target_id)

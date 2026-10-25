@@ -23,6 +23,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from profile_config import create_background_page
+
 _WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _SQRT3 = math.sqrt(3)
 _SQRT5 = math.sqrt(5)
@@ -312,18 +314,7 @@ def find_page_target(port: int, url_prefix: str) -> dict[str, Any] | None:
 
 
 def create_page_target(port: int, url: str) -> dict[str, Any]:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5) as resp:
-        version = json.loads(resp.read().decode("utf-8"))
-    ws_url = str(version.get("webSocketDebuggerUrl") or "")
-    parts = urllib.parse.urlsplit(ws_url)
-    if not parts.hostname or not parts.port or not parts.path:
-        raise RuntimeError(f"Browser CDP websocket unavailable on port {port}")
-    conn = CDPConnection.connect(parts.hostname, parts.port, parts.path)
-    try:
-        result = conn.call("Target.createTarget", {"url": url, "background": True})
-    finally:
-        conn.close()
-    target_id = str(result.get("targetId") or "")
+    target_id = create_background_page(port, url)
     deadline = time.time() + 5
     while time.time() < deadline:
         for target in list_page_targets(port):

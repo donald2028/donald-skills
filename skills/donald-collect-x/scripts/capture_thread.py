@@ -17,7 +17,6 @@ import argparse
 import json
 import random
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,6 +25,7 @@ import cdp_input
 import wheel_motion
 from extract_thread import build_self_thread, load_tweets_from_runs, parse_target_url
 from output_paths import resolve_tool_output_root
+from profile_config import preserve_foreground
 
 # Known page states that a human (not the script) must resolve.
 _BLOCK_MARKERS = {
@@ -56,40 +56,6 @@ def detect_block(page_text: str) -> str | None:
 
 def _safe(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", value)
-
-
-def _frontmost_app_name() -> str | None:
-    try:
-        result = subprocess.run(
-            [
-                "osascript", "-e",
-                'tell application "System Events" to get name of first application process whose frontmost is true',
-            ],
-            capture_output=True, text=True, timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
-
-
-def _activate_app(app_name: str) -> None:
-    try:
-        subprocess.run(
-            ["osascript", "-e", f'tell application "{app_name}" to activate'],
-            capture_output=True, text=True, timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return
-
-
-def _restore_frontmost_app(app_name: str | None) -> None:
-    if not app_name:
-        return
-    current = _frontmost_app_name()
-    if current and current != app_name:
-        _activate_app(app_name)
 
 
 class Browser(Protocol):
@@ -180,7 +146,8 @@ class AgentBrowser:
         self._page_conn.call("Page.enable")
         self._page_conn.call("Runtime.enable")
         self._page_conn.call("Network.enable")
-        self._page_conn.call("Page.navigate", {"url": url})
+        with preserve_foreground(int(self.port)):
+            self._page_conn.call("Page.navigate", {"url": url})
         time.sleep(4)
         self._drain_network_events(timeout=0.2)
 
@@ -338,7 +305,6 @@ class AgentBrowser:
         """Click the first visible button-like element matching any label."""
         normalized = json.dumps([label.lower() for label in labels])
         conn = self._connect_input()
-        front_app: str | None = None
         try:
             cdp_input.enable_focus_emulation(conn)
             expr = (
@@ -357,13 +323,11 @@ class AgentBrowser:
             rect = cdp_input.get_bounding_rect(conn, expr)
             if rect is None:
                 return False
-            front_app = _frontmost_app_name()
-            cdp_input.dispatch_click(conn, rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
+            with preserve_foreground(int(self.port)):
+                cdp_input.dispatch_click(conn, rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
             return True
         finally:
             conn.close()
-            if front_app is not None:
-                _restore_frontmost_app(front_app)
 
     def click_retry(self) -> bool:
         return self.click_button_texts(["Try again", "Retry"])

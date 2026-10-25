@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT Web"
+  short_description: "Chat, exchange files, and continue ChatGPT Web conversations"
+  default_prompt: "Use $donald-chatgpt to work with ChatGPT in the shared Chrome session, exchange files, and read or follow up on its replies."

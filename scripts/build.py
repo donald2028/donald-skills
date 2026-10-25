@@ -15,6 +15,7 @@ PACKAGE_PATH = REPO / "package.json"
 BROWSER_RUNTIME_SOURCE_DIR = REPO / "skills/donald-config-browser/scripts"
 BROWSER_RUNTIME_FILES = ("profile_config.py", "browser_runtime.py")
 BROWSER_RUNTIME_CONSUMERS = (
+    "donald-chatgpt",
     "donald-chatgpt-imagegen",
     "donald-collect-wechat",
     "donald-collect-x",

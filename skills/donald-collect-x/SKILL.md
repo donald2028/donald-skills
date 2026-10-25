@@ -43,7 +43,7 @@ substituting it for `python3` in the command examples below.
 
 - Log in to X in the selected visible Profile.
 - `X_COLLECTOR_CHROME_EXECUTABLE` and `X_COLLECTOR_CHROME_DATA_DIR` remain explicit legacy
-  overrides; the collector still verifies `agent-browser --cdp` attach before collecting.
+  overrides; the collector still verifies `agent-browser connect <port>` before collecting.
 - Media download additionally uses `curl`, with `ffmpeg` and `yt-dlp` for video fallbacks. Do not
   probe them before collection; the downloader records unavailable media honestly.
 
@@ -51,9 +51,11 @@ On macOS, keep the automatically launched headed Chrome visible behind the activ
 normal automation; this is not headless mode and does not make Chrome frontmost. The shared
 runtime launches it in the background without hiding it so every browser skill uses the same
 renderable lifecycle. Do not activate it during normal
-collection. When the collector detects a login wall, rate limit, or blocking error page, it returns
-`needs_ops`, activates only the configured CDP Chrome, and leaves it open for the user. Explain the
-required action and continue after the user confirms completion.
+collection, tab creation, navigation, recovery, or handoff. When the collector detects a login wall,
+rate limit, or blocking error page, it returns `needs_ops` and leaves the configured CDP Chrome open
+in the background. Explain the required action; activate Chrome only after an explicit user
+request, and continue after the user confirms completion. Background operations restore focus only
+if this Chrome took it, preserving any other app the user switched to.
 
 The collector uses the shared Donald `BrowserSession`: it operates only on the target ID allocated
 to the current run, closes that target and its CDP connection in `finally`, and exits Chrome only

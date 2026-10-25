@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,146 @@ class PageRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.args = argparse.Namespace(page_recovery_attempts=3)
         self.cwd = Path(__file__).resolve().parent
+
+    def test_collect_recovers_page_level_retry_before_collecting_original_image(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = 'https://chatgpt.com/c/original'
+            job = {'job_name': 'collect', 'prompt_card': 'prompt.md', 'download_dir': temporary,
+                   'chatgpt_message': 'Current prompt', 'variant_count': 1}
+            runner._write_session_patch(job, {'submission_committed': True, 'conversation_url': url,
+                                            'baseline_user_message_count': 4})
+            candidate = {'src': 'blob:current', 'width': 512, 'height': 512, 'inAssistant': True,
+                         'submittedPromptChecked': True, 'inSubmittedTurn': True, 'messageUserTurn': 4}
+            recover = mock.Mock(return_value={'status': 'page_recovered'})
+            submit, retry = mock.Mock(), mock.Mock()
+            patches = (
+                mock.patch.object(runner, '_validate_profile'),
+                mock.patch.object(runner, '_validate_account_lane', return_value={}),
+                mock.patch.object(runner, '_current_url', return_value=url),
+                mock.patch.object(runner, '_require_original_conversation', return_value=url),
+                mock.patch.object(runner, '_ensure_expected_conversation', return_value={'current_url': url}),
+                mock.patch.object(runner, '_screenshot'),
+                mock.patch.object(runner, '_page_access_state', side_effect=[
+                    {'crashReason': 'chatgpt_transient_page_error'} for _ in range(3)
+                ] + [{}]),
+                mock.patch.object(runner, '_recover_chatgpt_page', recover),
+                mock.patch.object(runner, '_page_text', return_value='Old error: Try again'),
+                mock.patch.object(runner, '_image_inventory', return_value=[candidate]),
+                mock.patch.object(runner, '_generation_page_health', return_value={'status': 'ok'}),
+                mock.patch.object(runner, '_emit_progress'),
+                mock.patch.object(runner, '_download_candidates', return_value=[{'path': 'current.png'}]),
+                mock.patch.object(runner, '_annotate_aspect_ratio_validation', return_value={}),
+                mock.patch.object(runner, '_profile_label', return_value='test'),
+                mock.patch.object(runner, '_agent_browser_session_record', return_value={}),
+                mock.patch.object(runner, '_update_summary_for_collect_current', return_value='summary.json'),
+                mock.patch.object(runner.time, 'sleep'),
+                mock.patch.object(runner, '_submit_prompt', submit),
+                mock.patch.object(runner, '_click_try_again', retry),
+            )
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                result = runner.run_collect_current(self.args, job, self.cwd)
+            self.assertEqual(result['status'], 'downloaded')
+            session = runner._read_json_if_exists(runner._session_path(job))
+            self.assertEqual(session.get('image_count'), result['image_count'])
+            self.assertEqual(session.get('raw_image_count'), result['raw_image_count'])
+            self.assertEqual(session.get('images'), result['images'])
+            self.assertEqual(len(result['page_recoveries']), 1)
+            self.assertEqual(recover.call_args.args[2], url)
+            self.assertEqual(recover.call_args.kwargs['phase'], 'post_submit_monitor:collect_current')
+            submit.assert_not_called()
+            retry.assert_not_called()
+
+    def test_empty_collection_replaces_stale_missing_turn_error_without_requesting_a_loop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = 'https://chatgpt.com/c/original'
+            job = {'job_name': 'empty', 'prompt_card': 'prompt.md', 'download_dir': temporary, 'variant_count': 1}
+            runner._write_session_patch(job, {
+                'status': 'generation_failed', 'submission_committed': True, 'conversation_url': url,
+                'error_type': 'chatgpt_submitted_turn_missing', 'generation_error': {'message': 'old missing turn'},
+                'retryable': True, 'terminal': True, 'attempt': {'action': 'failure', 'reason': 'old missing turn'},
+            })
+            args = argparse.Namespace(timeout=5)
+            clock = [0.0]
+            with (
+                mock.patch.multiple(runner,
+                    _validate_profile=mock.Mock(), _validate_account_lane=mock.Mock(return_value={}),
+                    _current_url=mock.Mock(return_value=url), _require_original_conversation=mock.Mock(return_value=url),
+                    _ensure_expected_conversation=mock.Mock(return_value={'current_url': url}),
+                    _screenshot=mock.Mock(), _page_access_state=mock.Mock(return_value={}),
+                    _page_text=mock.Mock(return_value=''), _image_inventory=mock.Mock(return_value=[]),
+                    _generation_page_health=mock.Mock(return_value={'status': 'ok'}), _emit_progress=mock.Mock(),
+                    _download_candidates=mock.Mock(return_value=[]), _annotate_aspect_ratio_validation=mock.Mock(return_value={}),
+                    _profile_label=mock.Mock(return_value='test'), _agent_browser_session_record=mock.Mock(return_value={}),
+                    _scroll_down=mock.Mock(),
+                ),
+                mock.patch.object(runner.time, 'time', side_effect=lambda: clock[0]),
+                mock.patch.object(runner.time, 'sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)),
+            ):
+                result = runner.run_collect_current(args, job, self.cwd)
+            session = runner._read_json_if_exists(runner._session_path(job))
+            self.assertEqual(result['status'], 'collect_current_no_new_images')
+            self.assertEqual(session['error_type'], 'chatgpt_collection_no_images')
+            self.assertNotIn('generation_error', session)
+            self.assertFalse(session['terminal'])
+            self.assertFalse(session['retryable'])
+            self.assertFalse(session['should_collect_current_first'])
+            self.assertEqual(session['recommended_next_action'], 'inspect_original_conversation_before_manual_recovery')
+            self.assertEqual(session['attempts'][0]['reason'], 'old missing turn')
+
+    def test_repeated_pre_submit_failure_uses_a_fresh_target_without_retrying_the_old_page(self):
+        with (
+            mock.patch.object(runner, "_page_access_state", return_value={}),
+            mock.patch.object(runner, "_replace_unsubmitted_tab") as replace,
+            mock.patch.object(runner, "_click_page_error_retry") as retry,
+            mock.patch.object(runner, "_navigate_owned_cdp_tab") as navigate,
+            mock.patch.object(runner, "_wait_ms"),
+            mock.patch.object(runner, "_wait_for_prompt_box"),
+        ):
+            event = runner._recover_chatgpt_page(self.args, self.cwd, "https://chatgpt.com/",
+                phase="pre_submit_prepare", attempt=2, reason="upload still pending")
+        self.assertEqual(event["method"], "replace_unsubmitted_tab")
+        replace.assert_called_once()
+        retry.assert_not_called()
+        navigate.assert_not_called()
+
+    def test_replacement_creates_new_page_before_closing_only_the_old_owned_page(self):
+        for succeeds in (True, False):
+            args = argparse.Namespace(_owned_tab_cdp_target_id="old", _owned_tab_cdp_url="ws://old")
+            def create(target, url):
+                if succeeds:
+                    target._owned_tab_cdp_target_id, target._owned_tab_cdp_url = "new", "ws://new"
+                return succeeds
+            with (
+                mock.patch.object(runner, "_open_background_cdp_tab", side_effect=create),
+                mock.patch.object(runner, "_close_owned_tab") as close,
+            ):
+                if succeeds:
+                    runner._replace_unsubmitted_tab(args, self.cwd, "https://chatgpt.com/")
+                    self.assertEqual(close.call_args.args[0]._owned_tab_cdp_target_id, "old")
+                    self.assertEqual(args._owned_tab_cdp_target_id, "new")
+                else:
+                    with self.assertRaises(runner.RecoverablePageError):
+                        runner._replace_unsubmitted_tab(args, self.cwd, "https://chatgpt.com/")
+                    close.assert_not_called()
+                    self.assertEqual(args._owned_tab_cdp_target_id, "old")
+
+    def test_dispatch_evidence_blocks_pre_submit_reset_and_does_not_consume_more_recovery_attempts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {"job_name": "dispatch", "prompt_card": "prompt.md", "download_dir": temporary}
+            args = argparse.Namespace(_health_job=job, page_recovery_attempts=3)
+            runner._write_session_patch(job, {"submission_committed": "unknown", "dispatch_started": True})
+            with (
+                mock.patch.object(runner, "_page_access_state", return_value={}),
+                mock.patch.object(runner, "_open_background_cdp_tab") as create,
+                mock.patch.object(runner, "_record_page_recovery") as record,
+                self.assertRaises(runner.OriginalConversationRequired),
+            ):
+                runner._run_with_page_recovery(args, self.cwd, mock.Mock(side_effect=runner.RecoverablePageError("page error")),
+                    phase="pre_submit_prepare", target_url="https://chatgpt.com/", job=job)
+            create.assert_not_called()
+            self.assertEqual(record.call_count, 1)
 
     def test_transient_post_submit_read_failures_do_not_refresh(self) -> None:
         operation = mock.Mock(

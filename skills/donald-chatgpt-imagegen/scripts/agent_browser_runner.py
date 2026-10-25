@@ -36,13 +36,14 @@ from browser_runtime import BrowserSession, process_is_alive
 from output_paths import resolve_tool_state_root
 from profile_config import (
     ProfileConfigError,
-    activate_browser,
     chrome_environment,
     cdp_target,
+    close_background_page,
     create_background_page,
     configured_browser,
     ensure_agent_browser,
-    restore_frontmost_process,
+    frontmost_process_id,
+    restore_frontmost_process_if_browser_active,
     run_agent_browser,
     show_browser_without_focus,
 )
@@ -558,15 +559,9 @@ def _agent_browser_session_record(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _agent_browser_base(args: argparse.Namespace) -> list[str]:
-    executable = ensure_agent_browser(auto_install=True)["executable"]
-    command = [executable, "--session", _agent_browser_transport_session(args)]
-    if args.download_path:
-        command.extend(["--download-path", str(args.download_path)])
-    if args.cdp:
-        command.extend(["--cdp", str(args.cdp)])
-    elif args.auto_connect:
-        command.append("--auto-connect")
-    return command
+    raise RuntimeError(
+        "Foreground CLI tab interaction is disabled; use shared BrowserSession and owned background CDP"
+    )
 
 
 def _cdp_page_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -616,47 +611,12 @@ def _forget_owned_cdp_target(args: argparse.Namespace) -> None:
     args._tab_label = ""
 
 
-def _capture_owned_tab_cdp_url(
-    args: argparse.Namespace,
-    cwd: Path,
-    before_target_ids: set[str] | None = None,
-) -> None:
-    deadline = time.time() + 5
-    last_error = ""
-    while time.time() < deadline:
-        try:
-            targets = _cdp_page_targets(args)
-        except Exception as error:
-            last_error = f"{type(error).__name__}: {error}"
-            time.sleep(0.2)
-            continue
-        if before_target_ids is not None:
-            for target in targets:
-                if str(target.get("id") or "") not in before_target_ids:
-                    if _remember_owned_cdp_target(args, target):
-                        return
-        elif targets and _remember_owned_cdp_target(args, targets[0]):
-            return
-        time.sleep(0.2)
-
-    try:
-        targets = _cdp_page_targets(args)
-    except Exception as error:
-        args._owned_tab_cdp_error = f"{type(error).__name__}: {error}"
-        return
-    if targets and _remember_owned_cdp_target(args, targets[0]):
-        return
-    args._owned_tab_cdp_error = last_error or "page_target_not_found"
-
-
 def _open_background_cdp_tab(args: argparse.Namespace, url: str) -> bool:
     try:
-        with _CDPConnection.connect(_browser_cdp_websocket_url(args), timeout=10) as conn:
-            result = conn.call("Target.createTarget", {"url": url, "background": True})
-        target_id = str(result.get("targetId") or "")
-        if not target_id:
-            args._owned_tab_cdp_error = "Chrome did not return a created target ID"
-            return False
+        target_id = create_background_page(int(_cdp_launch_port(args)), url)
+        browser_session = getattr(args, "_browser_session", None)
+        if browser_session is not None:
+            browser_session.owned_target_ids.add(target_id)
         deadline = time.time() + 10
         while time.time() < deadline:
             for target in _cdp_page_targets(args):
@@ -676,14 +636,24 @@ def _open_background_cdp_tab(args: argparse.Namespace, url: str) -> bool:
 def _navigate_owned_cdp_tab(args: argparse.Namespace, url: str) -> bool:
     if not _owned_tab_cdp_url(args):
         return False
+    previous_pid = frontmost_process_id()
+    stage = "connect"
     try:
         with _CDPConnection.connect(_owned_tab_cdp_url(args), timeout=30) as conn:
+            stage = "Page.enable"
             conn.call("Page.enable")
-            conn.call("Page.navigate", {"url": url})
+            stage = "Page.navigate"
+            result = conn.call("Page.navigate", {"url": url})
+            if result.get("errorText"):
+                raise RecoverablePageError(str(result["errorText"]))
+        args._owned_tab_cdp_error = ""
         return True
     except Exception as error:
-        args._owned_tab_cdp_error = f"{type(error).__name__}: {error}"
+        args._owned_tab_cdp_error = f"{stage}: {type(error).__name__}: {error}"
         return False
+    finally:
+        if previous_pid:
+            restore_frontmost_process_if_browser_active(previous_pid, int(_cdp_launch_port(args)))
 
 
 def _owned_tab_cdp_url(args: argparse.Namespace) -> str:
@@ -782,8 +752,7 @@ def _close_owned_tab(args: argparse.Namespace, cwd: Path) -> None:
     try:
         target_id = str(getattr(args, "_owned_tab_cdp_target_id", "") or "")
         if target_id:
-            with _CDPConnection.connect(_browser_cdp_websocket_url(args), timeout=10) as conn:
-                conn.call("Target.closeTarget", {"targetId": target_id})
+            close_background_page(int(_cdp_launch_port(args)), target_id)
             args._owned_tab_cdp_target_id = ""
             args._owned_tab_cdp_url = ""
             args._opened_tab = False
@@ -851,10 +820,8 @@ def _close_about_blank_tabs(args: argparse.Namespace, cwd: Path) -> dict[str, An
                 "about_blank_tab_ids": [str(target["id"]) for target in blank_targets],
                 "non_blank_count": len(targets) - len(blank_targets),
             }
-            if blank_targets:
-                with _CDPConnection.connect(_browser_cdp_websocket_url(args), timeout=10) as conn:
-                    for target in blank_targets:
-                        conn.call("Target.closeTarget", {"targetId": str(target["id"])})
+            for target in blank_targets:
+                close_background_page(int(_cdp_launch_port(args)), str(target["id"]))
             return summary
         except Exception:
             return summary
@@ -982,12 +949,6 @@ def _cleanup_agent_browser(args: argparse.Namespace, cwd: Path) -> None:
         _write_cdp_state_locked(args, state)
     if close_browser:
         _close_cdp_browser(args, cwd)
-        previous_pid = getattr(args, "_frontmost_pid_before_launch", None)
-        if previous_pid:
-            try:
-                args._frontmost_restore = restore_frontmost_process(int(previous_pid))
-            except (OSError, ProfileConfigError, subprocess.SubprocessError, ValueError) as error:
-                args._frontmost_restore = {"status": "error", "error": str(error)}
 
 
 def _split_browser_args(value: str | None) -> list[str]:
@@ -1168,9 +1129,7 @@ class _ResumeImageBrowserSession(BrowserSession):
             return self.original_target
         if self.require_target:
             raise OriginalConversationRequired("Original temporary conversation target is no longer available")
-        target = create_background_page(self.port, self.url)
-        self.owned_target_ids.add(target)
-        return target
+        return _FreshImageBrowserSession._claim_target(self, state)
 
     def _cleanup_failed_open(self) -> None:
         # Attach failure must not destroy a retained request before business recovery starts.
@@ -1180,9 +1139,9 @@ class _ResumeImageBrowserSession(BrowserSession):
         super()._cleanup_failed_open()
 
 
-class _HealthCheckBrowserSession(BrowserSession):
+class _FreshImageBrowserSession(BrowserSession):
     def _claim_target(self, state: dict[str, Any]) -> str:
-        # Never navigate a retained request just to inspect account health.
+        # Retained image requests belong to their saved jobs, including unknown submissions.
         target = create_background_page(self.port, self.url)
         self.owned_target_ids.add(target)
         return target
@@ -1203,7 +1162,7 @@ def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
                 "executable": args.executable_path,
             },
         }
-    session_type = _HealthCheckBrowserSession if getattr(args, "mode", "") == "health-check" else BrowserSession
+    session_type = _FreshImageBrowserSession
     resume_options = {}
     saved = getattr(args, "_resume_session", {})
     if getattr(args, "mode", "") != "health-check" and saved.get("owned_target_id") and (
@@ -1237,7 +1196,6 @@ def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
     args._opened_tab = True
     args._tab_label = ""
     args._launched_chrome = browser_session.launched
-    args._frontmost_pid_before_launch = browser_session.previous_frontmost_pid
     args.cdp = str(browser_session.port)
 
 
@@ -1254,10 +1212,7 @@ def _launch_chrome_for_cdp(args: argparse.Namespace, cwd: Path) -> None:
         "--no-default-browser-check",
         *_split_browser_args(args.browser_args),
     ]
-    if sys.platform == "darwin":
-        launch_args.append("about:blank")
-    else:
-        launch_args.append("--no-startup-window")
+    launch_args.append("--no-startup-window")
 
     if args.launch_background and args.executable_path == DEFAULT_CHROME:
         command = [
@@ -1310,11 +1265,8 @@ def _ensure_browser_connection(args: argparse.Namespace, cwd: Path) -> None:
                 if _open_background_cdp_tab(args, "about:blank") and getattr(
                     args, "_uses_shared_browser_profile", False
                 ):
-                    visibility = show_browser_without_focus(
+                    show_browser_without_focus(
                         configured_browser(), int(_cdp_launch_port(args))
-                    )
-                    args._frontmost_pid_before_launch = visibility.get(
-                        "restored_frontmost_pid"
                     )
             last_check = _agent_connection_check(args, cwd)
             if last_check["ok"]:
@@ -1338,11 +1290,8 @@ def _ensure_browser_connection(args: argparse.Namespace, cwd: Path) -> None:
             if _open_background_cdp_tab(args, "about:blank") and getattr(
                 args, "_uses_shared_browser_profile", False
             ):
-                visibility = show_browser_without_focus(
+                show_browser_without_focus(
                     configured_browser(), int(_cdp_launch_port(args))
-                )
-                args._frontmost_pid_before_launch = visibility.get(
-                    "restored_frontmost_pid"
                 )
         last_check = _agent_connection_check(args, cwd)
         if last_check["ok"]:
@@ -2006,6 +1955,79 @@ CONVERSATION_DOM_JS = r"""
 """.strip()
 
 
+HUMAN_VERIFICATION_STATE_JS = r"""
+(() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const frames = Array.from(document.querySelectorAll('iframe'))
+    .filter((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
+  const visibleFrames = frames.filter(visible);
+  const excluded = "nav,aside,[role='navigation'],[inert],#history,[aria-label='Chat history']," +
+    "[data-sidebar-item],[data-message-author-role],[data-turn-key],[data-testid^='conversation-turn']," +
+    "[data-user-message-bubble],[data-conversation-role],form,#prompt-textarea,[contenteditable='true']";
+  const markers = [
+    'verify you are human', 'verifying you are human', 'confirm you are human',
+    'checking your browser before accessing', 'performing security verification',
+    'complete the security check', 'complete the challenge', 'cloudflare ray id',
+    '验证码', '安全验证', '人机验证', '验证您是真人'
+  ];
+  const texts = Array.from(document.querySelectorAll('body *')).filter(visible)
+    .filter((el) => !el.closest(excluded) && !el.querySelector(excluded))
+    .map((el) => (el.innerText || '').replace(/\s+/g, ' ').toLowerCase());
+  return {
+    challengeFrame: visibleFrames.length > 0,
+    challengeFrameCount: frames.length,
+    visibleChallengeFrameCount: visibleFrames.length,
+    challengeTextMarker: markers.find((marker) => texts.some((text) => text.includes(marker))) || '',
+  };
+})()
+""".strip()
+
+
+CURRENT_RESPONSE_ERROR_STATE_JS = r"""
+((expectedPrompt) => {
+  const {users, turnFor, userFor, submittedUserFor} = __CONVERSATION_DOM__;
+  const currentUser = expectedPrompt ? submittedUserFor(expectedPrompt) : users.at(-1);
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const excluded = "nav,aside,[role='navigation'],[inert],#history,[aria-label='Chat history']," +
+    "[data-sidebar-item],[data-message-author-role='user'],[data-user-message-bubble]," +
+    "form,#prompt-textarea,[contenteditable='true']";
+  const belongsToCurrentResponse = (el) => {
+    if (!currentUser || el.closest(excluded) || el.contains(currentUser) || userFor(el) !== currentUser) return false;
+    const owner = turnFor(el);
+    if (owner) return userFor(owner) === currentUser;
+    const surface = el.closest('[role="alert"],[aria-live="assertive"],[data-testid*="error" i]') || el.parentElement;
+    const text = surface?.innerText || '';
+    return text.length <= 800 && /cloudflare_challenge/i.test(text);
+  };
+  const labelParts = (el) => [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText, el.textContent]
+    .filter(Boolean).map((value) => value.trim()).filter(Boolean);
+  const retryLabels = ["Try again", "Retry", "重新生成", "再试一次", "重试"];
+  const retryControls = Array.from(document.querySelectorAll('button,[role="button"],a'))
+    .filter(visible).filter(belongsToCurrentResponse)
+    .filter((el) => labelParts(el).some((label) => retryLabels.some((retry) => label.toLowerCase() === retry.toLowerCase())));
+  const errorSurfaces = Array.from(document.querySelectorAll(
+    '[role="alert"],[aria-live="assertive"],[data-testid*="error" i],[class*="toast" i]'
+  )).filter(visible).filter(belongsToCurrentResponse);
+  // Some response errors sit after the user turn without an assistant wrapper or alert role.
+  const retryErrors = retryControls.map((el) => el.parentElement).filter(Boolean)
+    .filter((el) => visible(el) && belongsToCurrentResponse(el)
+      && (el.innerText || '').length <= 800 && /cloudflare_challenge/i.test(el.innerText || ''));
+  const errorSurfaceTexts = [...errorSurfaces, ...retryErrors]
+    .map((el) => (el.innerText || el.textContent || '').trim()).filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index).slice(0, 8);
+  return {retryControls, retryControlLabels: retryControls.map((el) => labelParts(el)[0]), errorSurfaceTexts};
+})
+""".strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
+
+
 def _expand_submitted_prompt(args: argparse.Namespace, cwd: Path) -> bool:
     prompt = str(getattr(args, "_submitted_prompt", ""))
     if not prompt:
@@ -2061,44 +2083,12 @@ JSON.stringify((() => {
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
-  const belongsToCurrentTurn = (el) => {
-    if (el.closest("nav,aside,[role='navigation'],#history,[aria-label='Chat history'],[data-sidebar-item]")) return false;
-    const owner = turnFor(el);
-    return Boolean(owner && (currentUser ? userFor(owner) === currentUser : owner === latestTurn));
-  };
-  const labelParts = (el) => [
-    el.getAttribute("aria-label"),
-    el.getAttribute("title"),
-    el.innerText,
-    el.textContent,
-  ].filter(Boolean).map((value) => value.trim()).filter(Boolean);
-  const retryPattern = /^(try again|retry|再试一次|重试)$/i;
-  const retryControls = Array.from(document.querySelectorAll("button,[role='button'],a"))
-    .filter(visible)
-    .filter(belongsToCurrentTurn)
-    .filter((control) => labelParts(control).some((label) => retryPattern.test(label)));
-  const errorSurfaceTexts = Array.from(document.querySelectorAll(
-    '[role="alert"],[aria-live="assertive"],[data-testid*="error" i],[class*="toast" i]'
-  ))
-    .filter(visible)
-    .filter(belongsToCurrentTurn)
-    .map((el) => (el.innerText || el.textContent || "").trim())
-    .filter(Boolean)
-    .filter((value, index, values) => values.indexOf(value) === index)
-    .slice(0, 8);
+  const {retryControlLabels, errorSurfaceTexts} = (__CURRENT_RESPONSE_ERROR_STATE__)(expectedPrompt);
   const hasComposer = Array.from(document.querySelectorAll('[contenteditable="true"]')).some(visible);
-  const challengeFrame = Array.from(document.querySelectorAll('iframe'))
-    .some((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
-  const pageText = (document.body?.innerText || "").toLowerCase();
+  const {challengeFrame, challengeTextMarker} = __HUMAN_VERIFICATION_STATE__;
   const pageLoadingError = Array.from(document.querySelectorAll('body *')).filter(visible)
     .filter((el) => !turnFor(el) && !el.querySelector('[data-turn-key],[data-testid^="conversation-turn-"]'))
     .some((el) => /could not load (?:this |the )?(?:chatgpt )?conversation/i.test(el.innerText || el.textContent || ''));
-  const challengeText = [
-    "verify you are human", "verifying you are human", "confirm you are human",
-    "checking your browser before accessing", "performing security verification",
-    "complete the security check", "complete the challenge", "cloudflare ray id", "cloudflare_challenge",
-    "验证码", "安全验证", "人机验证", "验证您是真人"
-  ].some((marker) => pageText.includes(marker));
   return {
     href: window.location.href,
     userMessageCount: users.length,
@@ -2109,15 +2099,17 @@ JSON.stringify((() => {
     latestAssistantMessage: latest ? (latest.innerText || latest.textContent || "") : "",
     latestAssistantIsCurrent: Boolean(latest && (!latestTurn || latestTurn.contains(latest))),
     latestTurnText: latestTurn ? (latestTurn.innerText || latestTurn.textContent || "") : "",
-    retryControlLabels: retryControls.map((control) => labelParts(control)[0] || "").filter(Boolean),
+    retryControlLabels,
     errorSurfaceTexts,
     hasComposer,
     challengeFrame,
     pageLoadingError,
-    humanReason: challengeFrame || challengeText ? "anti_automation_verification" : "",
+    humanReason: challengeFrame || challengeTextMarker ? "anti_automation_verification" : "",
   };
 })())
 """.strip().replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
+        .replace("__CURRENT_RESPONSE_ERROR_STATE__", CURRENT_RESPONSE_ERROR_STATE_JS)
+        .replace("__HUMAN_VERIFICATION_STATE__", HUMAN_VERIFICATION_STATE_JS)
         .replace("__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", ""))))
     )
     observation = _eval_json(args, cwd, script, timeout=30)
@@ -2145,6 +2137,13 @@ JSON.stringify((() => {
     ]
     scoped_error_text = "\n".join([latest_assistant, latest_turn, *error_surface_texts]).strip()
     generation_error = _generation_error_from_text(scoped_error_text)
+    response_error = next((text for text in error_surface_texts if "cloudflare_challenge" in text.lower()), "")
+    if response_error:
+        generation_error = {
+            "error_type": "chatgpt_response_service_error",
+            "matched_marker": "cloudflare_challenge",
+            "message": response_error[-800:],
+        }
     if not generation_error and retry_control_labels:
         generation_error = {
             "error_type": "chatgpt_generation_error",
@@ -2152,7 +2151,7 @@ JSON.stringify((() => {
             "message": (scoped_error_text or retry_control_labels[0])[-800:],
         }
     human_reason = str(observation.get("humanReason") or "")
-    if observation.get("challengeFrame") or "cloudflare_challenge" in scoped_error_text.lower():
+    if observation.get("challengeFrame"):
         human_reason = "anti_automation_verification"
     if human_reason or observation.get("pageLoadingError"):
         generation_error = None
@@ -2276,42 +2275,17 @@ def _open_url(args: argparse.Namespace, cwd: Path, url: str) -> None:
     if getattr(args, "_opened_tab", False):
         if _navigate_owned_cdp_tab(args, url):
             return
-        if _owned_tab_cdp_url(args):
-            raise RuntimeError(
-                "Could not navigate owned background CDP tab; refusing agent-browser open fallback "
-                f"because it can steal focus. last_error={getattr(args, '_owned_tab_cdp_error', '')}"
-            )
-        _call_agent(args, cwd, ["open", url], timeout=180)
-        _capture_owned_tab_cdp_url(args, cwd)
-        return
+        raise RuntimeError(
+            "Could not navigate owned background CDP tab; refusing agent-browser open fallback "
+            f"because it can steal focus. last_error={getattr(args, '_owned_tab_cdp_error', '')}"
+        )
 
     if _open_background_cdp_tab(args, url):
         return
-    if args.cdp:
-        raise RuntimeError(
-            "Could not open a background CDP tab; refusing agent-browser tab fallback because it can steal focus. "
-            f"last_error={getattr(args, '_owned_tab_cdp_error', '')}"
-        )
-
-    label = getattr(args, "_tab_label", "")
-    if label:
-        with _cdp_command_lock(args):
-            _run(_agent_browser_base(args) + ["tab", "close", label], cwd=cwd, timeout=30)
-            try:
-                before_target_ids = {str(target.get("id") or "") for target in _cdp_page_targets(args)}
-            except Exception:
-                before_target_ids = set()
-            result = _run(_agent_browser_base(args) + ["tab", "new", "--label", label, url], cwd=cwd, timeout=180)
-            if result.returncode == 0:
-                args._opened_tab = True
-                _capture_owned_tab_cdp_url(args, cwd, before_target_ids)
-                return
-            _run(_agent_browser_base(args) + ["tab", label], cwd=cwd, timeout=30)
-            args._opened_tab = True
-            _capture_owned_tab_cdp_url(args, cwd)
-
-    _call_agent(args, cwd, ["open", url], timeout=180)
-    _capture_owned_tab_cdp_url(args, cwd)
+    raise RuntimeError(
+        "Could not open a background CDP tab; refusing agent-browser tab fallback because it can steal focus. "
+        f"last_error={getattr(args, '_owned_tab_cdp_error', '')}"
+    )
 
 
 def _open_conversation(args: argparse.Namespace, cwd: Path, url: str) -> str:
@@ -2522,27 +2496,15 @@ def _click_try_again(args: argparse.Namespace, cwd: Path) -> bool:
     if _owned_tab_cdp_url(args):
         script = r"""
 (() => {
-  const labels = ["Try again", "Retry", "重新生成", "再试一次", "重试"];
-  const visible = (el) => {
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  };
-  const controls = Array.from(document.querySelectorAll("button,[role='button'],a")).filter(visible);
-  const control = controls.find((candidate) => {
-    const text = [
-      candidate.getAttribute("aria-label"),
-      candidate.getAttribute("title"),
-      candidate.innerText,
-      candidate.textContent,
-    ].filter(Boolean).join(" ");
-    return labels.some((label) => text.includes(label));
-  });
+  const {retryControls} = (__CURRENT_RESPONSE_ERROR_STATE__)(__EXPECTED_PROMPT__);
+  const control = retryControls[0];
   if (!control) return "";
   control.click();
   return "clicked";
 })()
-"""
+""".replace("__CURRENT_RESPONSE_ERROR_STATE__", CURRENT_RESPONSE_ERROR_STATE_JS).replace(
+            "__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", "")))
+        )
         ok, result = _try_cdp_eval_js(args, script, timeout=60)
         if ok and result.strip() == "clicked":
             _wait_ms(args, cwd, 3000)
@@ -2999,13 +2961,15 @@ def _open_new_chat(args: argparse.Namespace, cwd: Path) -> None:
     if _owned_tab_cdp_url(args):
         script = r"""
 (() => {
-  const editor = document.querySelector("[contenteditable='true']");
-  if (editor) return "composer_ready";
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
+  const editor = Array.from(document.querySelectorAll("[contenteditable='true']")).find(visible);
+  const composer = editor?.closest('form');
+  const hasAttachments = Boolean(composer?.querySelector('[data-composer-attachments] img,button[aria-label^="Remove file"]'));
+  if (editor && !hasAttachments) return "composer_ready";
   const controls = Array.from(document.querySelectorAll("a,button,[role='button']")).filter(visible);
   const control = controls.find((candidate) => {
     const text = [
@@ -3016,12 +2980,14 @@ def _open_new_chat(args: argparse.Namespace, cwd: Path) -> None:
     ].filter(Boolean).join(" ");
     return /\bNew chat\b|新聊天|新建聊天/i.test(text);
   });
-  if (!control) return "";
+  if (!control) return hasAttachments ? "draft_not_cleared" : "";
   control.click();
   return "clicked";
 })()
 """
-        ok, _ = _try_cdp_eval_js(args, script, timeout=60)
+        ok, result = _try_cdp_eval_js(args, script, timeout=60)
+        if ok and result == "draft_not_cleared":
+            raise RecoverablePageError("New chat retained reference attachments and no New chat control cleared the draft")
         _wait_ms(args, cwd, 2000)
         return
     _safe_agent(args, cwd, ["find", "text", "New chat", "click", "--exact"], timeout=120)
@@ -3633,16 +3599,14 @@ JSON.stringify((() => {
   const loginControl = Array.from(document.querySelectorAll("a,button"))
     .filter(visible)
     .some((el) => /^(log in|sign in|continue with|登录|登入)/i.test((el.innerText || "").trim()));
-  const challengeFrames = Array.from(document.querySelectorAll("iframe"))
-    .filter((frame) => /captcha|challenge|turnstile|verify|cloudflare/i.test(`${frame.src} ${frame.title}`));
-  const challengeFrame = challengeFrames.length > 0;
-  const challengeTextMarker = [
-    "verify you are human", "verifying you are human", "confirm you are human",
-    "checking your browser before accessing", "performing security verification",
-    "complete the security check", "complete the challenge", "cloudflare ray id", "cloudflare_challenge",
-    "验证码", "安全验证", "人机验证", "验证您是真人"
-  ].find((marker) => text.includes(marker)) || "";
+  const {challengeFrame, challengeFrameCount, visibleChallengeFrameCount, challengeTextMarker} = __HUMAN_VERIFICATION_STATE__;
   const challengeText = Boolean(challengeTextMarker);
+  const {retryControlLabels, errorSurfaceTexts} = (__CURRENT_RESPONSE_ERROR_STATE__)(__EXPECTED_PROMPT__);
+  const responseErrorText = errorSurfaceTexts.find((value) => /cloudflare_challenge/i.test(value)) || '';
+  const responseError = responseErrorText ? {
+    error_type: 'chatgpt_response_service_error', matched_marker: 'cloudflare_challenge',
+    message: responseErrorText.slice(-800), retry_available: retryControlLabels.length > 0,
+  } : null;
   let humanReason = "";
   if (challengeFrame || challengeText) humanReason = "anti_automation_verification";
   else if (loginPath || loginControl) humanReason = "login_required";
@@ -3672,9 +3636,10 @@ JSON.stringify((() => {
   return {
     hasPrompt,
     humanReason,
+    responseError,
     humanEvidence: {
-      challengeFrameCount: challengeFrames.length,
-      visibleChallengeFrameCount: challengeFrames.filter(visible).length,
+      challengeFrameCount,
+      visibleChallengeFrameCount,
       challengeTextMarker, loginPath, loginControl,
     },
     crashReason,
@@ -3684,12 +3649,15 @@ JSON.stringify((() => {
     readyState: document.readyState,
   };
 })())
-""".strip()
+""".strip().replace("__HUMAN_VERIFICATION_STATE__", HUMAN_VERIFICATION_STATE_JS).replace(
+    "__CURRENT_RESPONSE_ERROR_STATE__", CURRENT_RESPONSE_ERROR_STATE_JS
+)
 
 
 def _page_access_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
     if _owned_tab_cdp_url(args):
-        return _eval_json(args, cwd, PAGE_ACCESS_STATE_JS, timeout=30)
+        script = PAGE_ACCESS_STATE_JS.replace("__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", ""))))
+        return _eval_json(args, cwd, script, timeout=30)
     snapshot = _snapshot(args, cwd)
     lowered = snapshot.lower()
     human_reason = ""
@@ -3700,7 +3668,6 @@ def _page_access_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
             "verifying you are human",
             "captcha",
             "turnstile",
-            "cloudflare_challenge",
             "security check",
             "人机验证",
             "安全验证",
@@ -3787,50 +3754,75 @@ def _wait_for_prompt_box(args: argparse.Namespace, cwd: Path, timeout_s: int = 6
     )
 
 
+def _activate_verification_browser(args: argparse.Namespace) -> dict[str, Any]:
+    """Retain the legacy result field while leaving activation to an explicit user request."""
+    try:
+        return show_browser_without_focus(configured_browser(), int(_cdp_launch_port(args)))
+    except (OSError, ProfileConfigError, subprocess.SubprocessError, ValueError) as error:
+        return {"status": "error", "error": str(error)}
+
+
+def _verification_page_healthy(state: dict[str, Any]) -> bool:
+    return bool(state.get("hasPrompt") and state.get("readyState", "complete") == "complete"
+                and not state.get("humanReason") and not state.get("crashReason"))
+
+
 def _activate_for_human_attention(args: argparse.Namespace, reason: str) -> None:
     args.keep_browser_open = True
     args._preserve_owned_tab = True
-    try:
-        activation = activate_browser(configured_browser(), int(_cdp_launch_port(args)))
-    except (OSError, ProfileConfigError, subprocess.SubprocessError, ValueError) as error:
-        activation = {"status": "error", "error": str(error)}
     job = getattr(args, "_health_job", None)
     if not job:
-        raise HumanAttentionRequired(reason, activation)
+        raise HumanAttentionRequired(reason, _activate_verification_browser(args))
     circuit = _queue_context(args)
-    if circuit:
-        with _queue_lock(args):
-            circuit.verification(args._job_id, time.time())
     label = getattr(args, "_active_request_label", "batch")
     _write_session_patch(job, {
-        "label": label, "status": "waiting_for_human", "reason": reason,
+        "label": label, "status": "checking_verification", "reason": reason,
         "owned_target_id": getattr(args, "_owned_tab_cdp_target_id", ""),
     })
     previous_phase = getattr(getattr(args, "_health", None), "phase", "page_loading")
-    _run_phase(args, "waiting_for_human", "complete verification in the preserved browser; no automatic clicks")
+    _run_phase(args, "checking_verification", "observe current page before requesting human attention")
     deadline = time.monotonic() + getattr(args, "human_wait_timeout", 600)
     healthy_checks = 0
-    while time.monotonic() < deadline:
+    activation: dict[str, Any] | None = None
+    state: dict[str, Any] = {}
+    while True:
         try:
             state = _page_access_state(args, Path.cwd())
         except (RuntimeError, OSError):
             state = {}
-        if state.get("crashReason") and not state.get("humanReason"):
+        if state.get("humanReason") and activation is None:
+            reason = str(state["humanReason"])
+            activation = _activate_verification_browser(args)
             if circuit:
                 with _queue_lock(args):
-                    circuit.verified(args._job_id)
+                    circuit.verification(args._job_id, time.time(), manifest=getattr(args, "manifest", None))
+            _write_session_patch(job, {
+                "label": label, "status": "waiting_for_human", "reason": reason,
+                "verification_observation": state,
+            })
+            _run_phase(args, "waiting_for_human", "complete verification in the preserved browser; no automatic clicks")
+        if state.get("crashReason") and not state.get("humanReason"):
             session = _read_json_if_exists(_session_path(job, label)) or {}
+            _write_session_patch(job, {"label": label, "status": "verification_page_error",
+                                       "reason": state["crashReason"], "verification_observation": state})
             if session.get("submission_committed") in (True, "unknown"):
+                _remember_submitted_url(args, Path.cwd())
                 raise OriginalConversationRequired("Browser verification ended in a page error after Send; locate the original request before retrying")
             args.keep_browser_open = getattr(args, "_original_keep_browser_open", False)
             args._preserve_owned_tab = False
             _write_session_patch(job, {"label": label, "status": "page_error", "reason": ""})
             raise RecoverablePageError("Browser verification ended in a reloadable page error")
-        if state.get("hasPrompt") and not state.get("humanReason") and not state.get("crashReason"):
+        if _verification_page_healthy(state):
             healthy_checks += 1
         else:
             healthy_checks = 0
         if healthy_checks >= 2:
+            # Account health and original-request identity are separate recovery decisions.
+            if circuit:
+                with _queue_lock(args):
+                    circuit.verified(args._job_id)
+            _write_session_patch(job, {"label": label, "status": "verification_resolved", "reason": "",
+                                       "verification_resolution": state})
             session = _read_json_if_exists(_session_path(job, label)) or {}
             if session.get("submission_committed") in (True, "unknown"):
                 original = _require_original_conversation(args, Path.cwd(), session)
@@ -3839,15 +3831,11 @@ def _activate_for_human_attention(args: argparse.Namespace, reason: str) -> None
                     if _conversation_id_from_url(restored) != _conversation_id_from_url(original):
                         raise OriginalConversationRequired("Verification cleared but the original request did not reopen")
                 patch = {"label": label, "conversation_url": original}
-                if not _temporary_conversation_id(_conversation_id_from_url(original)):
+                if _conversation_id_from_url(original) and not _temporary_conversation_id(_conversation_id_from_url(original)):
                     patch["canonical_conversation_url"] = original
                 _write_session_patch(job, patch)
-            if circuit:
-                with _queue_lock(args):
-                    circuit.verified(args._job_id)
             args.keep_browser_open = getattr(args, "_original_keep_browser_open", False)
             args._preserve_owned_tab = False
-            _write_session_patch(job, {"label": label, "status": "verification_resolved", "reason": ""})
             health = getattr(args, "_health", None)
             if health:
                 with health.lock:
@@ -3855,8 +3843,14 @@ def _activate_for_human_attention(args: argparse.Namespace, reason: str) -> None
                     health.failures = 0
             _run_phase(args, previous_phase, "human verification cleared in original target")
             return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(5)
-    raise HumanAttentionRequired(reason, activation)
+    if state.get("humanReason"):
+        raise HumanAttentionRequired(reason, activation or {"status": "not_activated"})
+    _write_session_patch(job, {"label": label, "status": "verification_recheck_incomplete",
+                               "reason": "page_health_unconfirmed", "verification_observation": state})
+    raise RecoverablePageError("Page health remained unconfirmed after verification; preserve the original request")
 
 
 def _run_phase(args: argparse.Namespace, phase: str, detail: str = "") -> None:
@@ -3876,7 +3870,9 @@ def _heartbeat_probe(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
         " pendingCount: document.querySelectorAll('[role=progressbar],[aria-busy=true]').length,"
         " userTurnCount: (() => {const {users} = __CONVERSATION_DOM__; return users.length;})(),"
         " hasPrompt,",
-    ).replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS)
+    ).replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS).replace(
+        "__EXPECTED_PROMPT__", json.dumps(str(getattr(args, "_submitted_prompt", "")))
+    )
     script = "JSON.stringify({...JSON.parse((" + script + ")), chatSurface: JSON.parse((" + CHAT_SURFACE_STATE_JS + "))})"
     deadline = time.monotonic() + 5
     with _CDPConnection.connect(target, timeout=5) as conn:
@@ -3965,17 +3961,33 @@ def _queue_probe(args: argparse.Namespace, cwd: Path) -> None:
 def run_health_check(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any]:
     """Resolve this job's verification pause without recovering or submitting its request."""
     _run_phase(args, "queue_health_check", "read-only account checks; no uploads or submission")
-    _open_new_chat(args, cwd)
+    _open_url(args, cwd, "https://chatgpt.com/")
     deadline = time.monotonic() + 30
     healthy_checks = 0
+    recoveries: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
         state = _page_access_state(args, cwd)
-        if state.get("humanReason") or state.get("crashReason"):
+        if state.get("humanReason"):
             args.keep_browser_open = True
             args._preserve_owned_tab = True
-            return {"status": "needs_ops", "reason": state.get("humanReason") or state["crashReason"],
-                    "submission_attempted": False}
-        if state.get("hasPrompt"):
+            return {"status": "needs_ops", "reason": state["humanReason"],
+                    "submission_attempted": False, "page_observation": state, "page_recoveries": recoveries}
+        if state.get("crashReason"):
+            healthy_checks = 0
+            if len(recoveries) >= _page_recovery_attempt_limit(args):
+                args.keep_browser_open = True
+                args._preserve_owned_tab = True
+                return {"status": "needs_ops", "reason": "health_check_page_recovery_exhausted",
+                        "submission_attempted": False, "page_observation": state, "page_recoveries": recoveries}
+            retry_clicked = _click_page_error_retry(args, cwd)
+            if not retry_clicked:
+                # This mode owns a separate health tab, never the retained image request.
+                _open_url(args, cwd, "https://chatgpt.com/")
+            recoveries.append({"attempt": len(recoveries) + 1, "reason": state["crashReason"],
+                               "method": "page_error_retry" if retry_clicked else "reload_health_tab"})
+            time.sleep(1)
+            continue
+        if _verification_page_healthy(state):
             healthy_checks += 1
             if healthy_checks == 2:
                 circuit = _queue_context(args)
@@ -3987,12 +3999,152 @@ def run_health_check(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -
                 saved = _read_json_if_exists(_session_path(job)) or {}
                 return {"status": "health_checked" if queue["state"] == "running" else "queue_paused",
                         "queue_health": queue, "submission_attempted": False,
-                        "submission_committed": saved.get("submission_committed", False)}
+                        "submission_committed": saved.get("submission_committed", False),
+                        "page_observation": state, "page_recoveries": recoveries}
             time.sleep(5)
         else:
             healthy_checks = 0
             time.sleep(1)
-    return {"status": "needs_ops", "reason": "page_health_check_timed_out", "submission_attempted": False}
+    return {"status": "needs_ops", "reason": "page_health_check_timed_out", "submission_attempted": False,
+            "page_recoveries": recoveries}
+
+
+@contextlib.contextmanager
+def _separate_recovery_tab(args: argparse.Namespace, cwd: Path):
+    probe = argparse.Namespace(**vars(args))
+    probe.mode = "health-check"
+    probe._health = None
+    probe._browser_session = None
+    probe._retain_generated_assets = False
+    probe.keep_browser_open = False
+    try:
+        _prepare_browser_lane(probe, cwd)
+        yield probe
+    finally:
+        if probe._browser_session is not None:
+            _cleanup_agent_browser(probe, cwd)
+
+
+def _automatic_health_check(args: argparse.Namespace, job: dict[str, Any], cwd: Path,
+                            *, owner: str | None = None) -> dict[str, Any]:
+    _run_phase(args, "automatic_health_check", "recover account health in a separate tab; preserve submitted requests")
+    with _separate_recovery_tab(args, cwd) as probe:
+        if owner:
+            probe._job_id = owner
+        for attempt in range(3):
+            result = run_health_check(probe, job, cwd)
+            result["automatic_check_rounds"] = attempt + 1
+            if result.get("reason") in ("anti_automation_verification", "login_required"):
+                raise HumanAttentionRequired(str(result["reason"]), _activate_verification_browser(probe))
+            if _verification_page_healthy(result.get("page_observation") or {}):
+                probe.keep_browser_open = False
+                return result
+            if attempt < 2:
+                _run_phase(args, "automatic_health_check", "temporary account failure; retrying after a bounded delay")
+                time.sleep((5, 15)[attempt])
+        return result
+
+
+def _recover_current_verification(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any] | None:
+    circuit = _queue_context(args)
+    queue = circuit.read() if circuit else {}
+    owners = queue.get("verification_owners", [queue["owner"]] if queue.get("owner") else [])
+    if queue.get("reason") != "human_verification" or args._job_id not in owners:
+        return None
+    try:
+        return _automatic_health_check(args, job, cwd)
+    except HumanAttentionRequired:
+        raise
+    except (RuntimeError, OSError, ProfileConfigError) as error:
+        return {"status": "needs_ops", "reason": "health_check_browser_unavailable", "detail": str(error)}
+
+
+def _admit_job_with_recovery(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> str:
+    """Wait out one cooldown, then check paused owners without submitting their jobs."""
+    deadline = time.monotonic() + min(300, max(0, getattr(args, "timeout", 1200)))
+    while True:
+        try:
+            return _queue_admit(args, allow_probe=True)
+        except QueuePausedError as error:
+            state = error.report.get("queue_health") or {}
+            if not state:
+                circuit = _queue_context(args)
+                state = circuit.read() if circuit else {}
+            delay = max(0, float(state.get("next_check_at") or 0) - time.time())
+            if delay and time.monotonic() + delay <= deadline:
+                _run_phase(args, "queue_cooldown", "waiting for the account recovery window; no submission")
+                time.sleep(min(20, delay))
+                continue
+            if delay or state.get("reason") != "human_verification":
+                raise
+            owners = state.get("verification_owners", [state["owner"]] if state.get("owner") else [])
+            for owner in owners:
+                owner_job = job if owner == args._job_id else None
+                manifest = (state.get("verification_manifests") or {}).get(owner)
+                if owner_job is None and manifest:
+                    owner_job = _read_json_if_exists(Path(manifest))
+                    if owner_job and hashlib.sha256(str(_session_path(owner_job).resolve()).encode()).hexdigest() != owner:
+                        owner_job = None
+                if owner_job is None:
+                    raise
+                health = _automatic_health_check(args, owner_job, cwd, owner=owner)
+                if not _verification_page_healthy(health.get("page_observation") or {}):
+                    raise
+            return _queue_admit(args, allow_probe=True)
+
+
+def _execute_with_automatic_recovery(args: argparse.Namespace, job: dict[str, Any], cwd: Path,
+                                     operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Own the one outer recovery cycle instead of sending retry commands to the caller."""
+    try:
+        result = operation()
+    except (SubmissionStateUnknownError, PageRecoveryExhaustedError, OriginalConversationRequired) as error:
+        failure = error
+        result = getattr(error, "report", {})
+    else:
+        failure = None
+        statuses = [result.get("status")]
+        statuses.extend((item.get("downloaded") or {}).get("status") for item in result.get("variants", []))
+        reports = [result, *((item.get("downloaded") or {}) for item in result.get("variants", []))]
+        missing_turn = any(report.get("error_type") == "chatgpt_submitted_turn_missing" for report in reports)
+        if not missing_turn and not any(status in ("download_failed", "timeout_no_images", "submission_state_unknown") for status in statuses):
+            return result
+    if args.mode == "health-check":
+        if failure:
+            raise failure
+        return result
+    session = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or {}
+    committed = session.get("submission_committed", result.get("submission_committed", "unknown"))
+    actions = [{"action": "automatic_recovery", "submission_committed": committed}]
+    args._automatic_recovery_actions = actions
+    health = _recover_current_verification(args, job, cwd)
+    if health:
+        actions.append({"action": "health_check", "status": health["status"]})
+    try:
+        if committed in (True, "unknown"):
+            if getattr(args, "_active_request_label", "batch") == "batch":
+                actions.append({"action": "collect_original_request"})
+                recovered = run_collect_current(args, job, cwd)
+            else:
+                # Each independent variant has its own guarded session; resume the normal loop.
+                actions.append({"action": "resume_independent_variants"})
+                recovered = operation()
+        elif committed is False:
+            if _owned_tab_cdp_url(args):
+                _replace_unsubmitted_tab(args, cwd, str(result.get("target_url") or "https://chatgpt.com/"))
+                actions.append({"action": "replace_unsubmitted_tab"})
+            actions.append({"action": "retry_unsubmitted_job"})
+            recovered = operation()
+        else:
+            if failure:
+                raise failure
+            return result
+    except (SubmissionStateUnknownError, PageRecoveryExhaustedError, OriginalConversationRequired) as error:
+        if hasattr(error, "report"):
+            error.report["automatic_recovery_actions"] = actions
+        raise
+    recovered["automatic_recovery_actions"] = actions
+    return recovered
 
 
 def _require_original_conversation(args: argparse.Namespace, cwd: Path, session: dict[str, Any]) -> str:
@@ -4000,6 +4152,12 @@ def _require_original_conversation(args: argparse.Namespace, cwd: Path, session:
     saved = str(session.get("canonical_conversation_url") or session.get("conversation_url") or "")
     saved_id = _conversation_id_from_url(saved)
     access = _page_access_state(args, cwd)
+    loading_deadline = time.monotonic() + 30
+    while access.get("readyState") == "loading" and not access.get("humanReason") and not access.get("crashReason"):
+        if time.monotonic() >= loading_deadline:
+            break
+        time.sleep(1)
+        access = _page_access_state(args, cwd)
     if access.get("humanReason"):
         _activate_for_human_attention(args, str(access["humanReason"]))
     if saved_id and not _temporary_conversation_id(saved_id):
@@ -4010,22 +4168,95 @@ def _require_original_conversation(args: argparse.Namespace, cwd: Path, session:
             and session.get("owned_target_id")
             and session["owned_target_id"] == getattr(args, "_owned_tab_cdp_target_id", None)):
         return current  # Observe this retained target in place; never reopen its temporary URL.
-    if current_id and not _temporary_conversation_id(current_id):
+    same_target = bool(session.get("owned_target_id") and
+                       session["owned_target_id"] == getattr(args, "_owned_tab_cdp_target_id", None))
+    if (current_id and not _temporary_conversation_id(current_id)) or same_target:
         _expand_submitted_prompt(args, cwd)
         observed = _eval_json(args, cwd, r"""
 JSON.stringify((() => {
  const {users} = __CONVERSATION_DOM__;
  const user = users.at(-1);
- return {text: user?.innerText || '', fullText: user?.textContent || ''};
+ return {text: user?.innerText || '', fullText: user?.textContent || '', userCount: users.length};
 })())
 """.replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS))
         expected = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
-        if expected and any(expected in " ".join(str(observed.get(key) or "").split()) for key in ("text", "fullText")):
+        if (expected and any(expected in " ".join(str(observed.get(key) or "").split()) for key in ("text", "fullText"))
+                and int(observed.get("userCount") or 0) > int(session.get("baseline_user_message_count") or 0)):
             return current
+    if same_target:
+        recovered = _recover_original_from_history(args, cwd, session)
+        if recovered:
+            return recovered
     raise OriginalConversationRequired(
         "The request may already be submitted, but its original canonical conversation cannot "
         "be verified. Keep the original job; locate its conversation before collecting."
     )
+
+
+def _conversation_history(args: argparse.Namespace) -> list[dict[str, Any]] | None:
+    target = _owned_tab_cdp_url(args)
+    if not target:
+        return None
+    try:
+        with _CDPConnection.connect(target, timeout=10) as connection:
+            return connection.call("Page.getNavigationHistory").get("entries", [])
+    except (RuntimeError, OSError, TimeoutError):
+        return None
+
+
+def _recover_original_from_history(args: argparse.Namespace, cwd: Path, session: dict[str, Any]) -> str | None:
+    """Inspect this tab's post-dispatch history and verify the prompt in an isolated tab."""
+    entries = _conversation_history(args) or []
+    baseline = session.get("baseline_navigation_entry_ids")
+    saved_id = _conversation_id_from_url(str(session.get("conversation_url") or ""))
+    anchor = next((index for index, entry in enumerate(entries)
+                   if saved_id and _conversation_id_from_url(str(entry.get("url") or "")) == saved_id), None)
+    if baseline is None and anchor is None:
+        return None
+    candidates = []
+    for index, entry in enumerate(entries):
+        url = str(entry.get("url") or "")
+        cid = _conversation_id_from_url(url)
+        if (url.startswith("https://chatgpt.com/c/") and cid and not _temporary_conversation_id(cid) and url not in candidates
+                and ((baseline is not None and entry.get("id") not in baseline)
+                     or (anchor is not None and index > anchor))):
+            candidates.append(url)
+    if not candidates or len(candidates) > 5:
+        return None
+    expected = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
+    if not expected:
+        return None
+    matches = []
+    with _separate_recovery_tab(args, cwd) as probe:
+        for url in candidates:
+            _open_url(probe, cwd, url)
+            for _ in range(10):
+                state = _page_access_state(probe, cwd)
+                if state.get("humanReason"):
+                    probe.keep_browser_open = True
+                    raise HumanAttentionRequired(str(state["humanReason"]), _activate_verification_browser(probe))
+                if _verification_page_healthy(state):
+                    if _conversation_id_from_url(_current_url(probe, cwd)) != _conversation_id_from_url(url):
+                        break
+                    observed = _eval_json(probe, cwd, r"""
+JSON.stringify((() => {
+ const {users} = __CONVERSATION_DOM__;
+ return {text: users.at(-1)?.textContent || '', userCount: users.length};
+})())
+""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS))
+                    if (expected in " ".join(str(observed.get("text") or "").split())
+                            and int(observed.get("userCount") or 0) > int(session.get("baseline_user_message_count") or 0)):
+                        matches.append(url)
+                    break
+                time.sleep(1)
+    if len(matches) != 1:
+        return None
+    job = getattr(args, "_health_job", None)
+    if job:
+        _write_session_patch(job, {"label": getattr(args, "_active_request_label", "batch"),
+            "conversation_url": matches[0], "canonical_conversation_url": matches[0],
+            "conversation_recovery": {"method": "original_target_navigation_history", "prompt_verified": True}})
+    return matches[0]
 
 
 def _page_recovery_attempt_limit(args: argparse.Namespace) -> int:
@@ -4043,7 +4274,8 @@ JSON.stringify((() => {
     const r = el.getBoundingClientRect(), s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
   };
-  const excluded = "[inert],#history,[aria-label='Chat history'],[data-sidebar-item]," +
+  const excluded = "nav,aside,[role='navigation'],[inert],#history,[aria-label='Chat history']," +
+    "[data-sidebar-item],[data-sidebar-chatgpt-conversation-key]," +
     "[data-message-author-role],[data-turn-key],[data-testid^='conversation-turn'],form";
   const error = /failed to load|something went wrong|network error|unable to load|try again later|we couldn.t load your account|browser check couldn.t finish|加载失败|网络错误/i;
   for (const el of document.querySelectorAll("button,[role='button']")) {
@@ -4088,16 +4320,31 @@ def _recover_chatgpt_page(
         state = {}
     if state.get("humanReason"):
         _activate_for_human_attention(args, str(state["humanReason"]))
+    if phase in ("pre_submit_prepare", "dry_upload_prepare"):
+        _require_unsubmitted_page(args)
     if phase.startswith("post_submit") and getattr(args, "_health_job", None):
         if getattr(args, "_retain_generated_assets", False):
             raise OriginalConversationRequired("Generated Blob assets remain in the original target; collect them without reloading")
         saved = _read_json_if_exists(_session_path(args._health_job, getattr(args, "_active_request_label", "batch"))) or {}
         target_url = _require_original_conversation(args, cwd, saved)
+        conversation_id = _conversation_id_from_url(target_url)
+        if not conversation_id or _temporary_conversation_id(conversation_id):
+            # The original turn is verified in place; reloading a temporary/home URL loses it.
+            _wait_for_prompt_box(args, cwd, timeout_s=30)
+            return {
+                "phase": phase, "attempt": attempt, "status": "page_recovered",
+                "reason": reason, "target_url": target_url, "method": "observe_original_target",
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
 
     previous_target_id = str(getattr(args, "_owned_tab_cdp_target_id", "") or "")
     recovery_method = "navigate_owned_tab"
     retry_clicked = False
-    if phase in ("pre_submit_prepare", "dry_upload_prepare"):
+    fresh_pre_submit = phase in ("pre_submit_prepare", "dry_upload_prepare") and attempt >= 2
+    if fresh_pre_submit:
+        _replace_unsubmitted_tab(args, cwd, target_url)
+        recovery_method = "replace_unsubmitted_tab"
+    elif phase in ("pre_submit_prepare", "dry_upload_prepare"):
         try:
             retry_clicked = _click_page_error_retry(args, cwd)
         except (RuntimeError, OSError, subprocess.SubprocessError):
@@ -4110,23 +4357,31 @@ def _recover_chatgpt_page(
                 return {
                     "phase": phase, "attempt": attempt, "status": "page_recovered",
                     "reason": reason, "target_url": target_url, "method": "page_error_retry",
+                    "previous_target_id": previous_target_id,
+                    "current_target_id": str(getattr(args, "_owned_tab_cdp_target_id", "") or ""),
                     "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
             except HumanAttentionRequired:
                 raise
             except (RuntimeError, OSError, subprocess.SubprocessError):
                 pass
-    if _owned_tab_cdp_url(args):
+    if fresh_pre_submit:
+        pass
+    elif _owned_tab_cdp_url(args):
         navigated = _navigate_owned_cdp_tab(args, target_url)
         if not navigated:
-            recovery_method = "replace_owned_tab"
-            _close_owned_tab(args, cwd)
-            _forget_owned_cdp_target(args)
-            if not _open_background_cdp_tab(args, target_url):
-                raise RecoverablePageError(
-                    "ChatGPT page target was unreadable and a replacement CDP tab could not be created: "
-                    f"{getattr(args, '_owned_tab_cdp_error', '')}"
-                )
+            if phase in ("pre_submit_prepare", "dry_upload_prepare"):
+                _replace_unsubmitted_tab(args, cwd, target_url)
+                recovery_method = "replace_unsubmitted_tab"
+            else:
+                recovery_method = "replace_owned_tab"
+                _close_owned_tab(args, cwd)
+                _forget_owned_cdp_target(args)
+                if not _open_background_cdp_tab(args, target_url):
+                    raise RecoverablePageError(
+                        "ChatGPT page target was unreadable and a replacement CDP tab could not be created: "
+                        f"{getattr(args, '_owned_tab_cdp_error', '')}"
+                    )
     else:
         recovery_method = "reopen_url"
         _open_url(args, cwd, target_url)
@@ -4145,6 +4400,30 @@ def _recover_chatgpt_page(
         "current_target_id": str(getattr(args, "_owned_tab_cdp_target_id", "") or ""),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def _require_unsubmitted_page(args: argparse.Namespace) -> None:
+    job = getattr(args, "_health_job", None)
+    label = getattr(args, "_active_request_label", "batch")
+    session = (_read_json_if_exists(_session_path(job, label)) or {}) if job else {}
+    if (session.get("submission_committed") in (True, "unknown") or session.get("dispatch_started")
+            or getattr(args, "_submit_dispatched", False)):
+        raise OriginalConversationRequired("Cannot replace the page after dispatch may have started")
+
+
+def _replace_unsubmitted_tab(args: argparse.Namespace, cwd: Path, target_url: str) -> None:
+    _require_unsubmitted_page(args)
+    job = getattr(args, "_health_job", None)
+    label = getattr(args, "_active_request_label", "batch")
+    if _temporary_conversation_id(_conversation_id_from_url(target_url)):
+        raise OriginalConversationRequired("Cannot reopen a temporary source conversation in a replacement page")
+    previous = argparse.Namespace(**vars(args))
+    if not _open_background_cdp_tab(args, target_url):
+        raise RecoverablePageError(f"Could not create a fresh background recovery tab: {getattr(args, '_owned_tab_cdp_error', '')}")
+    _close_owned_tab(previous, cwd)
+    if job:
+        _write_session_patch(job, {"label": label, "submission_committed": False,
+                                   "owned_target_id": getattr(args, "_owned_tab_cdp_target_id", "")})
 
 
 def _record_page_recovery(
@@ -4253,6 +4532,9 @@ def _run_with_page_recovery(
                 reason=reason,
             )
         except HumanAttentionRequired:
+            raise
+        except nonrecoverable_errors:
+            stop_for_human_gate()
             raise
         except recoverable_errors as recovery_error:
             last_error = recovery_error
@@ -4399,15 +4681,23 @@ JSON.stringify((() => {
   const cards = Array.from(composer.querySelectorAll(
     "[data-composer-attachments] [role='button'][aria-label]"
   )).filter((el) => visible(el) && el.querySelector("img"));
+  const pending = Array.from(composer.querySelectorAll("[role='progressbar'],[aria-busy='true']")).filter(visible);
   return {
     removeFileCount: removeLabels.length,
     removeFileLabels: removeLabels,
     uploadedImagePreviewCount: Math.max(uploadedImageLabels.length, cards.length),
     uploadedImagePreviewLabels: uploadedImageLabels,
     attachmentFilenames: cards.map((el) => el.getAttribute("aria-label")),
-    pendingAttachmentCount: Array.from(composer.querySelectorAll(
-      "[role='progressbar'],[aria-busy='true']"
-    )).filter(visible).length,
+    pendingAttachmentCount: pending.length,
+    pendingControls: pending.map((el) => ({
+      role: el.getAttribute('role'), label: el.getAttribute('aria-label'), busy: el.getAttribute('aria-busy'),
+      attachmentFilename: el.closest('[data-composer-attachments] [role="button"][aria-label]')?.getAttribute('aria-label') || null,
+    })),
+    attachmentDetails: cards.map((card) => ({
+      filename: card.getAttribute('aria-label'),
+      pending: card.matches('[aria-busy="true"]') || Boolean(card.querySelector('[role="progressbar"],[aria-busy="true"]')),
+      previewLoaded: Boolean(card.querySelector('img')?.complete && card.querySelector('img')?.naturalWidth),
+    })),
     blobImageUrls: Array.from(composer.querySelectorAll("img")).filter(visible)
       .map((el) => el.currentSrc || el.src)
       .filter((src) => src.startsWith("blob:https://chatgpt.com/")),
@@ -4445,6 +4735,8 @@ JSON.stringify((() => {
         "attachment_labels": attachment_labels,
         "attachment_filenames": attachment_filenames,
         "pending_attachment_count": pending_count,
+        "pending_controls": attachment_state.get("pendingControls") or [],
+        "attachment_details": attachment_state.get("attachmentDetails") or [],
         "uploaded_image_preview_count": int(attachment_state.get("uploadedImagePreviewCount") or 0),
         "filename_mentions": filename_mentions,
         "ready": attachment_count >= len(references) and pending_count == 0,
@@ -4471,7 +4763,9 @@ def _wait_for_reference_uploads_ready(
         if access_state.get("crashReason"):
             raise RecoverablePageError(
                 "ChatGPT page became unusable while waiting for reference uploads: "
-                f"{access_state['crashReason']}"
+                + json.dumps({key: access_state.get(key) for key in (
+                    "crashReason", "transientPageErrorText", "href", "readyState", "humanEvidence",
+                )}, ensure_ascii=False)
             )
         observation = _reference_upload_observation(args, cwd, references)
         if observation.get("failure"):
@@ -4491,7 +4785,7 @@ def _wait_for_reference_uploads_ready(
             )
         if elapsed >= timeout_s:
             raise RecoverablePageError(
-                "Reference attachments disappeared or never became verifiable before submission: "
+                "Reference uploads did not reach a verified completed state before timeout: "
                 + json.dumps(
                     {
                         key: value
@@ -4523,6 +4817,8 @@ def _upload_references_in_order(
         }
 
     original_references = list(references)
+    if _owned_tab_cdp_url(args) and _reference_upload_observation(args, cwd, []).get("attachment_count", 0):
+        raise RecoverablePageError("Composer retained reference attachments from an earlier preparation; rebuild before adding files")
     aliases = []
     job = getattr(args, "_health_job", None)
     if job:
@@ -5093,6 +5389,7 @@ def _submit_prompt(
         if trace_dir:
             atomic_json(trace_dir / "send_button_states.json", {"observations": states[-80:]})
         if _composer_state_has_submission_evidence(state, saw_prompt=saw_prompt, enter_presses=int(dispatched)):
+            _remember_submitted_url(args, cwd)
             return
         if not dispatched and state.get("readyToSubmit"):
             if job:
@@ -6400,6 +6697,13 @@ def _fully_downloaded(result: dict[str, Any]) -> bool:
     )
 
 
+def _requested_images_downloaded(report: dict[str, Any]) -> bool:
+    variants = report.get("variants")
+    if variants is not None:
+        return bool(variants) and all(_fully_downloaded(item.get("downloaded") or {}) for item in variants)
+    return _fully_downloaded(report)
+
+
 def _prune_success_trace_screenshots(
     job: dict[str, Any],
     report: dict[str, Any],
@@ -6777,6 +7081,7 @@ def _run_one_request(
     trace_dir = _trace_dir_for_label(job, label)
     args._active_request_label = label
     args._submitted_prompt = message
+    args._submit_dispatched = None
     trace_dir.mkdir(parents=True, exist_ok=True)
     is_followup = conversation_session_path is not None
     submit_mode = (
@@ -6988,12 +7293,15 @@ def _run_one_request(
     chat_surface = _ensure_chat_surface(args, cwd, recorded=chat_surface, timeout_s=2)
     _queue_admit(args)
     upload_observation["submit_started_at"] = time.time()
+    navigation_history = _conversation_history(args)
     _write_session_patch(job, {
         "label": label, "status": "submitting", "submission_committed": "unknown",
         "owned_target_id": getattr(args, "_owned_tab_cdp_target_id", ""),
         "prompt_sha256": hashlib.sha256(message.encode()).hexdigest(),
         "baseline_user_message_count": baseline_message_counts["user_message_count"],
         "baseline_asset_urls": sorted(baseline),
+        "baseline_navigation_entry_ids": (
+            [entry["id"] for entry in navigation_history if "id" in entry] if navigation_history is not None else None),
         **reference_audit_fields(job),
         "reference_upload": {key: value for key, value in upload_observation.items() if key != "page_text"},
         "chat_surface": chat_surface, "image_mode": image_mode,
@@ -7008,6 +7316,8 @@ def _run_one_request(
     except HumanAttentionRequired:
         raise
     except (TimeoutError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        if getattr(args, "_submit_dispatched", False):
+            _remember_submitted_url(args, cwd)
         submission_report = {
             "status": "submission_state_unknown",
             "error_type": "chatgpt_submission_state_unknown",
@@ -7059,11 +7369,10 @@ def _run_one_request(
         _wait_ms(args, cwd, 3000)
         conversation_url = _wait_for_conversation_url(args, cwd)
         if not _conversation_id_from_url(conversation_url):
-            raise RecoverablePageError(
-                "The prompt was submitted, but its ChatGPT conversation URL did not become available."
-            )
+            session = _read_json_if_exists(_session_path(job, label)) or {}
+            conversation_url = _require_original_conversation(args, cwd, session)
         binding = {"label": label, "conversation_url": conversation_url}
-        if not _temporary_conversation_id(_conversation_id_from_url(conversation_url)):
+        if _conversation_id_from_url(conversation_url) and not _temporary_conversation_id(_conversation_id_from_url(conversation_url)):
             binding["canonical_conversation_url"] = conversation_url
         _write_session_patch(job, binding)
         _screenshot(args, cwd, trace_dir / "04_after_submit.png")
@@ -7701,8 +8010,8 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "On macOS, bootstrap headed Chrome hidden with `open -g -j`, then reveal it "
-            "behind the active app without stealing OS focus."
+            "On macOS, start headed Chrome behind the active app with `open -g`, "
+            "keeping it visible without taking OS focus."
         ),
     )
     parser.add_argument(
@@ -7834,6 +8143,7 @@ def main() -> int:
 
     cwd = Path.cwd()
     manifest_path = Path(args.manifest).resolve()
+    args.manifest = str(manifest_path)
     job = json.loads(manifest_path.read_text(encoding="utf-8"))
     if job.get("reuse_conversation_references") and args.mode not in {"conversation-followup", "collect-current", "health-check"}:
         raise ValueError(
@@ -7865,21 +8175,44 @@ def main() -> int:
     queue_action = "allow"
     try:
         if not resume_only:
-            queue_action = _queue_admit(args, allow_probe=True)
+            queue_action = _admit_job_with_recovery(args, job, cwd)
         _prepare_browser_lane(args, cwd)
         _validate_profile(args)
         if queue_action == "probe":
             _queue_probe(args, cwd)
     except OriginalConversationRequired as error:
-        args._health.close("needs_ops")
-        print(json.dumps({"status": "needs_ops", "error_type": "original_conversation_required",
+        args.keep_browser_open = True
+        report = {"status": "needs_ops", "error_type": "original_conversation_required",
                           "reason": str(error), "submission_committed": saved.get("submission_committed", "unknown"),
-                          "retryable": False}, ensure_ascii=False, indent=2))
+                          "retryable": False,
+                          "recommended_next_action": "locate_original_conversation_then_collect"}
+        try:
+            health = _recover_current_verification(args, job, cwd)
+            if health:
+                report["automatic_health_check"] = health
+        except HumanAttentionRequired as attention:
+            report.update(error_type="human_attention_required", reason=attention.reason,
+                          verification_must_be_completed_by_human=True, browser_activation=attention.activation)
+        _write_session_patch(job, report)
+        args._health.close("needs_ops")
+        if getattr(args, "_browser_session", None) is not None:
+            _cleanup_agent_browser(args, cwd)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return 2
     except QueuePausedError as error:
         _cleanup_agent_browser(args, cwd)
         args._health.close("queue_paused")
         print(json.dumps(error.report, ensure_ascii=False, indent=2))
+        return 2
+    except HumanAttentionRequired as error:
+        args.keep_browser_open = True
+        if getattr(args, "_browser_session", None) is not None:
+            _cleanup_agent_browser(args, cwd)
+        args._health.close("needs_ops")
+        print(json.dumps({"status": "needs_ops", "error_type": "human_attention_required", "reason": error.reason,
+                          "submission_committed": saved.get("submission_committed", False),
+                          "verification_must_be_completed_by_human": True,
+                          "browser_activation": error.activation}, ensure_ascii=False, indent=2))
         return 2
     except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError, RuntimeError) as error:
         if getattr(args, "_browser_session", None) is not None:
@@ -7899,19 +8232,23 @@ def main() -> int:
         return 2
     exit_code = 0
     try:
-        if resume_human and args.mode != "health-check":
-            _activate_for_human_attention(args, str(saved["reason"]))
+        def execute_mode() -> dict[str, Any]:
+            if resume_human and args.mode != "health-check":
+                _activate_for_human_attention(args, str(saved["reason"]))
+            if args.mode == "health-check":
+                return run_health_check(args, job, cwd)
+            if args.mode == "single-batch-submit":
+                return run_submit(args, job, cwd)
+            if args.mode == "conversation-followup":
+                return run_conversation_followup(args, job, cwd)
+            if args.mode == "collect-current":
+                return run_collect_current(args, job, cwd)
+            return run_dry_upload(args, job, cwd)
+        report = _execute_with_automatic_recovery(args, job, cwd, execute_mode)
         if args.mode == "health-check":
-            report = run_health_check(args, job, cwd)
             exit_code = 0 if report["status"] == "health_checked" else 2
-        elif args.mode == "single-batch-submit":
-            report = run_submit(args, job, cwd)
-        elif args.mode == "conversation-followup":
-            report = run_conversation_followup(args, job, cwd)
-        elif args.mode == "collect-current":
-            report = run_collect_current(args, job, cwd)
-        else:
-            report = run_dry_upload(args, job, cwd)
+        elif args.mode != "dry-upload":
+            exit_code = 0 if _requested_images_downloaded(report) else 2
     except QueuePausedError as error:
         report = error.report
         exit_code = 2
@@ -7923,6 +8260,7 @@ def main() -> int:
                   "submission_committed": current_session.get("submission_committed", "unknown"),
                   "retryable": False, "reason": str(error),
                   "recommended_next_action": "locate_original_conversation_then_collect"}
+        _write_session_patch(job, {"label": getattr(args, "_active_request_label", "batch"), **report})
         exit_code = 2
     except PageRecoveryExhaustedError as error:
         report = error.report
@@ -7988,12 +8326,31 @@ def main() -> int:
         }
         exit_code = 2
     finally:
+        if report is not None and getattr(args, "_automatic_recovery_actions", None):
+            report["automatic_recovery_actions"] = args._automatic_recovery_actions
+            report["automatic_recovery_exhausted"] = exit_code != 0
+            if exit_code:
+                report.update(should_collect_current_first=False, retryable=False)
+                if report.get("recommended_next_action") == "collect_current_first":
+                    report["recommended_next_action"] = "inspect_original_conversation_before_manual_recovery"
+            if exit_code and report.get("recommended_next_action") == "rerun_same_job":
+                report.update(recommended_next_action="repair_environment_then_resume_unsubmitted_job", retryable=False)
+            _write_session_patch(job, {
+                "label": getattr(args, "_active_request_label", "batch"),
+                **{key: report[key] for key in ("automatic_recovery_actions", "automatic_recovery_exhausted",
+                                               "recommended_next_action", "retryable", "should_collect_current_first") if key in report},
+            })
         terminal_status = (report or {}).get("status")
         if not terminal_status and (report or {}).get("variants"):
             statuses = [v.get("downloaded", {}).get("status") or "stopped" for v in report["variants"]]
             terminal_status = next((status for status in statuses if status != "downloaded"), "downloaded")
         if terminal_status == "downloaded":
             args._retain_generated_assets = False
+        session = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or {}
+        cid = _conversation_id_from_url(str(session.get("canonical_conversation_url") or session.get("conversation_url") or ""))
+        if (args.mode != "health-check" and session.get("submission_committed") in (True, "unknown")
+                and terminal_status != "downloaded" and (not cid or _temporary_conversation_id(cid))):
+            args.keep_browser_open = True
         args._health.close(terminal_status or "stopped")
         _cleanup_agent_browser(args, cwd)
     if report is not None:

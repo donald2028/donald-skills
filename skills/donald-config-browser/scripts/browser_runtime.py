@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
@@ -115,6 +116,16 @@ def _safe_session(value: str, run_id: str) -> str:
     prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-") or "donald-browser"
     suffix = hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:8]
     return f"{prefix[:29]}-{suffix}"[:40]
+
+
+@contextlib.contextmanager
+def _preserve_foreground(port: int) -> Iterator[None]:
+    previous_pid = frontmost_process_id()
+    try:
+        yield
+    finally:
+        if previous_pid:
+            restore_frontmost_process_if_browser_active(previous_pid, port)
 
 
 @contextlib.contextmanager
@@ -237,13 +248,14 @@ class BrowserSession:
         self._transport_executable = ""
 
     def _navigate(self, target_id: str, url: str) -> None:
-        call_background_page(
-            self.port,
-            target_id,
-            "Page.navigate",
-            {"url": url},
-            timeout=self.timeout,
-        )
+        with _preserve_foreground(self.port):
+            call_background_page(
+                self.port,
+                target_id,
+                "Page.navigate",
+                {"url": url},
+                timeout=self.timeout,
+            )
         wait_for_background_page_url(
             self.port,
             target_id,
@@ -290,18 +302,17 @@ class BrowserSession:
         executable = ensure_agent_browser(auto_install=True)["executable"]
         before = _target_ids(self.port)
         self._transport_executable = executable
-        result = run_agent_browser(
-            [
-                executable,
-                "--session",
-                self.transport_session,
-                "--cdp",
-                str(self.port),
-                "get",
-                "url",
-            ],
-            timeout=60,
-        )
+        with _preserve_foreground(self.port):
+            result = run_agent_browser(
+                [
+                    executable,
+                    "--session",
+                    self.transport_session,
+                    "connect",
+                    str(self.port),
+                ],
+                timeout=60,
+            )
         poll_count = 20 if own_new_blank_targets else 1
         for poll_index in range(poll_count):
             after_targets = {
@@ -328,24 +339,26 @@ class BrowserSession:
             return
         # Closing a CDP-attached CLI session disconnects its daemon, not Chrome.
         # Omit --cdp so cleanup cannot reconnect to a browser that is exiting.
-        result = run_agent_browser(
-            [self._transport_executable, "--session", self.transport_session, "close"],
-            timeout=10,
-        )
+        with _preserve_foreground(self.port):
+            result = run_agent_browser(
+                [self._transport_executable, "--session", self.transport_session, "close"],
+                timeout=10,
+            )
         if result.returncode != 0:
             raise ProfileConfigError(f"Could not release agent-browser session: {result.stdout.strip()}")
         self._transport_executable = ""
 
     def _open_locked(self) -> None:
         state = _read_state(self.state_path)
-        startup = start_cdp_browser(
-            self.config,
-            self.port,
-            self.timeout,
-            allow_launch=self.allow_launch,
-            require_initialized_profile=self.require_initialized_profile,
-        )
-        self.launched = bool(startup.get("launched"))
+        with _preserve_foreground(self.port):
+            startup = start_cdp_browser(
+                self.config,
+                self.port,
+                self.timeout,
+                allow_launch=self.allow_launch,
+                require_initialized_profile=self.require_initialized_profile,
+            )
+        self.launched = self.launched or bool(startup.get("launched"))
         self.browser_pid = startup.get("pid")
         previous_runtime_pid = state.get("browser_pid")
         if previous_runtime_pid and self.browser_pid and int(previous_runtime_pid) != int(self.browser_pid):
@@ -355,18 +368,14 @@ class BrowserSession:
             state["launched_by_runtime"] = True
             state["browser_pid"] = self.browser_pid
 
+        # A /json/version response alone does not prove that targets can still be listed.
+        _target_ids(self.port)
         self.target_id = self._claim_target(state)
         self.owned_target_ids.add(self.target_id)
         target = cdp_target(self.port, self.target_id) or {}
         self.target_url = str(target.get("webSocketDebuggerUrl") or "")
         if self.verify_agent_browser:
             self._verify_attach(not state["active_runs"])
-        if startup.get("launched") and sys.platform == "darwin":
-            # Normal macOS startup opens a blank tab before the business target.
-            self.owned_target_ids.update(
-                str(target["id"]) for target in list_cdp_targets(self.port)
-                if target.get("type") == "page" and target.get("url") == "about:blank" and target.get("id")
-            )
         show_browser_without_focus(
             self.config,
             self.port,
@@ -390,7 +399,17 @@ class BrowserSession:
         self.previous_frontmost_pid = frontmost_process_id()
         with _file_lock(self.lock_path, self.lock_timeout):
             try:
-                self._open_locked()
+                for attempt in range(3):
+                    try:
+                        self._open_locked()
+                        break
+                    except ProfileConfigError as error:
+                        # CDP can disappear between the version probe and target listing.
+                        # Retry only before claiming a target; startup rechecks the same binding.
+                        if (self.owned_target_ids or attempt == 2
+                                or not isinstance(error.__cause__, (ConnectionError, urllib.error.URLError))):
+                            raise
+                        time.sleep(0.5)
             except Exception:
                 self._cleanup_failed_open()
                 raise
@@ -433,7 +452,7 @@ class BrowserSession:
 
     def preserve_for_human(self) -> dict[str, Any]:
         self.keep_open_for_human = True
-        return self.activate()
+        return show_browser_without_focus(self.config, self.port)
 
     def retain_target_for_human(self, target_id: str) -> None:
         target = cdp_target(self.port, target_id)

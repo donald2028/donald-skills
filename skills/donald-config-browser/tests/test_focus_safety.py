@@ -27,14 +27,33 @@ def _config() -> dict[str, object]:
 
 
 class FocusSafetyTests(unittest.TestCase):
-    def test_macos_launches_visible_in_background_instead_of_hidden_then_revealed(self) -> None:
+    def test_focus_guard_keeps_the_other_app_the_user_switched_to(self) -> None:
+        with (
+            mock.patch.object(profile_config.sys, 'platform', 'darwin'),
+            mock.patch.object(profile_config, 'frontmost_process_id', side_effect=[111, 333]),
+            mock.patch.object(profile_config, '_listening_process_id', return_value='222'),
+            mock.patch.object(profile_config, 'restore_frontmost_process') as restore,
+            mock.patch.object(profile_config.time, 'sleep'),
+        ):
+            with profile_config.preserve_foreground(9244):
+                pass
+        restore.assert_not_called()
+
+    def test_background_rpc_rejects_explicit_tab_activation(self) -> None:
+        for method in ('Page.bringToFront', 'Target.activateTarget'):
+            with self.subTest(method=method), mock.patch.object(profile_config, 'connect_cdp_target') as connect:
+                with self.assertRaisesRegex(profile_config.ProfileConfigError, 'foreground'):
+                    profile_config.call_background_page(9244, 'owned', method, {})
+                connect.assert_not_called()
+
+    def test_macos_launch_defers_its_window_to_background_target_creation(self) -> None:
         with mock.patch.object(profile_config.sys, "platform", "darwin"):
             command = profile_config.chrome_launch_command(_config(), 9244)
 
         self.assertEqual(command[:2], ["open", "-g"])
         self.assertNotIn("-j", command)
-        self.assertNotIn("--no-startup-window", command)
-        self.assertEqual(command[-1], "about:blank")
+        self.assertIn("--no-startup-window", command)
+        self.assertNotIn("about:blank", command)
 
     def test_launch_disables_the_unused_multi_gigabyte_on_device_model(self) -> None:
         command = profile_config.chrome_launch_command(_config(), 9244)

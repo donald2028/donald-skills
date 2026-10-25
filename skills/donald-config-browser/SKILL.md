@@ -15,7 +15,7 @@ relevant Donald business skill instead.
 
 Prepare each browser skill independently once, then reuse its saved binding. A successful setup
 means the skill has its own Profile binding and a real headed Chrome launched from that Profile's
-persistent `user-data-dir` has passed an `agent-browser --cdp` control check. The binding remains
+persistent `user-data-dir` has passed an agent-browser CDP connection check. The binding remains
 valid for later tasks until the user changes it or a runner reports a configuration failure.
 
 Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
@@ -23,12 +23,16 @@ substituting it for `python3` in the command examples below.
 
 Donald browser workflows invoke this skill only to create, inspect, change, reset, or repair the
 caller's binding, including after a runner reports missing, stale, or incomplete configuration.
-When invoked by a caller, use its skill name as `--scope`. Do not duplicate the caller's business
-workflow or import files from its skill directory.
+When invoked by a caller, use its declared configuration scope as `--scope` (normally its skill
+name). `donald-chatgpt` explicitly reuses the `donald-chatgpt-imagegen` binding, so setup and repair
+for either ChatGPT workflow use `--scope donald-chatgpt-imagegen`; do not create a second text-chat
+binding. Do not duplicate the caller's business workflow or import files from its skill directory.
 
 Keep bindings separate from browser state:
 
 - Each skill has an independent config and can select or reselect its own Chrome Profile.
+  The two ChatGPT workflows deliberately share the image-generation config; changing that binding
+  changes both, while their task ownership and conversation records remain separate.
 - The CDP `user-data-dir` belongs to the Chrome Profile, not the skill. Skills selecting the same
   Profile reuse the same directory, CDP port, cookies, and login state.
 - Profiles that differ use different runtime directories. Do not make a second copy merely because
@@ -69,7 +73,13 @@ hand-edit the vendored copies; change these canonical files and run `npm run bui
 Every normal business runner uses `BrowserSession` for the same lifecycle:
 
 1. Read the caller skill's saved binding and start or attach only to its verified Chrome/CDP lane.
-2. Create or reclaim one target owned by that run, then prove `agent-browser --cdp` can attach.
+2. Create or reclaim one target owned by that run, then prove `agent-browser connect <port>` can attach.
+   On macOS, startup, attachment, and navigation capture the active app immediately before the
+   operation and restore it only if the configured Chrome took focus. Sampling only after
+   attachment cannot recover the app that was active before it.
+   A caller with a strict background-only contract may set `verify_agent_browser=False` and use
+   this runtime's direct target-scoped CDP helpers instead; `donald-chatgpt` does this because CLI
+   tab interaction can activate Chrome. It must not fall back to foreground CLI interaction.
 3. Let the business code operate only on the owned target ID; never select an arbitrary matching tab.
 4. In `finally`, release this run's agent-browser transport session, including on attach failure or
    operator handoff; a CDP transport close leaves Chrome itself open. Close the owned target and
@@ -85,6 +95,9 @@ Every normal business runner uses `BrowserSession` for the same lifecycle:
 Only a recognized `needs_ops` state retains the owned target and browser for the operator. A later
 run reclaims that retained target instead of opening another page. Successful completion then
 performs the ordinary cleanup.
+Every browser caller retains human-verification targets in the background and notifies the user.
+`preserve_for_human()` preserves the task without activating Chrome. Bringing Chrome to the
+foreground requires an explicit user request through `activate`.
 
 ## Invocation Policy
 
@@ -157,7 +170,7 @@ caller already supplied its exact scope. Existing browser workflows use these sc
 
 A future Donald browser skill may use its own lowercase kebab-case `donald-*` skill name as the
 scope without changing this script. The first saved binding makes it appear in `targets`. Use the
-exact caller skill name so its runner reads the same config file.
+caller's declared configuration scope so its runner reads the same config file.
 
 List usable Profiles without changing config only for those cases:
 
@@ -196,7 +209,8 @@ overwritten, including its shared CDP port. Only the selected skill's config bin
 
 To repair an existing Windows snapshot binding without deleting it, pass `--fresh` to `set`. It
 creates or reuses a separate empty dedicated directory; bind every skill that should share it with
-the same flag, then sign in once after the preflight activates Chrome.
+the same flag, then sign in once in the background Chrome window created by preflight. Bring it
+forward only when the user requests that interaction.
 
 To migrate a known dedicated CDP directory, pass `--user-data-dir <path>`. It must contain the
 selected Profile directory and must not be Chrome's normal User Data root. If another target is
@@ -220,23 +234,24 @@ The preflight follows this exact sequence:
 
 1. Start real Chrome with `--remote-debugging-address=127.0.0.1`,
    `--remote-debugging-port`, `--user-data-dir`, and `--profile-directory`, with
-   `OptimizationGuideOnDeviceModel` disabled. On macOS, open `about:blank` through normal window
-   startup; `--no-startup-window` can leave native Quit and shutdown pending even after CDP creates
-   a window. Other platforms use `--no-startup-window`. Do not add `--headless`
+   `OptimizationGuideOnDeviceModel` disabled and `--no-startup-window`. Let CDP create the headed
+   background window; an automatic startup window can activate Chrome even with `open -g`.
+   Do not add `--headless`
    unless the user explicitly requests it.
 2. Wait for `http://127.0.0.1:<port>/json/version`.
 3. Create the page through browser-level CDP with `Target.createTarget({background: true})`.
-4. Run `agent-browser --session <name> --cdp <port> get url` to prove agent-browser control.
+4. Run `agent-browser --session <name> connect <port>` to prove agent-browser control. Reuse that
+   session without `--cdp` for any CLI read; never select a tab as part of attachment.
 5. If preflight started Chrome, close that exact CDP browser and wait for its port to stop listening
    before returning `ready`. The downstream runner must start and own its own Chrome lifecycle.
 
-On macOS, launch the headed Chrome instance with `open -g -n -a "Google Chrome"`: `-g` keeps it
-behind the active app without making Chrome frontmost. This remains headed Chrome, not headless
+On macOS, launch the headed Chrome instance with `open -g -n -a "Google Chrome"` and
+`--no-startup-window`, then create its background target. This remains headed Chrome, not headless
 Chrome. Do not add `-j`: a fully hidden macOS app does not reliably service CDP screenshots. Never
-activate Chrome or take keyboard focus. If login, MFA,
-captcha, risk confirmation,
-or another anti-automation challenge requires a human, return `needs_ops`, run the controlled
-activation command below, and keep that Chrome open:
+activate Chrome or take keyboard focus during normal browser work. If login, MFA, captcha, risk
+confirmation, or another anti-automation challenge requires a human, return `needs_ops` and keep
+that Chrome open. Request attention while leaving Chrome in the background; use the controlled
+activation command below only after the user explicitly asks to bring it forward:
 
 ```bash
 python3 "$SKILL_DIR/scripts/profile_config.py" --scope <skill-name> activate

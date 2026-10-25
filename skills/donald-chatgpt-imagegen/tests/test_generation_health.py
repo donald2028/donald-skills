@@ -96,17 +96,18 @@ class GenerationHealthTests(unittest.TestCase):
 
         return result, health_check.call_count, clock.now
 
-    def test_visible_cloudflare_error_has_priority_over_retry_without_frame(self) -> None:
+    def test_visible_cloudflare_response_error_enters_generation_recovery(self) -> None:
         with mock.patch.object(runner, "_eval_json", return_value={
             "href": "https://chatgpt.com/c/test", "hasComposer": True,
             "latestTurnText": "cloudflare_challenge Retry", "retryControlLabels": ["Retry"],
+            "errorSurfaceTexts": ["cloudflare_challenge Retry"],
             "challengeFrame": False, "humanReason": "",
         }):
             health = runner._generation_page_health(argparse.Namespace(), Path.cwd(),
                                                      "https://chatgpt.com/c/test", "")
-        self.assertEqual(health["status"], "needs_ops")
-        self.assertEqual(health["human_reason"], "anti_automation_verification")
-        self.assertNotIn("generation_error", health)
+        self.assertEqual(health["status"], "generation_error")
+        self.assertEqual(health["human_reason"], "")
+        self.assertEqual(health['generation_error']['matched_marker'], 'cloudflare_challenge')
 
     def test_recognizes_visible_something_went_wrong_error(self) -> None:
         error = runner._generation_error_from_text(

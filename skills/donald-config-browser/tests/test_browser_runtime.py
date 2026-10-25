@@ -29,6 +29,84 @@ def _config(root: Path) -> dict[str, object]:
 
 
 class BrowserRuntimeTests(unittest.TestCase):
+    def test_human_handoff_preserves_background_visibility_without_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = runtime.BrowserSession(session='handoff', config=_config(Path(temporary)))
+            with (
+                mock.patch.object(runtime, 'show_browser_without_focus', return_value={'status': 'visible_in_background'}) as show,
+                mock.patch.object(session, 'activate') as activate,
+            ):
+                result = session.preserve_for_human()
+            self.assertTrue(session.keep_open_for_human)
+            self.assertEqual(result['status'], 'visible_in_background')
+            show.assert_called_once_with(session.config, session.port)
+            activate.assert_not_called()
+
+    def test_attach_focus_guard_uses_app_active_before_the_cli_call_even_on_failure(self) -> None:
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as temporary:
+                session = runtime.BrowserSession(session='focus', config=_config(Path(temporary)))
+                with (
+                    mock.patch.object(runtime, 'frontmost_process_id', return_value=111),
+                    mock.patch.object(runtime, 'ensure_agent_browser', return_value={'executable': 'agent-browser'}),
+                    mock.patch.object(runtime, '_target_ids', return_value=set()),
+                    mock.patch.object(runtime, 'list_cdp_targets', return_value=[]),
+                    mock.patch.object(runtime, 'run_agent_browser', return_value=mock.Mock(returncode=returncode, stdout='failed')) as attach,
+                    mock.patch.object(runtime, 'restore_frontmost_process_if_browser_active') as restore,
+                ):
+                    if returncode:
+                        with self.assertRaises(runtime.ProfileConfigError):
+                            session._verify_attach(False)
+                    else:
+                        session._verify_attach(False)
+                restore.assert_called_once_with(111, 9333)
+                self.assertEqual(attach.call_args.args[0][-2:], ['connect', '9333'])
+                self.assertNotIn('--cdp', attach.call_args.args[0])
+
+    def test_open_retries_disappearing_cdp_before_claiming_a_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
+            session = runtime.BrowserSession(session="startup", config=_config(Path(temporary)))
+            failure = runtime.ProfileConfigError("Could not list Chrome CDP targets")
+            failure.__cause__ = ConnectionRefusedError("connection refused")
+            with (
+                mock.patch.object(runtime, "start_cdp_browser", side_effect=[
+                    {"launched": True, "pid": 1234}, {"launched": False, "pid": 1234},
+                ]) as startup,
+                mock.patch.object(runtime, "_target_ids", side_effect=[failure, set()]),
+                mock.patch.object(session, "_claim_target", return_value="owned-target") as claim,
+                mock.patch.object(runtime, "cdp_target", return_value={"webSocketDebuggerUrl": "ws://owned"}),
+                mock.patch.object(session, "_verify_attach"),
+                mock.patch.object(runtime, "show_browser_without_focus"),
+                mock.patch.object(session, "_cleanup_failed_open") as cleanup,
+                mock.patch.object(runtime.time, "sleep"),
+            ):
+                session.open()
+            self.assertTrue(session.opened)
+            self.assertTrue(session.launched)
+            self.assertEqual(startup.call_count, 2)
+            self.assertEqual(startup.call_args_list[0], startup.call_args_list[1])
+            claim.assert_called_once()
+            cleanup.assert_not_called()
+            session.opened = False
+            runtime.atexit.unregister(session._atexit_callback)
+
+    def test_startup_retry_is_bounded_and_does_not_retry_owner_mismatch(self) -> None:
+        for failure, expected_attempts in [(runtime.ProfileConfigError("wrong account"), 1),
+                                           (runtime.ProfileConfigError("target list unavailable"), 3)]:
+            if expected_attempts == 3:
+                failure.__cause__ = ConnectionRefusedError("connection refused")
+            with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
+                session = runtime.BrowserSession(session="startup", config=_config(Path(temporary)))
+                with (
+                    mock.patch.object(session, "_open_locked", side_effect=failure) as startup,
+                    mock.patch.object(session, "_cleanup_failed_open") as cleanup,
+                    mock.patch.object(runtime.time, "sleep"),
+                    self.assertRaises(runtime.ProfileConfigError),
+                ):
+                    session.open()
+                self.assertEqual(startup.call_count, expected_attempts)
+                cleanup.assert_called_once()
+
     def setUp(self) -> None:
         frontmost = mock.patch.object(runtime, "frontmost_process_id", return_value=None)
         frontmost.start()
@@ -55,6 +133,7 @@ class BrowserRuntimeTests(unittest.TestCase):
                 return_value={"launched": True, "pid": 1234},
             ),
             mock.patch.object(session, "_claim_target", return_value="owned-target"),
+            mock.patch.object(runtime, "_target_ids", return_value=set()),
             mock.patch.object(runtime, "list_cdp_targets", return_value=[]),
             mock.patch.object(session, "_verify_attach") as attach,
             mock.patch.object(
@@ -68,7 +147,7 @@ class BrowserRuntimeTests(unittest.TestCase):
             session.open()
         return session
 
-    def test_macos_owns_startup_blank_only_when_it_launched_chrome(self) -> None:
+    def test_launch_does_not_claim_blank_targets_it_did_not_create(self) -> None:
         for launched in (True, False):
             with self.subTest(launched=launched), tempfile.TemporaryDirectory() as temporary:
                 session = runtime.BrowserSession(session="startup", config=_config(Path(temporary)))
@@ -88,8 +167,7 @@ class BrowserRuntimeTests(unittest.TestCase):
                     ]),
                 ):
                     session._open_locked()
-                expected = {"owned-target", "startup-blank"} if launched else {"owned-target"}
-                self.assertEqual(session.owned_target_ids, expected)
+                self.assertEqual(session.owned_target_ids, {"owned-target"})
 
     def test_closes_only_owned_targets_and_the_browser_it_launched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
@@ -228,13 +306,14 @@ class BrowserRuntimeTests(unittest.TestCase):
                 config=_config(Path(temporary)),
             )
             with (
-                mock.patch.object(runtime, "frontmost_process_id", side_effect=[111, 222]),
+                mock.patch.object(runtime, "frontmost_process_id", side_effect=[111, 111, 222]),
                 mock.patch.object(
                     runtime,
                     "start_cdp_browser",
                     return_value={"launched": True, "pid": 1234},
                 ),
                 mock.patch.object(runtime, "create_background_page", return_value="failed-target"),
+                mock.patch.object(runtime, "_target_ids", return_value=set()),
                 mock.patch.object(
                     runtime,
                     "wait_for_background_page_url",
@@ -256,7 +335,7 @@ class BrowserRuntimeTests(unittest.TestCase):
                     session.open()
 
         close_target.assert_called_once_with(9333, "failed-target")
-        guard_focus.assert_called_once_with(222, 9333)
+        self.assertEqual(guard_focus.call_args_list, [mock.call(111, 9333), mock.call(222, 9333)])
         close_browser.assert_called_once()
 
     def test_attach_tracks_blank_target_that_appears_after_command_returns(self) -> None:

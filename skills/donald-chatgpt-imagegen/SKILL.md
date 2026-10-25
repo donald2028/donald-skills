@@ -42,6 +42,8 @@ substituting it for `python3` in the command examples below.
   separate configuration preflight before it. Startup, target ownership, cross-skill active-run
   tracking, and teardown use the shared Donald `BrowserSession`; ChatGPT-specific code begins only
   after that runtime returns an owned target ID.
+  Keep diagnosis and repair on this runner's agent-browser/CDP route and saved browser binding so
+  observations refer to the same environment and preserve the original request's ownership.
 
 - Log in to ChatGPT in the selected visible Profile.
 - Passing `--user-data-dir` or `CHATGPT_WEB_USER_DATA_DIR` selects an explicit CDP data directory;
@@ -55,13 +57,14 @@ login, MFA, captcha, policy refusals, or account restrictions.
 On macOS, keep the automatically launched headed Chrome visible behind the active app during
 normal automation; this is not headless mode and does not make Chrome frontmost. The shared
 runtime launches the window in the background without hiding it because macOS stops servicing CDP
-screenshots for a fully hidden application. Do not activate it during normal
-generation. When the runner detects login or anti-automation verification, it activates only the
-configured CDP Chrome and observes the preserved task page for up to 10 minutes. Tell the user to
-complete verification manually. The runner never clicks verification controls or refreshes an
+screenshots for a fully hidden application. Keep Chrome behind the user's active app during
+startup, attachment, navigation, recovery, and human handoff. When the runner detects login or
+anti-automation verification, it preserves the configured CDP Chrome in the background and observes
+the task page for up to 10 minutes. Tell the user what requires attention; bring Chrome forward
+only when the user explicitly requests it. The runner never clicks verification controls or refreshes an
 active challenge. Two healthy checks five seconds apart resume the original task. A timeout returns
-`needs_ops` and leaves the browser open; rerun the same job to recover its original request. Policy refusals are reported without
-activating Chrome because they are not an interactive login or verification state. After an
+`needs_ops` and leaves the browser open in the background; rerun the same job to recover its original
+request. After an
 ordinary terminal result, the runner closes its tab and exits the Donald Chrome when no other run
 is active. Cleanup releases the run's agent-browser connection and confirms the macOS Chrome process
 has exited, with bounded termination of only the verified Donald process if normal shutdown stalls.
@@ -158,37 +161,36 @@ owns the first recovery tier: it retries confirmed page failures three times by 
 ChatGPT generation failures twice by default (`--max-failure-retries`), and authenticated image
 downloads four times. Keep those bounded defaults enabled for normal runs.
 
-If the runner still returns a failure, perform at most one caller-level recovery cycle before
-reporting it:
+The runner also owns one outer recovery cycle. A confirmed unsubmitted failure retries the same
+job; an unknown or committed submission switches to collection of the original request. It never
+replays Send for either state. It waits through one queue cooldown (up to five minutes), then
+checks the paused task's account health in a separate tab. Recorded verification owners let later
+jobs perform that check without executing the owners' prompts. Transient health-page errors get
+bounded retries and backoff; a visible human gate stops those automatic clicks and reloads.
 
-- for `retryable=true` with `recommended_next_action=rerun_same_job` and
-  `submission_committed=false`, rerun the same command once;
-- for `collect_current_first` or `collect_current_or_inspect_conversation`, run `collect-current`
-  against the saved session before considering any new submission;
-- for an unknown submit state, inspect the saved session and conversation first; use
-  `collect-current` when a conversation URL exists, and never infer that a missing URL proves the
-  prompt was not submitted;
-- for `timeout_no_images`, preserve the current conversation and try `collect-current` once rather
-  than opening a new request immediately;
-- for `submit_new_request` after a terminal generation error and exhausted in-page Retry attempts,
-  report the failure. Prepare a separate replacement job only when the user authorizes another
-  submission; never reuse a committed manifest to bypass recovery;
-- for `inspect_session_and_rerun_if_not_submitted`, inspect `chatgpt_session.json`: rerun only when
-  it proves the prompt was not submitted; otherwise collect the current conversation first;
-- for `queue_paused`, stop dispatching new jobs to this browser environment; do not create new
-  manifests to bypass the pause. After the five-minute cooldown, one runner may perform a health
-  check without submitting a prompt; a successful check releases the queue;
-- for `original_conversation_required` or an unknown submission, locate the original conversation
-  before collecting. A missing/temporary URL is not proof that Send did not happen;
-- for `policy_refused`, `retryable=false`, unresolved verification, or account restrictions, report
-  or request the required user action. Do not loop unchanged submissions.
+If the original target redirects to the home page, the runner waits for page loading to settle and
+examines that target's navigation history. It may recover a canonical URL only from post-dispatch
+history and after verifying the submitted prompt and user-turn baseline in a separate tab. It
+preserves ambiguous or unavailable requests for inspection rather than sending again.
 
-Never loop caller-level retries indefinitely and never resubmit when commit state is unknown. If
-the one recovery cycle fails or no safe automatic action exists, promptly return the structured
-`status`, `error_type`, completed internal and caller retry actions, conversation URL, retained
-artifact paths, and `recommended_next_action` to the calling agent. A failed command must end in
-either a downloaded result or an explicit handoff, not a silent wait or abandonment. See
-`references/output-contract.md` for the full status-to-action mapping.
+Read `automatic_recovery_actions` and `automatic_recovery_exhausted` in the final JSON. When the
+runner has consumed its recovery cycle, report the remaining obstacle and retained evidence; do
+not add another caller retry loop. A real login/verification gate requires the user to complete it.
+Submit, follow-up, and collection exit successfully only after all requested images are downloaded.
+An empty collection is an unresolved request, and exhausted automatic collection requires inspecting
+the original conversation before a manual recovery decision.
+For an unrecoverable original conversation, preserve the job and its commit state. For an explicit
+terminal generation failure, prepare a separate replacement job only after the user authorizes a
+new submission. `policy_refused` and account restrictions remain terminal for that request.
+
+The normal invocation handles these transitions without separate recovery commands from the
+caller. `collect-current` and `health-check` remain available for explicit recovery and diagnostics.
+Rendered message counts may shrink while ChatGPT updates or virtualizes a conversation. The runner
+uses the submitted prompt to identify its turn and images; a count mismatch alone must not cause
+resubmission. Only errors and Retry controls belonging to that request count as generation errors.
+A failed command must end in either a downloaded result or an explicit handoff with `status`,
+`error_type`, completed recovery actions, conversation URL, retained artifact paths, and
+`recommended_next_action`. See `references/output-contract.md` for the result contract.
 
 For every fresh submission, the runner first selects and verifies the top-level `Chat` surface,
 never `Work`, using ChatGPT's `Composer mode` button group (`aria-pressed`) or the older
@@ -204,7 +206,13 @@ error is active; reload and replay the complete preparation transaction within t
 page-recovery budget. A temporarily disabled control or an unverified selection after a click
 also gets a bounded wait (about 15 seconds) before entering page recovery. Recovery first tries a
 visible page-loading-error Retry/Try again control, excluding conversation messages and history;
-if that does not restore the page, it reloads the target URL. Persistent failures return
+if that does not restore the page, it reloads the target URL. Repeated preparation failures and the
+outer unsubmitted retry create a fresh background target on the same browser binding, after
+checking that dispatch has not started. The new target must exist before closing the old owned
+target. Preparation clears retained draft attachments and rejects any remaining old attachments
+before uploading again. Pending attachment controls, their filenames when identifiable, and card
+readiness stay in the upload evidence; previews alone do not establish completed uploads.
+Persistent failures return
 recovery-exhausted evidence to the caller. Never silently submit through Work or fall back to ordinary chat. Reference
 uploads likewise require visible composer-attachment evidence before submission.
 
@@ -299,6 +307,13 @@ uses the visible Retry control up to `--max-failure-retries` times (two by defau
 those in-page retries fail does it return structured `generation_failed` with
 `recommended_next_action=submit_new_request`; it must not wait until the image timeout or surface a
 raw traceback.
+A `cloudflare_challenge` response error belongs to this recovery path when it follows the submitted
+user turn, including an error bar outside the assistant wrapper. The runner records
+`chatgpt_response_service_error` and retries only that request's visible Retry control within the
+same budget. A visible verification frame or page-level human-verification instruction takes
+priority and enters the manual-verification path. Error codes alone, old messages, prompt text,
+and hidden verification frames do not establish an active human gate. The independent heartbeat
+records the response error and available Retry so automatic recovery remains observable.
 If the expected conversation URL remains open but the submitted user turn is missing for two
 consecutive heartbeats, the runner reports `generation_failed` with
 `error_type=chatgpt_submitted_turn_missing`. This covers blank, unrecoverable conversation shells

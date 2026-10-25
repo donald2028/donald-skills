@@ -4,7 +4,7 @@ Donald 常用 Agent Skills 的统一仓库，面向 Claude Code、Codex、Cursor
 
 当前版本包含 Agent 项目基础设施、仓库维护、安全 Git 提交、统一存储约定、GitHub 仓库调研、
 按工具独立绑定且按 Profile 共享登录状态的浏览器配置，以及微信公众号采集、X 内容采集和
-ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发现并安装
+ChatGPT Web 普通对话、文件交流和外部出图等通用 skill。下面的安装入口可以直接发现并安装
 `skills/<name>/SKILL.md` 中的内容。
 
 当前工具 skills：
@@ -17,13 +17,14 @@ ChatGPT Web 外部出图等通用 skill。下面的安装入口可以直接发�
 - `donald-config-browser`：供 Donald 浏览器业务 skill 内部管理各自的 Chrome Profile 绑定；相同 Profile 复用同一份 CDP User Data 和 Cookie。
 - `donald-collect-wechat`：采集公众号文章列表和公开正文。
 - `donald-collect-x`：采集 X 账号帖子、thread、Article 和媒体。
+- `donald-chatgpt`：与 ChatGPT Web 进行文本对话、上传和下载文件、读取回复及多轮追问；直接复用出图 skill 的浏览器绑定和登录状态。
 - `donald-chatgpt-imagegen`：通过可恢复的 ChatGPT Web 浏览器任务外部出图。
 - `donald-visual-skill-matrix`：仅在用户明确要求比较多个 Skill 时，在独立新上下文中逐个运行视觉设计 Skill，并把图片或网页截图整理成不评分的并排画廊。
 
-GitHub、采集和出图结果默认保存在系统“文档”目录的 `Donald Skills/Data/` 下，不写入源码
+GitHub、采集、ChatGPT 对话和出图结果默认保存在系统“文档”目录的 `Donald Skills/Data/` 下，不写入源码
 仓库或当前工作目录。用户也可以把共享输出根目录一次写入统一配置根下的 `storage.json`；
-GitHub、X、微信和 ChatGPT 出图分别在其下使用 `github-research/`、`x/`、`wechat/` 和
-`chatgpt-images/`。单次命令仍可用 `--output-root` 指定精确工具目录，优先级最高。
+GitHub、X、微信、ChatGPT 对话和出图分别在其下使用 `github-research/`、`x/`、`wechat/`、
+`chatgpt/` 和 `chatgpt-images/`。单次命令仍可用 `--output-root` 指定精确工具目录，优先级最高。
 `DONALD_SKILLS_OUTPUT_ROOT` 和 `DONALD_GITHUB_RESEARCH_ROOT` 仅保留为进程级兼容覆盖，
 正常持久配置不需要修改 `.zshrc`。
 
@@ -161,14 +162,25 @@ runner 返回配置类故障时，才再次调用 `donald-config-browser`。
 
 浏览器配置与浏览器运行时是两层能力。`donald-config-browser/scripts/profile_config.py` 和
 `browser_runtime.py` 是唯一 canonical 实现；`npm run build` 将它们逐字 vendoring 到 ChatGPT
-出图、X 采集和微信采集 skill，使选择性安装仍然自包含，同时避免手工复制产生行为漂移。业务
+对话、出图、X 采集和微信采集 skill，使选择性安装仍然自包含，同时避免手工复制产生行为漂移。业务
 runner 通过统一的 `BrowserSession` 启动 Chrome、认领本次 target、验证 agent-browser attach，
 并在 `finally` 中释放。普通结果关闭本次 target，最后一个活跃任务只关闭由 Donald 启动的
-Chrome；只有 `needs_ops` 明确保留页面并激活浏览器。attach 过程中新增的空白 target 也属于
+Chrome；所有浏览器 skill 在 `needs_ops` 时保留后台页面并提示用户，只有用户明确要求时才激活
+浏览器。启动、新建标签页、导航、恢复和清理都保护用户当前应用的焦点；attach 过程中新增的空白 target 也属于
 本次任务并会被清理，预先存在的用户页面不会被批量扫描或关闭。
 
-GitHub、X、微信和 ChatGPT 出图 skill 各自携带自包含的 `scripts/output_paths.py`，不依赖额外
-配置 skill，因此可以独立安装。四个 workflow 使用相同的“单次覆盖 → 兼容环境变量 → 持久配置
+`donald-chatgpt` 的配置 scope 固定复用 `donald-chatgpt-imagegen`，因此沿用同一个 Chrome、
+CDP 端口和登录状态，无需安装出图 skill 或另选 Profile。文本任务使用独立的生命周期 ownership
+scope 和任务标签页，不接管出图任务。它的 JSON-lines 会话工具在收发期间保持运行，保存对话
+链接、回复和待确认的发送状态；退出后可通过 `--resume <session.json>` 接续。
+正常收发直接操作已认领 target 的后台 CDP，不执行可能激活 Chrome 的 CLI 标签页操作；
+不使用系统剪贴板，并记录操作前后的前台应用 PID，发现 Chrome 意外前置时恢复用户的工作应用并停止该操作。
+遇到 `cloudflare_challenge` 等错误时，先区分回复服务错误与实际验证页面，自动完成后台等待、
+有归属的失败回复重试和原会话核对；确认丢失的纯文本追问最多恢复一次。尝试预算随会话保存，
+只有恢复耗尽或剩余步骤确实需要用户处理时才返回 `needs_ops`，不会仅凭错误名称立即转人工。
+
+GitHub、X、微信、ChatGPT 对话和出图 skill 各自携带自包含的 `scripts/output_paths.py`，不依赖额外
+配置 skill，因此可以独立安装。这些 workflow 使用相同的“单次覆盖 → 兼容环境变量 → 持久配置
 → Documents 默认值”规则，并把持久配置写入同一个系统原生 config 根。
 
 这个依赖写在 workflow 指令中，不依赖某个 Agent 专用的工具名；Claude Code、Codex 和其他兼容

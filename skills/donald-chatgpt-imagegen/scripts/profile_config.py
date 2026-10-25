@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -1012,25 +1013,34 @@ class _CDPConnection:
         return collected
 
 
-def create_background_page(port: int, url: str = "about:blank") -> str:
-    previous_frontmost_pid = frontmost_process_id()
-    version = _cdp_version(port)
-    websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
-    if not websocket_url:
-        raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
+@contextlib.contextmanager
+def preserve_foreground(port: int):
+    """Keep the app active before this operation unless the user switches to another app."""
+    previous_pid = frontmost_process_id()
     try:
-        with _CDPConnection.connect(websocket_url, timeout=10) as connection:
-            result = connection.call(
-                "Target.createTarget", {"url": url, "background": True}
-            )
-    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
-        raise ProfileConfigError(f"Could not create a background CDP page: {error}") from error
-    target_id = str(result.get("targetId") or "")
-    if not target_id:
-        raise ProfileConfigError("Chrome did not return a target id for the background page")
-    if previous_frontmost_pid:
-        restore_frontmost_process_if_browser_active(previous_frontmost_pid, port)
-    return target_id
+        yield
+    finally:
+        if previous_pid:
+            restore_frontmost_process_if_browser_active(previous_pid, port)
+
+
+def create_background_page(port: int, url: str = "about:blank") -> str:
+    with preserve_foreground(port):
+        version = _cdp_version(port)
+        websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
+        if not websocket_url:
+            raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
+        try:
+            with _CDPConnection.connect(websocket_url, timeout=10) as connection:
+                result = connection.call(
+                    "Target.createTarget", {"url": url, "background": True}
+                )
+        except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+            raise ProfileConfigError(f"Could not create a background CDP page: {error}") from error
+        target_id = str(result.get("targetId") or "")
+        if not target_id:
+            raise ProfileConfigError("Chrome did not return a target id for the background page")
+        return target_id
 
 
 def list_cdp_targets(port: int) -> list[dict[str, Any]]:
@@ -1069,30 +1079,34 @@ def call_background_page(
     params: dict[str, Any] | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
+    if method in {"Page.bringToFront", "Target.activateTarget"}:
+        raise ProfileConfigError("Background page operations cannot request foreground activation; use explicit activate")
+    focus_guard = preserve_foreground(port) if method in {"Page.navigate", "Page.reload"} else contextlib.nullcontext()
     try:
-        with connect_cdp_target(port, target_id, timeout=timeout) as connection:
+        with focus_guard, connect_cdp_target(port, target_id, timeout=timeout) as connection:
             return connection.call(method, params)
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
         raise ProfileConfigError(f"Could not call {method} on CDP page {target_id}: {error}") from error
 
 
 def close_background_page(port: int, target_id: str) -> None:
-    version = _cdp_version(port)
-    websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
-    if not websocket_url:
-        raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
-    try:
-        with _CDPConnection.connect(websocket_url, timeout=10) as connection:
-            result = connection.call("Target.closeTarget", {"targetId": target_id})
-    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
-        raise ProfileConfigError(f"Could not close background CDP page {target_id}: {error}") from error
-    if result.get("success") is False:
-        raise ProfileConfigError(f"Chrome refused to close background CDP page {target_id}")
-    for _ in range(20):
-        if cdp_target(port, target_id) is None:
-            return
-        time.sleep(0.1)
-    raise ProfileConfigError(f"Background CDP page {target_id} remained open after close")
+    with preserve_foreground(port):
+        version = _cdp_version(port)
+        websocket_url = str((version or {}).get("webSocketDebuggerUrl") or "")
+        if not websocket_url:
+            raise ProfileConfigError(f"Chrome CDP browser websocket is unavailable on port {port}")
+        try:
+            with _CDPConnection.connect(websocket_url, timeout=10) as connection:
+                result = connection.call("Target.closeTarget", {"targetId": target_id})
+        except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+            raise ProfileConfigError(f"Could not close background CDP page {target_id}: {error}") from error
+        if result.get("success") is False:
+            raise ProfileConfigError(f"Chrome refused to close background CDP page {target_id}")
+        for _ in range(20):
+            if cdp_target(port, target_id) is None:
+                return
+            time.sleep(0.1)
+        raise ProfileConfigError(f"Background CDP page {target_id} remained open after close")
 
 
 def wait_for_background_page_url(
@@ -1127,7 +1141,7 @@ def wait_for_background_page_url(
     )
 
 
-def chrome_launch_command(config: dict[str, Any], port: int, url: str = "about:blank") -> list[str]:
+def chrome_launch_command(config: dict[str, Any], port: int) -> list[str]:
     chrome = config["chrome"]
     profile = config["profile"]
     launch_args = [
@@ -1138,21 +1152,18 @@ def chrome_launch_command(config: dict[str, Any], port: int, url: str = "about:b
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-features=OptimizationGuideOnDeviceModel",
+        "--no-startup-window",
     ]
-    # On macOS, suppressing startup leaves native Quit pending even after CDP
-    # creates a window. Let Chrome complete normal window startup instead.
-    if sys.platform == "darwin":
-        launch_args.append(url)
-    else:
-        launch_args.append("--no-startup-window")
+    # A startup window can activate Chrome even with open -g. The runner creates
+    # its headed window through Target.createTarget(background=True) instead.
     executable = str(chrome["executable"])
     if sys.platform == "darwin" and executable == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome":
         return ["open", "-g", "-n", "-a", "Google Chrome", "--args", *launch_args]
     return [executable, *launch_args]
 
 
-def _launch_chrome(config: dict[str, Any], port: int, url: str) -> list[str]:
-    command = chrome_launch_command(config, port, url)
+def _launch_chrome(config: dict[str, Any], port: int) -> list[str]:
+    command = chrome_launch_command(config, port)
     kwargs: dict[str, Any] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
@@ -1253,7 +1264,7 @@ def start_cdp_browser(
     if not allow_launch:
         raise ProfileConfigError(f"Chrome CDP is unavailable on port {port}")
 
-    launch_command = _launch_chrome(config, port, "about:blank")
+    launch_command = _launch_chrome(config, port)
     deadline = time.time() + timeout
     while time.time() < deadline:
         version = _cdp_version(port)
@@ -1437,37 +1448,6 @@ def frontmost_process_id() -> int | None:
     return int(result.stdout.strip())
 
 
-def hide_browser_without_focus(config: dict[str, Any], port: int, restore_pid: int | None = None) -> dict[str, Any]:
-    if sys.platform != "darwin":
-        return {"status": "platform_default", "cdp_port": port}
-    if not _cdp_version(port):
-        raise ProfileConfigError(f"Chrome CDP is unavailable on port {port}")
-    _verify_existing_cdp_owner(config, port)
-    pid = int(_listening_process_id(port) or 0)
-    if not pid:
-        raise ProfileConfigError(f"Could not identify the Chrome process on CDP port {port}")
-    previous_pid = restore_pid or frontmost_process_id()
-    restore_line = ""
-    if previous_pid and previous_pid != pid:
-        restore_line = f"set frontmost of first application process whose unix id is {previous_pid} to true\n"
-    script = (
-        'tell application "System Events"\n'
-        f"set visible of first application process whose unix id is {pid} to false\n"
-        + restore_line
-        + "end tell"
-    )
-    result = _run(["osascript", "-e", script], timeout=20)
-    if result.returncode != 0:
-        raise ProfileConfigError(f"Could not keep Chrome hidden in headed mode: {result.stdout.strip()}")
-    return {
-        "status": "hidden_headed",
-        "cdp_port": port,
-        "pid": pid,
-        "frontmost": False,
-        "restored_frontmost_pid": previous_pid,
-    }
-
-
 def restore_frontmost_process(pid: int) -> dict[str, Any]:
     if sys.platform != "darwin":
         return {"status": "platform_default", "pid": pid}
@@ -1511,10 +1491,10 @@ def preflight_browser(
 ) -> dict[str, Any]:
     if not 1 <= port <= 65535:
         raise ProfileConfigError("CDP port must be between 1 and 65535")
-    previous_frontmost_pid = frontmost_process_id()
     ensure_agent_browser(auto_install=True)
     user_data_dir = Path(config["chrome"]["cdp_user_data_dir"])
-    startup = start_cdp_browser(config, port, timeout)
+    with preserve_foreground(port):
+        startup = start_cdp_browser(config, port, timeout)
     version = startup["browser"]
     launch_command = startup["launch_command"]
     background_target_id = ""
@@ -1524,7 +1504,7 @@ def preflight_browser(
         background_url = wait_for_background_page_url(
             port, background_target_id, url, timeout=min(timeout, 15)
         )
-        background_visibility = hide_browser_without_focus(config, port, previous_frontmost_pid)
+        background_visibility = show_browser_without_focus(config, port)
         session_prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", session).strip("-") or "donald-cdp"
         transport_session = f"{session_prefix[:30]}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         agent_browser = ensure_agent_browser(auto_install=True)["executable"]
@@ -1532,30 +1512,35 @@ def preflight_browser(
             agent_browser,
             "--session",
             transport_session,
-            "--cdp",
+            "connect",
             str(port),
-            "get",
-            "url",
         ]
-        attach = run_agent_browser(attach_command, timeout=60)
+        with preserve_foreground(port):
+            attach = run_agent_browser(attach_command, timeout=60)
         if attach.returncode != 0:
             raise ProfileConfigError(
                 "Chrome CDP is reachable, but agent-browser could not attach: "
                 f"{attach.stdout.strip()}"
             )
-        agent_browser_url = attach.stdout.strip()
+        url_command = [agent_browser, "--session", transport_session, "get", "url"]
+        with preserve_foreground(port):
+            url_result = run_agent_browser(url_command, timeout=30)
+        if url_result.returncode != 0:
+            raise ProfileConfigError(f"agent-browser could not read the attached page URL: {url_result.stdout.strip()}")
+        agent_browser_url = url_result.stdout.strip()
         if background_url != "about:blank" and agent_browser_url == "about:blank":
             deadline = time.time() + 5
             while time.time() < deadline and agent_browser_url == "about:blank":
                 time.sleep(0.2)
-                attach = run_agent_browser(attach_command, timeout=30)
+                with preserve_foreground(port):
+                    attach = run_agent_browser(url_command, timeout=30)
                 if attach.returncode != 0:
                     raise ProfileConfigError(
                         "agent-browser attached but could not reread the background page URL: "
                         f"{attach.stdout.strip()}"
                     )
                 agent_browser_url = attach.stdout.strip()
-        background_visibility = hide_browser_without_focus(config, port, previous_frontmost_pid)
+        background_visibility = show_browser_without_focus(config, port)
         result = {
             "status": "ready",
             "profile": config["profile"],
@@ -1571,6 +1556,7 @@ def preflight_browser(
             "background_visibility": background_visibility,
             "launch_command": launch_command,
             "attach_command": attach_command,
+            "url_command": url_command,
         }
     except Exception as error:
         if launch_command:

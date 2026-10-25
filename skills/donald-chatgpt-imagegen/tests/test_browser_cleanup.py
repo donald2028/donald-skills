@@ -16,7 +16,28 @@ import agent_browser_runner as runner  # noqa: E402
 
 
 class BrowserCleanupTests(unittest.TestCase):
-    def test_macos_legacy_launch_completes_normal_window_startup(self) -> None:
+    def test_runner_and_legacy_helpers_cannot_fall_back_to_cli_tab_interaction(self) -> None:
+        for args in (argparse.Namespace(_browser_session=object()), argparse.Namespace()):
+            with self.subTest(registered=hasattr(args, '_browser_session')):
+                with mock.patch.object(runner, 'ensure_agent_browser') as install:
+                    with self.assertRaisesRegex(RuntimeError, 'Foreground'):
+                        runner._agent_browser_base(args)
+                install.assert_not_called()
+
+    def test_verification_handoff_keeps_chrome_in_the_background(self) -> None:
+        config = {'scope': 'donald-chatgpt-imagegen'}
+        with (
+            mock.patch.object(runner, 'configured_browser', return_value=config),
+            mock.patch.object(runner, '_cdp_launch_port', return_value=9333),
+            mock.patch.object(runner, 'show_browser_without_focus', return_value={'status': 'visible_in_background'}) as show,
+            mock.patch.object(runner, 'activate_browser', create=True) as activate,
+        ):
+            result = runner._activate_verification_browser(argparse.Namespace())
+        self.assertEqual(result['status'], 'visible_in_background')
+        show.assert_called_once_with(config, 9333)
+        activate.assert_not_called()
+
+    def test_macos_legacy_launch_defers_its_window_to_background_target_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = argparse.Namespace(
                 cdp_port=9333, cdp=None, user_data_dir=temporary, profile="Default",
@@ -27,13 +48,13 @@ class BrowserCleanupTests(unittest.TestCase):
             ) as launch:
                 runner._launch_chrome_for_cdp(args, Path(temporary))
         command = launch.call_args.args[0]
-        self.assertNotIn("--no-startup-window", command)
+        self.assertIn("--no-startup-window", command)
         self.assertNotIn("-j", command)
-        self.assertEqual(command[-1], "about:blank")
+        self.assertNotIn("about:blank", command)
 
     def test_replacement_claims_only_the_target_created_by_this_run(self) -> None:
         session = argparse.Namespace(owned_target_ids=set())
-        args = argparse.Namespace(_browser_session=session)
+        args = argparse.Namespace(_browser_session=session, cdp='9333')
         targets = [
             {"id": "other-blank", "url": "about:blank", "webSocketDebuggerUrl": "ws://other-blank"},
             {"id": "other-new", "url": "https://chatgpt.com/c/other", "webSocketDebuggerUrl": "ws://other-new"},
@@ -41,12 +62,11 @@ class BrowserCleanupTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(runner, "_cdp_page_targets", return_value=targets),
-            mock.patch.object(runner, "_browser_cdp_websocket_url", return_value="ws://browser"),
-            mock.patch.object(runner._CDPConnection, "connect") as connect,
+            mock.patch.object(runner, "create_background_page", return_value="created") as create,
             mock.patch.object(runner, "_navigate_owned_cdp_tab", return_value=True) as navigate,
         ):
-            connect.return_value.__enter__.return_value.call.return_value = {"targetId": "created"}
             self.assertTrue(runner._open_background_cdp_tab(args, "https://chatgpt.com/c/ours"))
+        create.assert_called_once_with(9333, "https://chatgpt.com/c/ours")
         self.assertEqual(args._owned_tab_cdp_target_id, "created")
         self.assertEqual(session.owned_target_ids, {"created"})
         navigate.assert_not_called()
@@ -108,7 +128,7 @@ class BrowserCleanupTests(unittest.TestCase):
         }
         with (
             mock.patch.object(runner, "configured_browser", return_value=config),
-            mock.patch.object(runner, "BrowserSession") as session_type,
+            mock.patch.object(runner, "_FreshImageBrowserSession") as session_type,
         ):
             session = session_type.return_value
             session.open.return_value = session
@@ -142,7 +162,7 @@ class BrowserCleanupTests(unittest.TestCase):
         args = argparse.Namespace(
             keep_browser_open=False,
             _active_run_id="current-run",
-            _frontmost_pid_before_launch=None,
+            _frontmost_pid_before_launch=42,
         )
         state = {
             "schema_version": 1,
@@ -161,10 +181,12 @@ class BrowserCleanupTests(unittest.TestCase):
             mock.patch.object(runner, "_read_cdp_state_locked", return_value=state),
             mock.patch.object(runner, "_write_cdp_state_locked"),
             mock.patch.object(runner, "_close_cdp_browser") as close_browser,
+            mock.patch.object(runner, "restore_frontmost_process", create=True) as stale_restore,
         ):
             runner._cleanup_agent_browser(args, Path.cwd())
 
         close_browser.assert_called_once_with(args, Path.cwd())
+        stale_restore.assert_not_called()
 
     def test_runner_keeps_browser_while_another_run_is_active(self) -> None:
         args = argparse.Namespace(

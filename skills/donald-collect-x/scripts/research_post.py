@@ -26,10 +26,10 @@ from browser_runtime import BrowserSession
 from output_paths import resolve_tool_output_root
 from profile_config import (
     ProfileConfigError,
-    activate_browser,
     chrome_environment,
     configured_browser,
     default_runtime_root,
+    show_browser_without_focus,
 )
 
 CHROME_DATA_DIR = os.environ.get("X_COLLECTOR_CHROME_DATA_DIR", "")
@@ -81,7 +81,7 @@ def activate_for_human_attention(result: dict[str, Any], port: int) -> dict[str,
         return result
     result = dict(result)
     try:
-        result["browser_activation"] = activate_browser(configured_browser(), port)
+        result["browser_activation"] = show_browser_without_focus(configured_browser(), port)
     except (OSError, ProfileConfigError, subprocess.SubprocessError, TimeoutError) as error:
         result["browser_activation"] = {"status": "error", "error": str(error)}
     return result
