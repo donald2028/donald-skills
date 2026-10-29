@@ -24,6 +24,93 @@ class Clock:
 
 
 class AutomaticRecoveryTests(unittest.TestCase):
+    def test_upstream_rebuild_collects_an_existing_image_without_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'collect-first', 'prompt_card': 'fixture.md', 'download_dir': temporary}
+            runner._write_session_patch(job, {'submission_committed': 'unknown'})
+            args = argparse.Namespace(mode='single-batch-submit', rebuild_request=True)
+            operation = mock.Mock()
+            with (mock.patch.object(runner, 'run_collect_current', return_value={
+                    'status': 'downloaded', 'image_count': 1, 'expected_image_count': 1}) as collect,
+                  mock.patch.object(runner, '_rebuild_unreachable_request') as rebuild):
+                self.assertEqual(runner._execute_with_automatic_recovery(args, job, Path.cwd(), operation)['status'], 'downloaded')
+            collect.assert_called_once(); rebuild.assert_not_called(); operation.assert_not_called()
+
+    def test_rebuild_preserves_inherited_reference_request_until_local_inputs_exist(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'references', 'prompt_card': 'fixture.md', 'download_dir': temporary,
+                   'reuse_conversation_references': True}
+            runner._write_session_patch(job, {'submission_committed': True})
+            args = argparse.Namespace(mode='conversation-followup')
+            result = runner._rebuild_unreachable_request(args, job, Path.cwd(),
+                runner.OriginalConversationRequired('original unavailable'), mock.Mock())
+            self.assertEqual(result['error_type'], 'rebuild_inputs_required')
+            self.assertTrue(runner.terminal_failure(result))
+            self.assertTrue(runner._read_json_if_exists(runner._session_path(job))['submission_committed'])
+
+    def test_gallery_repair_preserves_live_generation_loaded_assets_and_temporary_urls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'gallery', 'prompt_card': 'fixture.md', 'download_dir': temporary}
+            args = argparse.Namespace()
+            idle = {'checked': True, 'readyForNextPrompt': True}
+            gallery = {'galleryCount': 1, 'placeholderCount': 1, 'loadedGeneratedImages': 0}
+            url = 'https://chatgpt.com/c/original'
+            with (mock.patch.object(runner, '_pending_gallery_state', return_value=gallery),
+                  mock.patch.object(runner, '_page_access_state', return_value={}),
+                  mock.patch.object(runner, '_current_url', return_value=url),
+                  mock.patch.object(runner, '_refresh_expected_conversation') as reload):
+                for buttons, candidates, target, loaded in [
+                    ({**idle, 'generationActive': True}, [], url, 0),
+                    (idle, [{'src': 'blob:loaded'}], url, 0),
+                    (idle, [], url, 1),
+                    (idle, [], 'https://chatgpt.com/c/local-chatgpt%3Aoriginal', 0),
+                ]:
+                    gallery['loadedGeneratedImages'] = loaded
+                    runner._write_session_patch(job, {'pending_asset_recovery': {'first_seen_at': runner.time.time() - 40, 'reloads': 0}})
+                    self.assertFalse(runner._recover_pending_gallery(args, job, Path.cwd(), 'batch', target, buttons, candidates))
+                reload.assert_not_called()
+                runner._write_session_patch(job, {'pending_asset_recovery': {'first_seen_at': 1, 'last_reload_at': 1, 'reloads': 2}})
+                with self.assertRaises(runner.OriginalConversationRequired):
+                    runner._recover_pending_gallery(args, job, Path.cwd(), 'batch', url, idle, [])
+                reload.assert_not_called()
+
+    def test_upstream_rebuild_does_not_retry_policy_refusal_or_override_reconcile_only(self):
+        args = argparse.Namespace(mode='single-batch-submit', rebuild_request=True)
+        operation = mock.Mock(return_value={'status': 'policy_refused'})
+        with mock.patch.object(runner, 'run_collect_current') as collect:
+            self.assertEqual(runner._execute_with_automatic_recovery(args, {}, Path.cwd(), operation)['status'], 'policy_refused')
+            collect.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            args.reconcile_only = True
+            job = {'download_dir': temporary}
+            with self.assertRaises(runner.OriginalConversationRequired):
+                runner._rebuild_unreachable_request(args, job, Path.cwd(), runner.OriginalConversationRequired('missing'), operation)
+
+    def test_replacement_cap_retains_history_and_accepts_one_explicit_takeover_per_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'cap', 'prompt_card': 'fixture.md', 'download_dir': temporary, 'chatgpt_batch_message': 'Draw a tree.'}
+            old = {'submission_committed': 'unknown', 'response_retry_count': 2, 'request_rebuild_count': 2}
+            runner._write_session_patch(job, old)
+            args = argparse.Namespace(mode='single-batch-submit', _automatic_recovery_actions=[], _health_job=job)
+            operation = mock.Mock(return_value={'status': 'downloaded'})
+            error = runner.OriginalConversationRequired('Original target and history unavailable')
+            with self.assertRaises(runner.OriginalConversationRequired):
+                runner._rebuild_unreachable_request(args, job, Path.cwd(), error, operation)
+            args.rebuild_request = True
+            with (mock.patch.object(runner, '_page_access_state', return_value={}),
+                  mock.patch.object(runner, '_checked_generation_button_state', return_value={'checked': True, 'readyForNextPrompt': True}),
+                  mock.patch.object(runner, '_image_inventory', return_value=[]),
+                  mock.patch.object(runner, '_pending_gallery_state', return_value={}),
+                  mock.patch.object(runner, '_replace_unsubmitted_tab')):
+                result = runner._rebuild_unreachable_request(args, job, Path.cwd(), error, operation)
+                self.assertEqual(result['status'], 'downloaded')
+                saved = runner._read_json_if_exists(runner._session_path(job))
+                self.assertEqual(json.loads(Path(saved['replacement_of']).read_text())['response_retry_count'], 2)
+                self.assertEqual(saved['request_rebuild_count'], 3)
+                with self.assertRaises(runner.OriginalConversationRequired):
+                    runner._rebuild_unreachable_request(args, job, Path.cwd(), error, operation)
+            operation.assert_called_once()
+
     def test_empty_automatic_collection_exits_nonzero_and_stops_caller_retry_loop(self):
         with tempfile.TemporaryDirectory() as temporary:
             job = {"job_name": "empty", "prompt_card": "prompt.md", "download_dir": temporary}

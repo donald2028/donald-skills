@@ -37,7 +37,7 @@ from chatgpt_page_health import (
     PAGE_ACCESS_STATE_JS, CLICK_PAGE_ERROR_RETRY_JS, DEFAULT_PAGE_RECOVERY_ATTEMPTS, RecoverablePageError,
     page_failure, page_recovery_action, original_turn_script, original_history_script,
 )
-from task_supervisor import DEFAULT_TASK_TIMEOUT, add_supervisor_arguments, read_state, supervise
+from task_supervisor import DEFAULT_TASK_TIMEOUT, WorkerStopped, worker_signals, add_supervisor_arguments, read_state, result_complete, terminal_failure, supervise
 from browser_runtime import BrowserSession, process_is_alive
 from output_paths import resolve_tool_state_root
 from profile_config import (
@@ -203,7 +203,9 @@ class QueuePausedError(RuntimeError):
 
 
 class OriginalConversationRequired(RuntimeError):
-    pass
+    def __init__(self, message: str, *, rebuild_allowed: bool = True):
+        super().__init__(message)
+        self.rebuild_allowed = rebuild_allowed
 
 
 class ImageModeSelectionError(RuntimeError):
@@ -1117,21 +1119,20 @@ def _write_cdp_state_locked(args: argparse.Namespace, state: dict[str, Any]) -> 
 
 class _ResumeImageBrowserSession(BrowserSession):
     """Claim only this job's retained target, without navigating away from verification."""
-    def __init__(self, *args, original_target: str, require_target: bool, **kwargs):
+    def __init__(self, *args, original_target: str, **kwargs):
         super().__init__(*args, **kwargs)
         self.original_target = original_target
-        self.require_target = require_target
 
     def _claim_target(self, state: dict[str, Any]) -> str:
         if any(run.get("target_id") == self.original_target for run in state.get("active_runs", [])):
-            raise OriginalConversationRequired("The original request is still owned by another active runner")
+            raise OriginalConversationRequired("The original request is still owned by another active runner", rebuild_allowed=False)
         if cdp_target(self.port, self.original_target):
             state["retained_targets"] = [item for item in state.get("retained_targets", [])
                                          if item.get("target_id") != self.original_target]
             self.owned_target_ids.add(self.original_target)
             return self.original_target
-        if self.require_target:
-            raise OriginalConversationRequired("Original temporary conversation target is no longer available")
+        # Missing targets enter bounded original lookup and linked request recovery.
+        self.url = 'https://chatgpt.com/'
         return _FreshImageBrowserSession._claim_target(self, state)
 
     def _cleanup_failed_open(self) -> None:
@@ -1173,11 +1174,8 @@ def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
         or saved.get("reason") in ("anti_automation_verification", "login_required")
     ):
         session_type = _ResumeImageBrowserSession
-        url = str(saved.get("canonical_conversation_url") or saved.get("conversation_url") or "")
         resume_options = {
             "original_target": saved["owned_target_id"],
-            "require_target": saved.get("submission_committed") in (True, "unknown")
-                and (not url or _temporary_conversation_id(_conversation_id_from_url(url))),
         }
     browser_session = session_type(
         **resume_options,
@@ -1189,6 +1187,8 @@ def _prepare_browser_lane(args: argparse.Namespace, cwd: Path) -> None:
         timeout=60,
         lock_timeout=args.lock_timeout,
         allow_launch=not args.no_launch_browser,
+        owner_path=Path(args._health_job['download_dir']) / 'chatgpt_browser_owner.json'
+            if getattr(args, '_health_job', None) else None,
     ).open()
     args._browser_session = browser_session
     args._agent_browser_transport_session = browser_session.transport_session
@@ -1516,6 +1516,65 @@ def _generation_active_from_button_state(state: dict[str, Any]) -> bool:
     if state.get("generationActive") or state.get("stopButtonVisible"):
         return True
     return not bool(state.get("readyForNextPrompt"))
+
+
+def _pending_gallery_state(args: argparse.Namespace, cwd: Path) -> dict[str, Any]:
+    return _eval_json(args, cwd, r"""
+JSON.stringify((() => {
+  const {users, assistants, userFor, submittedUserFor} = __CONVERSATION_DOM__;
+  const user = submittedUserFor(__EXPECTED_PROMPT__);
+  const galleries = [...document.querySelectorAll('[data-testid="generated-image-gallery"]')].filter(el =>
+    user && userFor(el) === user && assistants.some(assistant => assistant.contains(el))
+    && !users.some(node => node.contains(el)) && !el.closest('nav,aside,form,[role=navigation]'));
+  return {url: location.href, galleryCount: galleries.length,
+    placeholderCount: galleries.reduce((n, el) => n + el.querySelectorAll('[class*="Placeholder"]').length, 0),
+    loadedGeneratedImages: galleries.reduce((n, el) => n + [...el.querySelectorAll('img')].filter(img =>
+      img.complete && img.naturalWidth >= 256 && img.naturalHeight >= 256).length
+      + el.querySelectorAll('canvas').length, 0)};
+})())
+""".replace('__CONVERSATION_DOM__', CONVERSATION_DOM_JS).replace(
+        '__EXPECTED_PROMPT__', json.dumps(str(getattr(args, '_submitted_prompt', '')))))
+
+
+def _recover_pending_gallery(args: argparse.Namespace, job: dict[str, Any], cwd: Path,
+                             label: int | str, url: str | None, buttons: dict[str, Any],
+                             candidates: list[dict[str, Any]]) -> bool:
+    """Recover completed, unloaded output; never reload a live generation or loaded Blob."""
+    args._pending_generated_assets = False
+    if (candidates or not buttons.get('checked') or buttons.get('generationActive')
+            or buttons.get('stopButtonVisible') or not buttons.get('readyForNextPrompt')):
+        return False
+    gallery = _pending_gallery_state(args, cwd)
+    if not gallery.get('galleryCount') or not gallery.get('placeholderCount') or gallery.get('loadedGeneratedImages'):
+        return False
+    args._pending_generated_assets = True
+    access = _page_access_state(args, cwd)
+    if access.get('humanReason'):
+        _activate_for_human_attention(args, str(access['humanReason']))
+    _run_phase(args, 'asset_hydration', 'completed gallery; waiting for original image bytes')
+    saved = _read_json_if_exists(_session_path(job, label)) or {}
+    recovery = saved.get('pending_asset_recovery') or {'first_seen_at': time.time(), 'reloads': 0}
+    _write_session_patch(job, {'label': label, 'status': 'pending_generated_assets',
+                              'pending_asset_recovery': recovery, 'gallery_observation': gallery})
+    cid = _conversation_id_from_url(url or '')
+    durable = bool(cid and not _temporary_conversation_id(cid))
+    if ((int(recovery.get('reloads') or 0) >= 2
+            and time.time() - float(recovery.get('last_reload_at') or recovery['first_seen_at']) >= 30)
+            or (not durable and time.time() - recovery['first_seen_at'] >= 90)):
+        _write_session_patch(job, {'label': label, 'pending_asset_recovery': {**recovery, 'exhausted': True}})
+        raise OriginalConversationRequired('Completed gallery assets remain unavailable after bounded hydration recovery.')
+    if (not durable or _conversation_id_from_url(_current_url(args, cwd)) != cid
+            or time.time() - float(recovery.get('last_reload_at') or recovery['first_seen_at']) < 30
+            or int(recovery.get('reloads') or 0) >= 2 or getattr(args, '_retain_generated_assets', False)):
+        return False
+    # Save before navigation, so a worker crash cannot replay this recovery indefinitely.
+    recovery = {**recovery, 'reloads': int(recovery.get('reloads') or 0) + 1, 'last_reload_at': time.time()}
+    _write_session_patch(job, {'label': label, 'pending_asset_recovery': recovery,
+        'attempt': {'action': 'reload_completed_gallery', 'guard': gallery, 'conversation_url': url,
+                    'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}})
+    _refresh_expected_conversation(args, cwd, url, reason='completed_gallery_assets_unloaded',
+                                   candidate_count=0, expected_count=_expected_image_count(job, label))
+    return True
 
 
 def _validate_profile(args: argparse.Namespace) -> None:
@@ -3971,21 +4030,98 @@ def _admit_job_with_recovery(args: argparse.Namespace, job: dict[str, Any], cwd:
             return _queue_admit(args, allow_probe=True)
 
 
+def _request_file_prefix(job: dict[str, Any], label: int | str) -> str:
+    saved = _read_json_if_exists(_session_path(job, label)) or {}
+    suffix = '_' + saved['request_id'] if saved.get('request_id') else ''
+    return f"{job['job_name']}_agent_browser_{_variant_prefix(label)}{suffix}_generated"
+
+
+def _rebuild_unreachable_request(args: argparse.Namespace, job: dict[str, Any], cwd: Path,
+                                 error: OriginalConversationRequired,
+                                 operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Archive a failed request before one bounded, linked replacement of the same inputs."""
+    label = getattr(args, '_active_request_label', 'batch')
+    saved = _read_json_if_exists(_session_path(job, label)) or {}
+    if (not error.rebuild_allowed or getattr(args, 'reconcile_only', False)
+            or args.mode in {'health-check', 'dry-upload'}):
+        raise error
+    count = int(saved.get('request_rebuild_count') or 0)
+    supervisor = read_state(Path(job['download_dir']) / 'chatgpt_supervisor.json')
+    ticket = supervisor.get('started_at', 'direct')
+    explicit = count >= 2 and getattr(args, 'rebuild_request', False) and saved.get('rebuild_ticket') != ticket
+    if count >= 2 and not explicit:
+        raise OriginalConversationRequired('Automatic request replacements exhausted; upstream may use --rebuild-request after review.',
+                                            rebuild_allowed=False)
+    if job.get('reuse_conversation_references'):
+        result = {'status': 'needs_ops', 'error_type': 'rebuild_inputs_required', 'business_complete': False,
+                  'requires_user_action': True, 'recommended_next_action': 'supply_original_reference_files',
+                  'reason': 'Rebuilding requires the original reference image files; prepare a linked job with those inputs.'}
+        _write_session_patch(job, {'label': label, **result})
+        return result
+    access = _page_access_state(args, cwd)
+    if access.get('humanReason'):
+        _activate_for_human_attention(args, str(access['humanReason']))
+    buttons = _checked_generation_button_state(args, cwd)
+    candidates = _generated_image_candidates(_image_inventory(args, cwd), set(saved.get('baseline_asset_urls') or []),
+                                              saved.get('baseline_user_message_count'))
+    if _generation_active_from_button_state(buttons) or candidates:
+        raise OriginalConversationRequired('Original generation or image assets remain available; collect before rebuilding.', rebuild_allowed=False)
+    gallery = _pending_gallery_state(args, cwd)
+    if gallery.get('galleryCount') and not (saved.get('pending_asset_recovery') or {}).get('exhausted'):
+        raise OriginalConversationRequired('Original gallery exists; finish asset hydration before rebuilding.', rebuild_allowed=False)
+    _validate_manifest_reference_mapping(job)
+    request_id = uuid.uuid4().hex[:12]
+    archive = Path(job['download_dir']) / 'request-history' / f'{_variant_prefix(label)}-{request_id}'
+    archive.mkdir(parents=True)
+    atomic_json(archive / 'session.json', saved)
+    for name in ('chatgpt_web_run_summary.json', 'chatgpt_supervisor.json', 'chatgpt_recovery.json'):
+        source = Path(job['download_dir']) / name
+        if source.exists():
+            shutil.copy2(source, archive / name)
+    link = {'action': 'rebuild_unreachable_request', 'request_id': request_id,
+            'previous_request_id': saved.get('request_id', 'original'), 'previous_session': str(archive / 'session.json'),
+            'reason': str(error), 'submission_committed': saved.get('submission_committed', 'unknown'),
+            'prompt_sha256': hashlib.sha256(_message_for_label(job, label).encode()).hexdigest(),
+            'explicit_upstream_takeover': bool(explicit), 'at': time.time()}
+    # Archive old submission/Retry counters before assigning a separate request identity.
+    atomic_json(_session_path(job, label), {'request_id': request_id, 'request_rebuild_count': count + 1,
+        'request_history': [*saved.get('request_history', []), link], 'replacement_of': str(archive / 'session.json'),
+        'rebuild_ticket': ticket if explicit else saved.get('rebuild_ticket'), 'submission_committed': False})
+    args._submit_dispatched = None
+    args._retain_generated_assets = False
+    _replace_unsubmitted_tab(args, cwd, 'https://chatgpt.com/')
+    args._automatic_recovery_actions.append(link)
+    if args.mode == 'collect-current':
+        return _run_one_request(args, job, cwd, label=label, message=_message_for_label(job, label), resume=False)
+    return operation()
+
+
 def _execute_with_automatic_recovery(args: argparse.Namespace, job: dict[str, Any], cwd: Path,
                                      operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """Own the one outer recovery cycle instead of sending retry commands to the caller."""
+    saved = (_read_json_if_exists(_session_path(job, getattr(args, '_active_request_label', 'batch'))) or {}) if job else {}
+    collection_first = bool(getattr(args, 'rebuild_request', False)
+        and saved.get('submission_committed') in (True, 'unknown')
+        and getattr(args, '_active_request_label', 'batch') == 'batch')
     try:
-        result = operation()
+        result = run_collect_current(args, job, cwd) if collection_first else operation()
     except (SubmissionStateUnknownError, PageRecoveryExhaustedError, OriginalConversationRequired) as error:
+        if isinstance(error, OriginalConversationRequired) and not error.rebuild_allowed:
+            raise
         failure = error
         result = getattr(error, "report", {})
     else:
         failure = None
+        if terminal_failure(result):
+            return result
         statuses = [result.get("status")]
         statuses.extend((item.get("downloaded") or {}).get("status") for item in result.get("variants", []))
         reports = [result, *((item.get("downloaded") or {}) for item in result.get("variants", []))]
         missing_turn = any(report.get("error_type") == "chatgpt_submitted_turn_missing" for report in reports)
-        if not missing_turn and not any(status in ("download_failed", "timeout_no_images", "submission_state_unknown") for status in statuses):
+        if (not getattr(args, 'rebuild_request', False) and not missing_turn
+                and not any(status in ("download_failed", "timeout_no_images", "submission_state_unknown") for status in statuses)):
+            return result
+        if result_complete(result, interactive=False):
             return result
     if args.mode == "health-check":
         if failure:
@@ -3999,10 +4135,12 @@ def _execute_with_automatic_recovery(args: argparse.Namespace, job: dict[str, An
     if health:
         actions.append({"action": "health_check", "status": health["status"]})
     try:
+        if collection_first and isinstance(failure, OriginalConversationRequired):
+            raise failure
         if committed in (True, "unknown"):
             if getattr(args, "_active_request_label", "batch") == "batch":
                 actions.append({"action": "collect_original_request"})
-                recovered = run_collect_current(args, job, cwd)
+                recovered = result if collection_first and failure is None else run_collect_current(args, job, cwd)
             else:
                 # Each independent variant has its own guarded session; resume the normal loop.
                 actions.append({"action": "resume_independent_variants"})
@@ -4018,9 +4156,17 @@ def _execute_with_automatic_recovery(args: argparse.Namespace, job: dict[str, An
                 raise failure
             return result
     except (SubmissionStateUnknownError, PageRecoveryExhaustedError, OriginalConversationRequired) as error:
+        if isinstance(error, OriginalConversationRequired):
+            recovered = _rebuild_unreachable_request(args, job, cwd, error, operation)
+            recovered['automatic_recovery_actions'] = actions
+            return recovered
         if hasattr(error, "report"):
             error.report["automatic_recovery_actions"] = actions
         raise
+    if (getattr(args, 'rebuild_request', False) and not terminal_failure(recovered)
+            and not _requested_images_downloaded(recovered)):
+        recovered = _rebuild_unreachable_request(args, job, cwd,
+            OriginalConversationRequired('Bounded original-result collection exhausted; upstream requested replacement.'), operation)
     recovered["automatic_recovery_actions"] = actions
     return recovered
 
@@ -4098,7 +4244,7 @@ def _require_original_conversation(args: argparse.Namespace, cwd: Path, session:
     raise OriginalConversationRequired(
         "The request may already be submitted, but its original user turn could not be verified "
         "in the owned target, post-dispatch history, or unique exact-prompt sidebar entry. "
-        "Keep the original job and recovery checkpoint; never duplicate Send."
+        "The bounded original-result lookup is exhausted; retain its record and rebuild a linked request."
     )
 
 
@@ -5920,7 +6066,7 @@ def _collect_generated_images_with_retries(
     active_expected_conversation_url = expected_conversation_url
     expected_count = _expected_image_count(job, label)
     download_limit = _candidate_download_limit(expected_count, references)
-    file_prefix = f"{job['job_name']}_agent_browser_{_variant_prefix(label)}_generated"
+    file_prefix = _request_file_prefix(job, label)
     _run_phase(args, "generation_wait")
     started_at = time.time()
     progress_interval = max(5, int(getattr(args, "progress_interval", 20)))
@@ -6047,6 +6193,9 @@ def _collect_generated_images_with_retries(
                 "composer_controls",
             )
             generation_active = _generation_active_from_button_state(button_state)
+            if _recover_pending_gallery(args, job, cwd, label, active_expected_conversation_url, button_state, candidates):
+                next_progress_at = 0.0
+                continue
             if (any(int(candidate.get("width") or 0) >= 256 and int(candidate.get("height") or 0) >= 256
                     for candidate in candidates) and button_state.get("checked")
                     and not button_state.get("generationActive") and not button_state.get("stopButtonVisible")):
@@ -6102,8 +6251,8 @@ def _collect_generated_images_with_retries(
                 _emit_progress(
                     job,
                     label=label,
-                    phase="generation_wait",
-                    status="waiting_for_generated_images",
+                    phase="asset_hydration" if getattr(args, '_pending_generated_assets', False) else "generation_wait",
+                    status="pending_generated_assets" if getattr(args, '_pending_generated_assets', False) else "waiting_for_generated_images",
                     started_at=started_at,
                     expected_count=expected_count,
                     recognized_count=len(candidates),
@@ -6553,6 +6702,9 @@ def _collect_generated_images_with_retries(
 
 
 def _trace_dir_for_label(job: dict[str, Any], label: int | str) -> Path:
+    saved = _read_json_if_exists(_session_path(job, label)) or {}
+    if saved.get('request_id'):
+        return Path(job['download_dir']) / 'request-history' / saved['request_id'] / 'trace'
     if label == "batch":
         return Path(job["download_dir"]) / "agent_browser_trace_submit"
     return Path(job["download_dir"]) / f"agent_browser_trace_{_variant_prefix(label)}"
@@ -7575,7 +7727,8 @@ def _recover_generated_asset_target(args: argparse.Namespace, cwd: Path, session
 
 def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path) -> dict[str, Any]:
     args._submitted_prompt = str(job.get("chatgpt_batch_message") or job.get("chatgpt_message") or "")
-    trace_dir = Path(job["download_dir"]) / "agent_browser_trace_collect"
+    trace_dir = (_trace_dir_for_label(job, 'batch') / 'collect' if
+        (_read_json_if_exists(_session_path(job)) or {}).get('request_id') else Path(job['download_dir']) / 'agent_browser_trace_collect')
     trace_dir.mkdir(parents=True, exist_ok=True)
 
     _validate_profile(args)
@@ -7634,6 +7787,10 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
             conversation_restores.append(conversation_guard)
         candidates = _vertical_images(rows, set(existing_session.get("baseline_asset_urls") or []),
                                       existing_session.get("baseline_user_message_count"))
+        if not candidates and _recover_pending_gallery(args, job, cwd, 'batch', conversation_url,
+                                                       _checked_generation_button_state(args, cwd), candidates):
+            next_progress_at = 0.0
+            continue
         if time.time() >= next_progress_at:
             page_health = _generation_page_health(args, cwd, conversation_url, page_text)
             if page_health.get("human_reason") or page_health.get("challenge_frame"):
@@ -7668,7 +7825,7 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
         cwd,
         selected_candidates,
         Path(job["download_dir"]),
-        f"{job['job_name']}_agent_browser_batch_generated",
+        _request_file_prefix(job, 'batch'),
         download_failures,
     )
     downloaded, filtered_reference_downloads = _filter_reference_downloads(downloaded_all, references)
@@ -7992,6 +8149,8 @@ def argument_parser() -> argparse.ArgumentParser:
             "screenshots are always preserved."
         ),
     )
+    parser.add_argument('--rebuild-request', action='store_true',
+                        help='Collect first, then allow one additional linked replacement if the original is unusable.')
     parser.add_argument("--human-wait-timeout", type=int, default=600,
                         help="Seconds to observe manual verification; never click verification controls.")
     add_supervisor_arguments(parser)
@@ -8084,7 +8243,7 @@ def main() -> int:
             _queue_probe(args, cwd)
     except OriginalConversationRequired as error:
         args.keep_browser_open = True
-        report = {"status": "needs_ops", "error_type": "original_conversation_required",
+        report = {"status": "recovery_required", "error_type": "original_conversation_required",
                           "reason": str(error), "submission_committed": saved.get("submission_committed", "unknown"),
                           "retryable": False,
                           "recommended_next_action": "locate_original_conversation_then_collect"}
@@ -8158,7 +8317,7 @@ def main() -> int:
         args.keep_browser_open = True
         args._preserve_owned_tab = True
         current_session = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or saved
-        report = {"status": "needs_ops", "error_type": "original_conversation_required",
+        report = {"status": "recovery_required", "error_type": "original_conversation_required",
                   "submission_committed": current_session.get("submission_committed", "unknown"),
                   "retryable": False, "reason": str(error),
                   "recommended_next_action": "locate_original_conversation_then_collect"}
@@ -8228,6 +8387,11 @@ def main() -> int:
         }
         exit_code = 2
     finally:
+        stopped = sys.exc_info()[1]
+        if isinstance(stopped, WorkerStopped):
+            args.keep_browser_open = stopped.preserve_browser
+            if not stopped.preserve_browser:
+                args._retain_generated_assets = False
         if report is not None and getattr(args, "_automatic_recovery_actions", None):
             report["automatic_recovery_actions"] = args._automatic_recovery_actions
             report["automatic_recovery_exhausted"] = exit_code != 0
@@ -8250,7 +8414,7 @@ def main() -> int:
             args._retain_generated_assets = False
         session = _read_json_if_exists(_session_path(job, getattr(args, "_active_request_label", "batch"))) or {}
         cid = _conversation_id_from_url(str(session.get("canonical_conversation_url") or session.get("conversation_url") or ""))
-        if (args.mode != "health-check" and session.get("submission_committed") in (True, "unknown")
+        if (not isinstance(stopped, WorkerStopped) and args.mode != "health-check" and session.get("submission_committed") in (True, "unknown")
                 and terminal_status != "downloaded" and (not cid or _temporary_conversation_id(cid))):
             args.keep_browser_open = True
         args._health.close(terminal_status or "stopped")
@@ -8273,9 +8437,17 @@ def entrypoint() -> int:
     args = argument_parser().parse_args()
     if args.reconcile_only and args.mode != 'collect-current':
         raise ValueError('--reconcile-only requires --mode collect-current')
-    if args.worker or args.mode in {'status', 'health-check'}:
+    if args.reconcile_only and (args.rebuild_request or args.restart_task):
+        raise ValueError('--reconcile-only cannot restart or rebuild requests')
+    if args.rebuild_request:
+        args.restart_task = True
+    if args.mode == 'status':
         return main()
     job = json.loads(Path(args.manifest).read_text(encoding='utf-8'))
+    if args.worker or args.mode == 'health-check':
+        with worker_signals(Path(job['download_dir'])):
+            return main()
+        return 130
     return supervise(Path(__file__).resolve(), sys.argv[1:], Path(job['download_dir']),
                      _session_path(job), args)
 

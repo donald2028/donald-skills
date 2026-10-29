@@ -88,6 +88,7 @@ class PageRecoveryTests(unittest.TestCase):
                     _ensure_expected_conversation=mock.Mock(return_value={'current_url': url}),
                     _screenshot=mock.Mock(), _page_access_state=mock.Mock(return_value={}),
                     _page_text=mock.Mock(return_value=''), _image_inventory=mock.Mock(return_value=[]),
+                    _checked_generation_button_state=mock.Mock(return_value={'checked': True, 'generationActive': True}),
                     _generation_page_health=mock.Mock(return_value={'status': 'ok'}), _emit_progress=mock.Mock(),
                     _download_candidates=mock.Mock(return_value=[]), _annotate_aspect_ratio_validation=mock.Mock(return_value={}),
                     _profile_label=mock.Mock(return_value='test'), _agent_browser_session_record=mock.Mock(return_value={}),

@@ -28,6 +28,103 @@ from PIL import Image, PngImagePlugin  # noqa: E402
     "requires opt-in and a configured Chrome lane",
 )
 class BrowserDomTests(unittest.TestCase):
+    def test_unreachable_ghost_history_rebuilds_linked_request_and_downloads(self):
+        prompt = 'Create the requested image.'
+        self.load_html('<aside id="history"><div role="button" aria-label="@Create image ' + prompt + '">Original request</div></aside>'
+            '<main>Where should we begin?</main><div contenteditable="true"></div>')
+        runner._eval_js(self.args, self.cwd, 'globalThis.historyClicks=0; globalThis.fixtureSends=0; '
+            'document.querySelector("#history [role=button]").onclick=()=>{historyClicks++;};')
+        png = io.BytesIO()
+        Image.new('RGB', (300, 420), 'coral').save(png, format='PNG')
+        data_url = 'data:image/png;base64,' + base64.b64encode(png.getvalue()).decode()
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'ghost', 'prompt_card': 'fixture.md', 'download_dir': temporary,
+                   'variant_count': 1, 'chatgpt_batch_message': prompt}
+            args = argparse.Namespace(**vars(self.args))
+            args._submitted_prompt, args._health_job = prompt, job
+            args._owned_tab_cdp_target_id, args.mode = self.browser.target_id, 'single-batch-submit'
+            args.timeout, args.progress_interval = 10, 1
+            args.profile, args.user_data_dir, args.session = 'fixture', temporary, 'fixture'
+            runner._write_session_patch(job, {'submission_committed': 'unknown', 'owned_target_id': self.browser.target_id,
+                'conversation_url': 'https://chatgpt.com/c/local-chatgpt%3Aoriginal', 'baseline_user_message_count': 0,
+                'baseline_navigation_entry_ids': [], 'response_retry_count': 2})
+            def replace(*unused):
+                self.load_html('<div role="group" aria-label="Composer mode"><button aria-pressed="true">Chat</button>'
+                    '<button aria-pressed="false">Work</button></div><main></main><form onsubmit="return false">'
+                    '<div id="prompt-textarea" role="textbox" contenteditable="true"></div>'
+                    '<button type="button" data-testid="send-button">Send</button></form>')
+                runner._eval_js(args, self.cwd, '''document.querySelector('[data-testid=send-button]').onclick = () => {
+                  fixtureSends++;
+                  const user = document.createElement('div'); user.dataset.messageAuthorRole='user';
+                  user.textContent=document.querySelector('#prompt-textarea').textContent;
+                  const assistant=document.createElement('div'); assistant.dataset.messageAuthorRole='assistant';
+                  assistant.innerHTML='<div data-testid="generated-image-gallery"><img src="' + IMAGE + '"></div>';
+                  document.querySelector('main').append(user, assistant);
+                  document.querySelector('#prompt-textarea').textContent='';
+                };'''.replace('IMAGE', json.dumps(data_url)))
+            def operation():
+                saved = runner._read_json_if_exists(runner._session_path(job))
+                if saved.get('submission_committed') in (True, 'unknown'):
+                    runner._require_original_conversation(args, self.cwd, saved)
+                    self.fail('Ghost history must not verify the original request')
+                runner._paste_prompt(args, self.cwd, prompt)
+                runner._submit_prompt(args, self.cwd, prompt, timeout_s=5)
+                runner._write_session_patch(job, {'submission_committed': True, 'baseline_user_message_count': 0})
+                return runner._collect_generated_images_with_retries(args, job, self.cwd, Path(temporary),
+                    set(), [], label='batch', mode='single_batch_submit', resumed=False,
+                    expected_conversation_url='https://chatgpt.com/c/replacement', baseline_user_message_count=0)
+            with (mock.patch.object(runner, '_current_url', side_effect=lambda *unused:
+                    'https://chatgpt.com/c/replacement' if runner._read_json_if_exists(runner._session_path(job)).get('request_id')
+                    else 'https://chatgpt.com/'),
+                  mock.patch.object(runner, '_conversation_history', return_value=[]),
+                  mock.patch.object(runner, '_cdp_page_targets', return_value=[]),
+                  mock.patch.object(runner, '_replace_unsubmitted_tab', side_effect=replace),
+                  mock.patch.object(runner, '_screenshot'), mock.patch.object(runner, '_write_timing_sample'),
+                  mock.patch.object(runner.time, 'sleep')):
+                result = runner._execute_with_automatic_recovery(args, job, self.cwd, operation)
+            self.assertEqual(result['status'], 'downloaded')
+            self.assertEqual(Path(result['images'][0]['path']).read_bytes(), png.getvalue())
+            saved = runner._read_json_if_exists(runner._session_path(job))
+            old = json.loads(Path(saved['replacement_of']).read_text())
+            self.assertEqual(old['submission_committed'], 'unknown')
+            self.assertEqual(old['response_retry_count'], 2)
+            self.assertGreater(old['original_history_recovery_attempts'], 0)
+            self.assertEqual(saved['request_rebuild_count'], 1)
+            self.assertIn(saved['request_id'], Path(result['images'][0]['path']).name)
+            self.assertEqual(runner._eval_json(args, self.cwd, 'JSON.stringify({sends: fixtureSends})')['sends'], 1)
+
+    def test_completed_gallery_placeholder_reopens_original_and_downloads_native_png(self):
+        prompt = 'Create the requested image.'
+        gallery = (Path(__file__).parent / 'fixtures/completed-gallery-placeholder.html').read_text()
+        self.load_html('<main><section data-turn-key="original"><div data-message-author-role="user">'
+                       + prompt + '</div>' + gallery + '</section></main><div contenteditable="true"></div>')
+        png = io.BytesIO()
+        Image.new('RGB', (300, 420), 'coral').save(png, format='PNG')
+        data_url = 'data:image/png;base64,' + base64.b64encode(png.getvalue()).decode()
+        url = 'https://chatgpt.com/c/original'
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'hydration', 'prompt_card': 'fixture.md', 'download_dir': temporary, 'variant_count': 1}
+            args = argparse.Namespace(**vars(self.args), _submitted_prompt=prompt, _health_job=job,
+                                      timeout=3, progress_interval=1)
+            runner._write_session_patch(job, {'submission_committed': True, 'conversation_url': url,
+                'pending_asset_recovery': {'first_seen_at': 1, 'reloads': 0}})
+            def reopen(*unused):
+                runner._eval_js(args, self.cwd, 'document.querySelector("[data-web-image-tile]").innerHTML = '
+                                + json.dumps('<img src="' + data_url + '">'))
+                return url
+            with (mock.patch.object(runner, '_current_url', return_value=url),
+                  mock.patch.object(runner, '_open_conversation', side_effect=reopen) as navigate,
+                  mock.patch.object(runner, '_screenshot'), mock.patch.object(runner, '_write_timing_sample'),
+                  mock.patch.object(runner, '_submit_prompt') as send,
+                  mock.patch.object(runner, '_click_try_again') as retry):
+                result = runner._collect_generated_images_with_retries(args, job, self.cwd, Path(temporary),
+                    set(), [], label='batch', mode='single_batch_resume', resumed=True,
+                    expected_conversation_url=url, baseline_user_message_count=0)
+            self.assertEqual(result['status'], 'downloaded')
+            self.assertEqual(Path(result['images'][0]['path']).read_bytes(), png.getvalue())
+            navigate.assert_called_once_with(args, self.cwd, url)
+            send.assert_not_called(); retry.assert_not_called()
+
     def test_response_retry_home_history_button_recovers_original_and_downloads_without_send(self):
         prompt = 'Create one image with the exact four-line alignment correction.'
         png = io.BytesIO()

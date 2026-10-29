@@ -187,6 +187,11 @@ unchanged failures indefinitely. A pending checkpoint is not a scheduled backgro
 that ChatGPT has replied. Actual human gates retain `needs_ops` and their concrete required action.
 This supervises worker processes while the parent is running; closing
 the host or terminating the supervisor still requires an explicit `--resume`.
+Cancellation signals reap the owned worker and release its recorded browser ownership, closing
+runtime-owned Chrome only after the last active/retained run releases it. Planned takeovers retain
+the original live request. A whole browser process exiting produces `interrupted` and must not
+relaunch Chrome automatically. Preserve the session and wait for an explicit resume instruction;
+do not consume an interrupted/cancelled result as an ordinary service-recovery checkpoint.
 
 ## Recover Before Requesting Help
 

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -15,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from browser_runtime import _file_lock
+from browser_runtime import _file_lock, process_is_alive, cleanup_stopped_browser
 from run_health import atomic_json
 from chatgpt_page_health import page_failure
 
@@ -23,6 +25,50 @@ DEFAULT_HEARTBEAT_TIMEOUT = 60
 DEFAULT_STALL_TIMEOUT = 180
 DEFAULT_TASK_TIMEOUT = 300
 MAX_CONTINUATION_RUNS = 2
+
+
+class WorkerStopped(BaseException):
+    def __init__(self, preserve_browser: bool):
+        self.preserve_browser = preserve_browser
+
+
+@contextlib.contextmanager
+def worker_signals(root: Path):
+    previous = {}
+    def stop(signum, _frame):
+        signal.signal(signum, signal.SIG_IGN)
+        request = read_state(root / 'chatgpt_worker_stop.json')
+        # An older supervisor may not write a stop request. Preserve its unresolved browser
+        # rather than mistaking a planned takeover for permission to discard the live target.
+        preserve = bool(request.get('preserve_browser')) if request.get('pid') == os.getpid() else True
+        raise WorkerStopped(preserve)
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT, *([signal.SIGHUP] if hasattr(signal, 'SIGHUP') else [])):
+            previous[sig] = signal.signal(sig, stop)
+        try:
+            yield
+        except WorkerStopped:
+            pass
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+@contextlib.contextmanager
+def termination_as_interrupt():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    def stop(signum, _frame):
+        signal.signal(signum, signal.SIG_IGN)
+        raise KeyboardInterrupt
+    previous = {sig: signal.signal(sig, stop) for sig in
+                (signal.SIGTERM, signal.SIGINT, *([signal.SIGHUP] if hasattr(signal, 'SIGHUP') else []))}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 class StreamWriter:
@@ -72,6 +118,8 @@ def add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--max-worker-restarts', type=int, default=2)
     parser.add_argument('--resume-recovery', action='store_true',
                         help='Continue this task from its saved recovery checkpoint after cooldown.')
+    parser.add_argument('--restart-task', action='store_true',
+                        help='Request takeover of the live worker, or start a fresh bounded recovery cycle.')
     parser.add_argument('--reconcile-only', action='store_true',
                         help='Inspect/collect the original request without Send or response Retry.')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
@@ -86,16 +134,28 @@ def read_state(path: Path) -> dict[str, Any]:
         return {}
 
 
-def stop_worker(child: subprocess.Popen) -> None:
+def browser_exited(owner: dict[str, Any], worker_pid: int) -> bool:
+    return bool(owner.get('pid') == worker_pid and owner.get('browser_pid')
+                and (owner.get('browser_exited_before_cleanup')
+                     or (owner.get('status') in {'open', 'starting'}
+                         and not process_is_alive(int(owner['browser_pid'])))))
+
+
+def stop_worker(child: subprocess.Popen, root: Path | None = None, *, preserve_browser: bool = True) -> None:
     # Only the Python worker belongs to this supervisor. Chrome may own unresolved requests
     # or other tasks; never kill its process group or close its targets during takeover.
     if child.poll() is None:
+        if root is not None:
+            atomic_json(root / 'chatgpt_worker_stop.json', {'pid': child.pid, 'preserve_browser': preserve_browser})
         child.terminate()
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait(timeout=5)
+    if root is not None:
+        cleanup = cleanup_stopped_browser(root / 'chatgpt_browser_owner.json', child.pid, preserve=preserve_browser)
+        atomic_json(root / 'chatgpt_browser_cleanup.json', cleanup)
 
 
 def terminal_failure(report: Any) -> bool:
@@ -109,7 +169,7 @@ def terminal_failure(report: Any) -> bool:
     if markers & {
         'policy_refused', 'human_attention_required', 'human_verification_required',
         'login_required', 'foreground_changed',
-        'browser_profile_unconfigured', 'pillow_unavailable',
+        'browser_profile_unconfigured', 'pillow_unavailable', 'rebuild_inputs_required',
     }:
         return True
     return any(terminal_failure(value) for value in report.values() if isinstance(value, (dict, list)))
@@ -195,32 +255,63 @@ def supervise(script: Path, worker_args: list[str], root: Path, session_path: Pa
     if min(limits.stall_timeout, limits.heartbeat_timeout, limits.task_timeout) <= 0 or limits.max_worker_restarts < 0:
         raise ValueError('Supervisor timeouts must be positive and restart count must be nonnegative')
     root.mkdir(parents=True, exist_ok=True)
+    manifest_value = getattr(limits, 'manifest', None)
+    manifest = Path(manifest_value) if manifest_value else (
+        Path(worker_args[0]) if worker_args and not worker_args[0].startswith('-') else None)
+    if manifest and manifest.is_file():
+        manifest = manifest.resolve()
+        worker_args = [str(manifest) if not value.startswith('-')
+                       and Path(value).expanduser().resolve() == manifest else value for value in worker_args]
+    task_key = hashlib.sha256((script.name + str(session_path.resolve())
+        + (hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest and manifest.is_file() else '')).encode()).hexdigest()
+    if getattr(limits, 'restart_task', False):
+        try:
+            with _file_lock(root / 'chatgpt_supervisor.lock', timeout=0):
+                pass
+        except TimeoutError:
+            owner = read_state(root / 'chatgpt_supervisor.json')
+            if read_state(root / 'chatgpt_recovery.json').get('task_key') != task_key:
+                raise ValueError('Recovery inputs changed; preserve the original manifest and session')
+            if owner.get('status') != 'running' or not process_is_alive(int(owner.get('pid') or 0)):
+                raise RuntimeError('Supervisor lock is busy without a live owner; inspect the saved run')
+            request = {'action': 'restart', 'supervisor_pid': owner['pid'], 'started_at': owner['started_at'],
+                       'id': uuid.uuid4().hex, 'rebuild_request': bool(getattr(limits, 'rebuild_request', False))}
+            atomic_json(root / 'chatgpt_supervisor_control.json', request)
+            print(json.dumps({'status': 'recovery_requested', 'business_complete': False,
+                              'supervisor_path': str(root / 'chatgpt_supervisor.json'), 'request': request}))
+            return 0
     # Prevent two parents from restarting workers against the same task.
-    with _file_lock(root / 'chatgpt_supervisor.lock', timeout=0):
+    with termination_as_interrupt(), _file_lock(root / 'chatgpt_supervisor.lock', timeout=0):
         recovery_path = root / 'chatgpt_recovery.json'
         recovery = read_state(recovery_path)
-        manifest_value = getattr(limits, 'manifest', None)
-        manifest = Path(manifest_value) if manifest_value else (
-            Path(worker_args[0]) if worker_args and not worker_args[0].startswith('-') else None)
-        if manifest and manifest.is_file():
-            manifest = manifest.resolve()
-            worker_args = [str(manifest) if not value.startswith('-')
-                           and Path(value).expanduser().resolve() == manifest else value for value in worker_args]
-        task_key = hashlib.sha256((script.name + str(session_path.resolve())
-            + (hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest and manifest.is_file() else '')).encode()).hexdigest()
         if recovery:
             if recovery.get('task_key') != task_key:
                 raise ValueError('Recovery inputs changed; preserve the original manifest and session')
+            restart = getattr(limits, 'restart_task', False)
+            if restart:
+                recovery.setdefault('takeovers', []).append({'at': time.time(), 'preceding_status': recovery.get('status'),
+                    'preceding_round': recovery['round']})
+                recovery.update(round=recovery['round'] + 1, cycle_started_round=recovery['round'] + 1, status='running')
+                atomic_json(recovery_path, recovery)
+                if '--recover-worker' not in worker_args:
+                    worker_args = [*worker_args, '--recover-worker']
+            if recovery.get('status') == 'interrupted' and not (restart or getattr(limits, 'resume_recovery', False) or getattr(limits, 'resume', None)):
+                writer = StreamWriter(sys.stdout)
+                writer.json(recovery['result'])
+                writer.close()
+                return 130
             if recovery.get('status') in {'recovery_pending', 'recovery_blocked'}:
                 reconcile = getattr(limits, 'reconcile_only', False)
-                if not reconcile and (not getattr(limits, 'resume_recovery', False) or recovery['round'] >= MAX_CONTINUATION_RUNS):
+                if not reconcile and not restart and (not getattr(limits, 'resume_recovery', False)
+                        or recovery['round'] - recovery.get('cycle_started_round', 0) >= MAX_CONTINUATION_RUNS):
                     writer = StreamWriter(sys.stdout)
                     writer.json(recovery['result'])
                     writer.close()
                     return 2
                 # A new bounded run is explicit, checkpointed, and delayed; repeated normal
                 # invocations cannot silently reset either the budget or the continuation cap.
-                time.sleep(max(0, recovery['not_before'] - time.time()))
+                if not restart:
+                    time.sleep(max(0, recovery['not_before'] - time.time()))
                 recovery.update(round=recovery['round'] + (0 if reconcile else 1), status='running')
                 atomic_json(recovery_path, recovery)
                 if '--recover-worker' not in worker_args:
@@ -263,6 +354,17 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
         atomic_json(state_path, state)
         diagnostics.json({'event': 'task_supervisor', **state['actions'][-1]})
 
+    def interrupted(reason: str) -> int:
+        result = {'status': 'interrupted', 'reason': reason, 'business_complete': False,
+                  'automatic_resume_allowed': False, 'session_path': str(session_path),
+                  'supervisor_path': str(state_path), 'recommended_next_action': 'resume_only_on_explicit_request'}
+        state.update(status='interrupted', result=result)
+        recovery.update(status='interrupted', result=result)
+        atomic_json(root / 'chatgpt_recovery.json', recovery)
+        record('supervisor_interrupted', reason=reason)
+        output.json(result)
+        return 130
+
     def exhausted(reason: str, report: dict[str, Any]) -> int:
         manifest_value = getattr(limits, 'manifest', None)
         completed = None if interactive else reconcile_saved_images(
@@ -287,8 +389,10 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
             record('supervision_handoff')
             output.json(result)
             return 2
-        pending = recovery['round'] < MAX_CONTINUATION_RUNS
-        command_args = [value for value in worker_args if value not in {'--resume-recovery', '--recover-worker', '--reconcile-only'}]
+        cycle_round = recovery['round'] - recovery.get('cycle_started_round', 0)
+        pending = cycle_round < MAX_CONTINUATION_RUNS
+        command_args = [value for value in worker_args if value not in {
+            '--resume-recovery', '--recover-worker', '--reconcile-only', '--restart-task', '--rebuild-request'}]
         reconcile_args = list(command_args)
         if not interactive:
             if '--mode' in reconcile_args:
@@ -300,11 +404,14 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                   'worker_restarts': state['restarts'], 'last_worker_report': report,
                   'requires_user_action': False, 'business_complete': False,
                   'recovery_path': str(root / 'chatgpt_recovery.json'),
-                  'recommended_next_action': 'resume_recovery_after_cooldown' if pending else 'repair_service_then_collect_original',
-                  'continuation': {'round': recovery['round'], 'remaining_rounds': max(0, MAX_CONTINUATION_RUNS - recovery['round']),
+                  'recommended_next_action': 'resume_recovery_after_cooldown' if pending else 'upstream_takeover',
+                  'continuation': {'round': recovery['round'], 'remaining_rounds': max(0, MAX_CONTINUATION_RUNS - cycle_round),
                      'not_before': time.time() + 30,
                      'argv': [sys.executable, str(script), *command_args, '--resume-recovery'],
-                     'reconcile_argv': [sys.executable, str(script), *reconcile_args, '--reconcile-only']}}
+                     'reconcile_argv': [sys.executable, str(script), *reconcile_args, '--reconcile-only'],
+                     'takeover_argv': [sys.executable, str(script), *command_args, '--restart-task']}}
+        if not interactive:
+            result['continuation']['rebuild_argv'] = [sys.executable, str(script), *command_args, '--restart-task', '--rebuild-request']
         recovery.update(status=result['status'], result=result, not_before=result['continuation']['not_before'])
         atomic_json(root / 'chatgpt_recovery.json', recovery)
         state.update(status=result['status'], reason=reason, result=result)
@@ -401,6 +508,7 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                         eof_at = time.monotonic()
                         worker_input.put(None)
                     heartbeat = read_state(root / 'chatgpt_heartbeat.json')
+                    owner = read_state(root / 'chatgpt_browser_owner.json')
                     if heartbeat.get('phase') == 'download':
                         state['retain_live_target'] = True
                     if heartbeat.get('phase') == 'waiting_input' and (not interactive or not reply_ready):
@@ -413,10 +521,26 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                         heartbeat = {**heartbeat, 'phase': 'command_unacknowledged',
                                      'last_progress_at': max(pending_commands[0], float(heartbeat.get('last_progress_at', 0)))}
                     now = time.time()
+                    control = read_state(root / 'chatgpt_supervisor_control.json')
+                    takeover = (control.get('action') == 'restart' and control.get('supervisor_pid') == os.getpid()
+                        and control.get('started_at') == state['started_at'] and control.get('id') != state.get('last_control_id'))
+                    if takeover:
+                        state['last_control_id'] = control['id']
+                        recovery.setdefault('takeovers', []).append({**control, 'at': now})
+                        atomic_json(root / 'chatgpt_recovery.json', recovery)
+                        if control.get('rebuild_request') and not interactive and '--rebuild-request' not in worker_args:
+                            worker_args.append('--rebuild-request')
+                        active_started = time.monotonic()
+                        state['restart_cycle_start'] = state['restarts']
+                        record('upstream_takeover', request_id=control['id'])
                     idle = interactive and heartbeat.get('phase') == 'waiting_input' and heartbeat.get('pid') == child.pid
                     if idle:
                         active_started = time.monotonic()
-                    if time.monotonic() - active_started >= limits.task_timeout:
+                    if takeover:
+                        reason = 'upstream_restart'
+                    elif browser_exited(owner, child.pid):
+                        reason = 'browser_process_exited'
+                    elif time.monotonic() - active_started >= limits.task_timeout:
                         reason = 'task_deadline_exceeded'
                     elif eof:
                         if time.monotonic() - eof_at >= 10:
@@ -424,7 +548,7 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                     else:
                         reason = takeover_reason(heartbeat, now=now, started=launched, limits=limits)
                     if reason:
-                        stop_worker(child)
+                        stop_worker(child, root, preserve_browser=reason != 'browser_process_exited')
                         break
                     if time.monotonic() >= next_report:
                         record('worker_observed', phase=heartbeat.get('phase', 'starting'),
@@ -448,6 +572,10 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                         events.put((event, value))
                         break
             report = read_state(output_path) if not interactive else read_state(session_path)
+            # The worker may notice the disconnect, finish cleanup and exit before our next
+            # poll. Its pre-cleanup observation still prevents an unwanted browser relaunch.
+            if reason is None and browser_exited(read_state(root / 'chatgpt_browser_owner.json'), child.pid):
+                reason = 'browser_process_exited'
             last_report = report
             recovered = None
             if not interactive and (reason or child.returncode != 0 or not result_complete(report, interactive=False)):
@@ -457,6 +585,10 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                     report = recovered
                     record('artifacts_reconciled', preceding_reason=reason, worker_exit_code=child.returncode)
             succeeded = bool(recovered) or (child.returncode == 0 and reason is None and result_complete(report, interactive=interactive))
+            if child.returncode == 130 and reason is None and not succeeded:
+                return interrupted('worker_cancelled')
+            if interactive and reason == 'browser_process_exited' and not succeeded:
+                return interrupted(reason)
             if succeeded or eof or (reason is None and terminal_failure(report)):
                 state.update(status='complete' if succeeded else 'needs_ops')
                 if not interactive:
@@ -472,10 +604,13 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                 if not interactive or (not succeeded and not eof):
                     output.json(result)
                 return 0 if succeeded else (child.returncode if child.returncode > 0 else 2)
-            if reason == 'task_deadline_exceeded' or state['restarts'] >= limits.max_worker_restarts:
+            if reason == 'task_deadline_exceeded' or (reason != 'upstream_restart'
+                    and state['restarts'] - state.get('restart_cycle_start', 0) >= limits.max_worker_restarts):
                 return exhausted(reason or 'worker_restart_budget_exhausted', report)
             state['restarts'] += 1
             state['retain_live_target'] = bool(state.get('retain_live_target') or heartbeat.get('phase') == 'download')
+            if reason == 'browser_process_exited':
+                state['retain_live_target'] = False
             record('restart_worker', reason=reason or 'worker_exited', exit_code=child.returncode)
             if interactive:
                 output.json({'event': 'worker_restarting', 'ok': False,
@@ -483,13 +618,11 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
             # Bounded backoff counts toward the same task deadline.
             time.sleep(min(5 * state['restarts'], max(0, limits.task_timeout - (time.monotonic() - active_started))))
     except (KeyboardInterrupt, BrokenPipeError):
-        state.update(status='interrupted')
-        record('supervisor_interrupted')
-        return 130
+        return interrupted('cancelled')
     except Exception as error:
         return exhausted('unexpected_supervisor_error', {'error_type': type(error).__name__, 'reason': str(error)})
     finally:
         if child is not None:
-            stop_worker(child)
+            stop_worker(child, root, preserve_browser=state['status'] not in {'interrupted', 'complete'})
         output.close()
         diagnostics.close()

@@ -217,6 +217,7 @@ class BrowserSession:
         allow_launch: bool = True,
         verify_agent_browser: bool = True,
         require_initialized_profile: bool = True,
+        owner_path: Path | None = None,
     ) -> None:
         self.config = config or configured_browser(scope=scope)
         self.scope = str(scope or self.config.get("scope") or "donald-browser")
@@ -228,7 +229,9 @@ class BrowserSession:
         self.allow_launch = allow_launch
         self.verify_agent_browser = verify_agent_browser
         self.require_initialized_profile = require_initialized_profile
+        self.owner_path = owner_path
         self.run_id = f"{os.getpid()}:{uuid.uuid4().hex}"
+        self.owner_pid = os.getpid()
         self.transport_session = _safe_session(session, self.run_id)
         user_data_dir = str(Path(self.config["chrome"]["cdp_user_data_dir"]).expanduser().resolve())
         key = hashlib.sha1(f"{self.port}:{user_data_dir}".encode("utf-8")).hexdigest()[:16]
@@ -241,11 +244,25 @@ class BrowserSession:
         self.previous_frontmost_pid: int | None = None
         self.launched = False
         self.browser_pid: int | None = None
+        self.browser_exited_before_cleanup = False
         self.keep_open_for_human = False
         self.opened = False
         self.cleanup: dict[str, Any] = {"status": "not_opened"}
         self._atexit_callback: Any | None = None
         self._transport_executable = ""
+
+    def _save_owner(self, status: str = 'open') -> None:
+        if getattr(self, 'owner_path', None) is None:
+            return
+        _write_state(self.owner_path, {
+            'status': status, 'pid': self.owner_pid, 'run_id': self.run_id,
+            'binding_scope': self.config.get('scope', self.scope), 'scope': self.scope,
+            'session': self.session, 'port': self.port, 'state_path': str(self.state_path),
+            'browser_pid': self.browser_pid, 'launched': self.launched,
+            'browser_exited_before_cleanup': self.browser_exited_before_cleanup,
+            'target_id': self.target_id, 'owned_target_ids': sorted(self.owned_target_ids),
+            'transport_session': self.transport_session, 'transport_executable': self._transport_executable,
+        })
 
     def _navigate(self, target_id: str, url: str) -> None:
         with _preserve_foreground(self.port):
@@ -360,6 +377,7 @@ class BrowserSession:
             )
         self.launched = self.launched or bool(startup.get("launched"))
         self.browser_pid = startup.get("pid")
+        self._save_owner('starting')
         previous_runtime_pid = state.get("browser_pid")
         if previous_runtime_pid and self.browser_pid and int(previous_runtime_pid) != int(self.browser_pid):
             state["launched_by_runtime"] = False
@@ -392,6 +410,7 @@ class BrowserSession:
             }
         )
         _write_state(self.state_path, state)
+        self._save_owner()
 
     def open(self) -> "BrowserSession":
         if self.opened:
@@ -410,7 +429,7 @@ class BrowserSession:
                                 or not isinstance(error.__cause__, (ConnectionError, urllib.error.URLError))):
                             raise
                         time.sleep(0.5)
-            except Exception:
+            except BaseException:
                 self._cleanup_failed_open()
                 raise
         self.opened = True
@@ -419,6 +438,9 @@ class BrowserSession:
         return self
 
     def _cleanup_failed_open(self) -> None:
+        browser_pid = getattr(self, 'browser_pid', None)
+        self.browser_exited_before_cleanup = bool(browser_pid and not process_is_alive(browser_pid))
+        self._save_owner('closing')
         try:
             self._release_transport()
         except (ProfileConfigError, OSError, subprocess.SubprocessError):
@@ -472,7 +494,16 @@ class BrowserSession:
         if self._atexit_callback is not None:
             atexit.unregister(self._atexit_callback)
             self._atexit_callback = None
+        if preserve is None and self.owner_path is not None:
+            try:
+                request = json.loads((self.owner_path.parent / 'chatgpt_worker_stop.json').read_text())
+                if request.get('pid') == self.owner_pid:
+                    preserve = bool(request.get('preserve_browser'))
+            except (OSError, ValueError):
+                pass
         preserve = self.keep_open_for_human if preserve is None else preserve
+        self.browser_exited_before_cleanup = bool(self.browser_pid and not process_is_alive(self.browser_pid))
+        self._save_owner('closing')
         errors: list[str] = []
         try:
             self._release_transport()
@@ -537,6 +568,7 @@ class BrowserSession:
                         "scope": self.scope,
                         "session": self.session,
                         "retained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "run_id": self.run_id,
                     }
                 )
             state["retained_targets"] = retained
@@ -563,6 +595,7 @@ class BrowserSession:
             "browser": browser_cleanup,
             "errors": errors,
         }
+        self._save_owner('preserved' if preserve else ('cleanup_failed' if errors else 'closed'))
         return self.cleanup
 
     def __enter__(self) -> "BrowserSession":
@@ -570,3 +603,40 @@ class BrowserSession:
 
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
         self.close()
+
+
+def cleanup_stopped_browser(owner_path: Path, worker_pid: int, *, preserve: bool) -> dict[str, Any]:
+    """Release only the stopped worker's recorded browser ownership; never discover arbitrary tabs."""
+    try:
+        owner = json.loads(owner_path.read_text(encoding='utf-8'))
+        if owner.get('pid') != worker_pid or process_is_alive(worker_pid):
+            return {'status': 'not_stopped_owner'}
+        if owner.get('status') == 'closed':
+            return {'status': 'already_cleaned'}
+        session = BrowserSession(session=owner['session'], scope=owner['scope'], port=int(owner['port']),
+                                 config=configured_browser(scope=owner['binding_scope']),
+                                 lock_timeout=5, owner_path=owner_path)
+        if session.state_path.resolve() != Path(owner['state_path']).resolve():
+            return {'status': 'binding_changed'}
+        session.run_id, session.owner_pid = owner['run_id'], worker_pid
+        session.browser_pid, session.launched = owner.get('browser_pid'), bool(owner.get('launched'))
+        session.target_id = owner.get('target_id') or ''
+        session.owned_target_ids = set(owner.get('owned_target_ids') or [])
+        session.transport_session = owner.get('transport_session') or session.transport_session
+        session._transport_executable = owner.get('transport_executable') or ''
+        with _file_lock(session.lock_path, 5):
+            state = _read_state(session.state_path)
+            other_targets = {item.get('target_id') for item in state['active_runs'] if item.get('run_id') != session.run_id}
+            session.owned_target_ids -= other_targets
+            if session.target_id in other_targets:
+                session.target_id = ''
+            # Startup can be interrupted after Chrome is launched but before run registration.
+            if session.launched and state.get('browser_pid') in (None, session.browser_pid):
+                state.update(launched_by_runtime=True, browser_pid=session.browser_pid)
+            _write_state(session.state_path, state)
+        session.opened = True
+        return session.close(preserve=preserve)
+    except FileNotFoundError:
+        return {'status': 'no_browser_owner'}
+    except (OSError, ValueError, KeyError, TypeError, ProfileConfigError, subprocess.SubprocessError) as error:
+        return {'status': 'error', 'error_type': type(error).__name__, 'reason': str(error)}

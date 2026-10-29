@@ -34,8 +34,11 @@ Session files record the conversation URL, attempts, resume state, outputs, and 
 `compiled_model_reference_map` audit fields.
 They also record `submission_committed` at the submit boundary plus the latest `page_recovery` and
 accumulated `page_recoveries` evidence. Before that boundary, recovery replays the whole composer
-setup and reference upload. After that boundary, recovery is read-only with respect to submission:
-it may reopen the saved conversation to observe or collect, but it must never send the prompt again.
+setup and reference upload. After that boundary, recovery first observes/collects the original.
+An exhausted original lookup can archive that request and submit a linked replacement. The active
+session records `request_id`, `replacement_of`, `request_rebuild_count`, and `request_history`;
+`request-history/` preserves old sessions, counters, run snapshots, and replacement traces. Generated
+filenames include the new request ID, so old files are not overwritten.
 The run summary records request mode, variant results, image paths, status, and the same reference
 audit fields so numbering can be checked against local inputs without exposing those identifiers to
 the model. Each fresh upload observation records `upload_sequence`, `order_verified`, and
@@ -159,9 +162,11 @@ owns internal retries and one outer recovery cycle:
 | Evidence | Automatic action |
 | --- | --- |
 | Confirmed unsubmitted page failure | Retry the same job once after internal recovery. |
-| Unknown/committed submit or pending download | Collect the original request once; never replay Send. |
+| Unknown/committed submit or pending download | Collect the original before considering any replacement. |
 | Paused account | Wait through one cooldown, then check the recorded owner's health in a separate tab without executing its prompt. |
 | Original target redirected home | Inspect post-dispatch history, then a unique exact-prompt sidebar control including role=button without href. Verify the original main user turn, baseline, saved turn key, and owned target before collecting or scoped Retry, even without a canonical URL. |
+| Original lookup exhausted; no live generation or loaded output | Archive the old session and rebuild the same inputs as a linked request, up to two automatic replacements. A cached history control alone does not prove recovery. |
+| Current response has completed gallery placeholders but no loaded output | Enter `asset_hydration`; after 30 seconds reload the same durable conversation, up to twice. Retain `pending_asset_recovery` across workers. Unloaded temporary galleries get 90 seconds of observation without reload. Exhaustion can enter linked replacement. |
 | Fresh login/verification gate | Preserve the request and request human completion; do not click or reload the challenge. |
 | Explicit generation error | Apply the original response's bounded Retry automatically; report a terminal failure when recovery is exhausted. |
 
@@ -175,8 +180,10 @@ including every selected variant. Empty, partial, and failed results exit nonzer
 result after the outer recovery sets `automatic_recovery_exhausted=true`; stdout and session both
 disable blind caller resubmission while preserving the supervisor's continuation. Health checks
 and upload-only preparation have their own success criteria and do not require generated images.
-Standalone `health-check` never sends a prompt or modifies the saved request session. Unavailable or
-ambiguous original-conversation identity never authorizes a replacement submission.
+Standalone `health-check` never sends a prompt or modifies the saved request session. Uncertain
+submission requires bounded original lookup, not permanent prohibition on recovery. No replacement
+is allowed while a generation, loaded output, or another active owner remains. Complete local
+reference inputs are required; lost conversation-only references must be supplied before rebuilding.
 For exhausted unsubmitted preparation, stdout and session both retain the consumed recovery cycle
 and `recommended_next_action=repair_environment_then_resume_unsubmitted_job`, with `retryable=false`.
 The supervisor may replay confirmed-unsubmitted preparation within its bounded budget. Once
@@ -191,17 +198,36 @@ The independent supervisor writes `chatgpt_recovery.json` when ordinary failures
   are saved before launch and ordinary reinvocation cannot reset them. Response Retry counts are
   separately persisted before clicking and never reset by a worker/run restart.
 - `recovery_blocked`: the retry cap is spent, not a human-verification classification. Keep the
-  task, original target, and logs. `continuation.reconcile_argv` is a bounded `collect-current
+  task, original target, and logs. Upstream can execute `continuation.takeover_argv` to start another
+  bounded cycle, or `continuation.rebuild_argv` to collect first and permit one additional linked
+  replacement. These actions need no new user approval within the authorized task. The checkpoint
+  preserves cumulative rounds and takeover history. `continuation.reconcile_argv` is a bounded `collect-current
   --reconcile-only` invocation that cannot Send or click response Retry. Use it when new service
   or original-output evidence justifies collection, rather than looping on unchanged failure.
 - `needs_ops`: a real human/input/runtime permission obstacle. A visible verification gate at the
   run deadline also retains this handoff instead of scheduling another automatic retry.
 
 A checkpoint does not itself schedule a wakeup or guarantee that the upstream service will recover.
-Do not claim business completion until the requested original outputs are downloaded and checked.
+Do not claim business completion until all requested outputs are downloaded and checked.
+`--restart-task` delivers a request to a live supervisor through `chatgpt_supervisor_control.json`,
+bound to its PID and start timestamp. The supervisor stops/reaps its current worker before another
+launch. `recovery_requested` acknowledges that request and has `business_complete=false`; monitor
+the existing supervisor for completion. With no live supervisor it starts a bounded recovery cycle.
+`--rebuild-request` implies takeover and permits one extra replacement per supervisor run after
+original-result collection. Each replacement archives old counters; it does not erase failed attempts.
+`--reconcile-only` cannot be combined with either takeover/rebuild option.
+
+`interrupted` with `cancelled` or `worker_cancelled` is a stop condition,
+with `automatic_resume_allowed=false`. It cannot become an automatic continuation. Only an explicit
+resume may restart it. A disappeared browser during an image task is instead a bounded recovery
+condition on the same binding. `chatgpt_worker_stop.json` distinguishes planned takeover from cancellation;
+`chatgpt_browser_owner.json` pins worker/run, browser PID, binding, and owned targets, while
+`chatgpt_browser_cleanup.json` records parent cleanup after the worker exits. Cleanup preserves
+other active/retained jobs and never closes an unverified Chrome process.
 
 Repeated pre-submit recovery creates a fresh background target on the same binding before closing
-the old owned target. Committed/unknown submissions and dispatch evidence block that reset.
+the old owned target. Committed/unknown submissions require original lookup and archival before
+entering the separate linked-replacement path.
 Upload observations include `pending_controls` and `attachment_details` to distinguish an
 identified pending reference card from an unscoped busy control. All visible pending controls
 continue to block submission; the diagnostic fields do not relax upload or ordering checks.

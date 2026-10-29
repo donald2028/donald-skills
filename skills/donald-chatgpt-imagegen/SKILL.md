@@ -18,14 +18,17 @@ recovery. On a recoverable error or timeout, immediately use the runner's recove
 without asking whether to retry, collect, resume, or restart the worker. This includes inspecting
 saved state, reconnecting the saved browser binding, reopening the original durable conversation,
 retrying confirmed-unsubmitted preparation, the original failed response's bounded Retry action,
-and downloading existing candidates. Use the normal supervised entrypoint; never pass `--worker`
-directly or disable supervision to recover. Keep the same job, inputs, browser binding, and budgets.
-Committed or uncertain submissions recover by collecting the original request, never a duplicate Send.
+and downloading existing candidates. Both the calling agent and the runner may restart failed
+workers/pages and rebuild an unusable request within this authorization. Use the normal supervised
+entrypoint; never pass `--worker` directly or disable supervision. Keep the task inputs and browser
+binding. Collect committed/uncertain requests first; if bounded lookup proves the original is
+unreachable, preserve its record and create a linked replacement as described below.
 
 Keep monitoring the running command through its final result. A progress update may describe
 recovery but must not end the task with “shall I retry?” or a pending approval question. An exhausted
 worker/run is not the end of the business task: consume the saved continuation below automatically,
-without resetting response Retry counts or creating another job. User action is needed only for a concrete remaining requirement, such as
+without discarding request history. A per-run deadline or saved submission marker does not end the
+business task. User action is needed only for a concrete remaining requirement, such as
 login, a human challenge, a new Profile choice, or missing input. If the host runtime actually
 blocks a tool call on its permission policy, report that exact action and block separately; skill
 instructions cannot bypass a runtime approval requirement.
@@ -182,8 +185,8 @@ ChatGPT generation failures twice by default (`--max-failure-retries`), and auth
 downloads four times. Keep those bounded defaults enabled for normal runs.
 
 Each worker attempt also owns one outer recovery cycle. A confirmed unsubmitted failure retries the same
-job; an unknown or committed submission switches to collection of the original request. It never
-replays Send for either state. It waits through one queue cooldown (up to five minutes), then
+job; an unknown or committed submission switches to collection of the original request before
+considering a linked replacement. It waits through one queue cooldown (up to five minutes), then
 checks the paused task's account health in a separate tab. Recorded verification owners let later
 jobs perform that check without executing the owners' prompts. Transient health-page errors get
 bounded retries and backoff; a visible human gate stops those automatic clicks and reloads.
@@ -191,8 +194,8 @@ bounded retries and backoff; a visible human gate stops those automatic clicks a
 If the original target redirects to the home page, the runner waits for page loading to settle and
 examines that target's navigation history. It may recover a canonical URL only from post-dispatch
 history and after verifying the submitted prompt and user-turn baseline in a separate tab. It
-preserves ambiguous or unavailable requests rather than sending again. On the same owned target,
-it also opens a unique sidebar history control whose full accessible label matches the submitted
+preserves the original lookup evidence. On the same owned target, it also opens a unique sidebar
+history control whose full accessible label matches the submitted
 prompt, including `role=button` entries without an href. It then verifies the full prompt, the
 post-dispatch user-turn baseline, and any saved turn key in the main conversation. That verified
 live turn can be collected and its scoped response Retry used even while the URL remains home or
@@ -205,10 +208,21 @@ A real login/verification gate requires the user to complete it.
 Submit, follow-up, and collection exit successfully only after all requested images are downloaded.
 An empty collection remains unresolved and must retain the original request and continuation.
 For an unrecoverable original conversation, preserve the job and its commit state. An explicit
-generation failure uses the original response's bounded automatic Retry path. If recovery is
-exhausted, continue observation/collection through the saved checkpoint; do not turn it into an
-approval wait or reset its response Retry budget with a replacement job. `policy_refused` and account restrictions remain terminal for
-that request.
+generation failure uses the original response's bounded automatic Retry path. A history entry that
+opens home without the original user turn is an unsuccessful lookup, even if its label matches.
+After bounded lookup fails, the runner archives the old session and creates a new request identity,
+preserving prompt, references, old Retry counts, lineage, and distinct image/trace paths. It permits
+two automatic replacements per task; upstream may authorize one more per takeover using the
+existing generation authorization. Rebuilding requires complete local inputs; a follow-up relying
+on unavailable conversation references needs those files supplied first. `policy_refused` and
+account restrictions remain terminal for that request.
+
+A current-response gallery with placeholders, idle composer, no Stop, and no loaded generated
+image is `asset_hydration`, not active generation. After 30 seconds the runner may reload that same
+verified canonical conversation, at most twice across workers. It preserves loaded image/Blob
+assets and never reloads a temporary URL. If hydration still fails (or an unreloadable temporary
+gallery stays empty for 90 seconds), it can rebuild a linked request after checking existing results.
+Only validated native image bytes count as success; Edit/Share controls and placeholders do not.
 
 The normal invocation handles these transitions without separate recovery commands from the
 caller. `collect-current` and `health-check` remain available for explicit recovery and diagnostics.
@@ -303,6 +317,15 @@ Before returning an interrupted/failed run, the supervisor checks the same manif
 stored hashes when present, and full PNG decoding are required. Valid saved outputs return success
 with `completion_source=verified_saved_artifacts`, even if the deadline interrupted the worker
 before its final stdout. A label alone, missing/corrupt files, or partial outputs cannot complete it.
+Task cancellation is separate from automatic takeover. SIGTERM/interrupt stops the owned worker,
+releases its recorded browser ownership, and closes the runtime-owned Chrome only when no other
+run or retained target needs it. If a worker must be killed before cleanup, the parent uses
+`chatgpt_browser_owner.json` to finish that same ownership cleanup. Planned recovery preserves the
+original live target. A browser process disappearing during an image run triggers bounded worker
+restart on the same binding; it alone is not evidence of user cancellation. SIGTERM/interrupt of
+the task or direct worker cancellation remains `interrupted`, with no automatic relaunch. Resume
+cancelled work only on explicit instruction. Ordinary service failures use the continuation below
+without another approval.
 Command and result forwarding stay outside the monitoring loop, including caller stdout/stderr.
 Unexpected worker output cannot count as success or disable the deadline. Unclassified worker
 failures consume the same restart budget; unexpected supervision errors stop the worker and save
@@ -326,13 +349,28 @@ The checkpoint counts these runs before launch; ordinary reinvocation cannot res
 response Retry counts survive every worker/run, including uncertain click timeouts. These are
 separate, observable recovery runs, not a silent extension of the original five-minute deadline.
 
-If those runs still cannot progress, `recovery_blocked` retains the unfinished business task and
-`continuation.reconcile_argv`. Once there is evidence that the service or original output changed,
-execute that command to inspect/collect the same original request with `--reconcile-only`. This
-mode cannot Send or click response Retry, and remains available after retry exhaustion. Do not
-poll it in a tight loop, label it a human gate, or claim the images exist before collection succeeds.
-A persistent upstream failure can still block completion; retained recovery is not proof of a
-completed image or a scheduled background wakeup.
+If those runs cannot progress, `recovery_blocked` means the automatic cycle is spent. The upstream
+agent owns the next decision; it may execute `continuation.takeover_argv` (`--restart-task`) to
+start another bounded cycle after diagnosing/repairing the failure, or `continuation.rebuild_argv`
+to collect first and permit one additional linked replacement. These are executable recovery
+actions under the existing authorization, not requests for another user approval. Total run and
+replacement history remain recorded. Do not repeat unchanged failures indefinitely.
+
+For late results, `continuation.reconcile_argv` uses `collect-current --reconcile-only`; it cannot
+Send, click response Retry, or rebuild. It remains available after exhaustion. A checkpoint itself
+does not schedule a wakeup or establish that an image exists.
+
+The same takeover entrypoint works while a supervisor is alive:
+
+```bash
+python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest>" --mode single-batch-submit --restart-task
+# Collect first, then allow one additional linked replacement if needed:
+python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest>" --mode single-batch-submit --rebuild-request
+```
+
+A live supervisor receives an ownership-scoped restart request and reaps its worker before
+launching the next. `recovery_requested` acknowledges control delivery, not image completion;
+continue monitoring the original command/status. An exited task gets a fresh bounded cycle.
 
 Inspect a running or exited job without opening a browser:
 
@@ -366,7 +404,8 @@ Page recovery is state-aware and bounded (three attempts by default):
   page-error Retry click before reloading. Chat is checked again after uploads and before submit;
 - before invoking the submit control, the session records `dispatch_started=true` and
   `submission_committed=unknown`; confirmed submission changes it to `true`. After dispatch,
-  recovery may only observe or collect the original conversation, never replay the prompt;
+  recovery first observes/collects that request; an unreachable original may then be archived and
+  replaced through the linked-request path above;
 - within the worker, time-based generation refresh is disabled by default; post-submit page
   recovery begins after three consecutive page/DOM heartbeat failures or an explicit browser
   error page. The separate supervisor can restart a worker that exceeds its progress deadline,

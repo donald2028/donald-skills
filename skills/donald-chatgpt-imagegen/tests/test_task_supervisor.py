@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,136 @@ from browser_runtime import process_is_alive
 
 
 class SupervisorTests(unittest.TestCase):
+    def supervisor_process(self):
+        script = self.root / 'parent.py'
+        script.write_text(textwrap.dedent(f'''\
+            import sys
+            from pathlib import Path
+            from types import SimpleNamespace
+            sys.path.insert(0, {str(Path(supervisor.__file__).parent)!r})
+            from task_supervisor import supervise
+            root = Path(__file__).parent
+            raise SystemExit(supervise(root/'worker.py', [], root, root/'session.json',
+                SimpleNamespace(stall_timeout=100, heartbeat_timeout=100, task_timeout=100, max_worker_restarts=2)))
+        '''))
+        parent = subprocess.Popen([sys.executable, '-B', str(script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: supervisor.stop_worker(parent))
+        import time
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (self.root / 'worker-ready').exists():
+            time.sleep(.05)
+        self.assertTrue((self.root / 'worker-ready').exists())
+        return parent
+
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX SIGTERM delivery')
+    def test_sigterm_cancels_parent_reaps_worker_and_blocks_automatic_relaunch(self):
+        self._assert_signal_cancels(signal.SIGTERM)
+
+    @unittest.skipUnless(hasattr(signal, 'SIGHUP'), 'POSIX terminal hangup')
+    def test_terminal_hangup_reaps_worker_and_blocks_automatic_relaunch(self):
+        self._assert_signal_cancels(signal.SIGHUP)
+
+    def _assert_signal_cancels(self, sig):
+        self.worker(f'''\
+            sys.path.insert(0, {str(Path(supervisor.__file__).parent)!r})
+            from task_supervisor import worker_signals, WorkerStopped
+            with worker_signals(root):
+                try:
+                    (root/'worker-ready').write_text('ready')
+                    while True:
+                        beat(progress=time.time())
+                        time.sleep(.03)
+                finally:
+                    stopped = sys.exc_info()[1]
+                    save('worker-cleaned.json', {{'stopped':isinstance(stopped, WorkerStopped),
+                                                'preserve_browser':stopped.preserve_browser}})
+        ''')
+        parent = self.supervisor_process()
+        parent.send_signal(sig)
+        self.assertEqual(parent.wait(timeout=8), 130)
+        state = supervisor.read_state(self.root/'chatgpt_supervisor.json')
+        self.assertEqual(state['status'], 'interrupted')
+        self.assertEqual(state['restarts'], 0)
+        self.assertFalse(process_is_alive(state['worker_pid']))
+        self.assertEqual(supervisor.read_state(self.root/'worker-cleaned.json'), {'stopped':True,'preserve_browser':False})
+        code, output, _ = self.run_worker()
+        self.assertEqual(code, 130)
+        self.assertEqual((self.root/'counter').read_text(), '1')
+
+    def test_exited_browser_restarts_image_worker_with_original_session(self):
+        browser = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(lambda: supervisor.stop_worker(browser))
+        self.worker(f'''\
+            if attempt > 1:
+                print(json.dumps({{'status':'downloaded','image_count':1}}))
+                sys.exit(0)
+            save('chatgpt_browser_owner.json', {{'status':'open','pid':os.getpid(),'browser_pid':{browser.pid}}})
+            (root/'worker-ready').write_text('ready')
+            while True:
+                beat(progress=time.time())
+                time.sleep(.03)
+        ''')
+        parent = self.supervisor_process()
+        browser.terminate(); browser.wait(timeout=5)
+        self.assertEqual(parent.wait(timeout=12), 0)
+        state = supervisor.read_state(self.root/'chatgpt_supervisor.json')
+        self.assertEqual(state['result']['status'], 'downloaded')
+        self.assertTrue(any(action.get('reason') == 'browser_process_exited' for action in state['actions']))
+        self.assertEqual((self.root/'counter').read_text(), '2')
+
+    def test_browser_exit_is_not_lost_when_worker_finishes_cleanup_before_parent_poll(self):
+        self.worker('''\
+            if attempt > 1:
+                print(json.dumps({'status':'downloaded','image_count':1}))
+                sys.exit(0)
+            save('chatgpt_browser_owner.json', {'status':'closed','pid':os.getpid(),
+                'browser_pid':99999999,'browser_exited_before_cleanup':True})
+            print(json.dumps({'status':'generation_failed','error_type':'network_error'}))
+            sys.exit(2)
+        ''')
+        code, output, state = self.run_worker()
+        self.assertEqual(code, 0)
+        self.assertEqual(state['result']['status'], 'downloaded')
+        self.assertEqual((self.root/'counter').read_text(), '2')
+
+    def test_upstream_can_take_over_a_live_supervisor_without_overlapping_workers(self):
+        self.worker('''\
+            if attempt > 1:
+                print(json.dumps({'status':'downloaded','image_count':1}))
+                sys.exit(0)
+            (root/'worker-ready').write_text('ready')
+            while True:
+                beat(progress=time.time())
+                time.sleep(.03)
+        ''')
+        parent = self.supervisor_process()
+        self.limits.restart_task = True
+        self.limits.manifest = self.root / 'different-job.json'
+        self.limits.manifest.write_text('{"prompt":"different task"}')
+        with self.assertRaisesRegex(ValueError, 'Recovery inputs changed'):
+            self.run_worker()
+        del self.limits.manifest
+        code, output, _ = self.run_worker()
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)['status'], 'recovery_requested')
+        self.assertEqual(parent.wait(timeout=12), 0)
+        self.assertEqual((self.root/'counter').read_text(), '2')
+
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX SIGTERM delivery')
+    def test_direct_worker_cancel_is_not_treated_as_a_retryable_crash(self):
+        self.worker(f'''\
+            sys.path.insert(0, {str(Path(supervisor.__file__).parent)!r})
+            from task_supervisor import worker_signals
+            import signal
+            with worker_signals(root):
+                os.kill(os.getpid(), signal.SIGTERM)
+            sys.exit(130)
+        ''')
+        code, output, state = self.run_worker()
+        self.assertEqual(code, 130)
+        self.assertEqual(state['result']['reason'], 'worker_cancelled')
+        self.assertEqual((self.root/'counter').read_text(), '1')
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -147,6 +278,21 @@ class SupervisorTests(unittest.TestCase):
         self.run_worker()
         self.run_worker()
         self.assertEqual((self.root / 'counter').read_text(), '1')
+
+    def test_upstream_takeover_after_cap_finishes_without_losing_prior_counters(self):
+        self.limits.max_worker_restarts = 0
+        self.worker('sys.exit(2)\n')
+        for round_number in range(3):
+            self.limits.resume_recovery = round_number > 0
+            self.run_worker()
+        self.limits.restart_task = True
+        self.worker("print(json.dumps({'status':'downloaded','image_count':1}))\n")
+        code, output, _ = self.run_worker()
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)['status'], 'downloaded')
+        checkpoint = supervisor.read_state(self.root/'chatgpt_recovery.json')
+        self.assertEqual(checkpoint['round'], 3)
+        self.assertEqual(checkpoint['takeovers'][0]['preceding_round'], 2)
 
     def test_changed_manifest_cannot_resume_the_original_checkpoint(self):
         self.limits.manifest = self.root / 'job.json'

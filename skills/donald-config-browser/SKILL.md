@@ -92,6 +92,13 @@ Every normal business runner uses `BrowserSession` for the same lifecycle:
    that its PID exited even if CDP stopped responding. Bounded shutdown may escalate from
    `Browser.close` to SIGTERM and SIGKILL only after rechecking that process's binding and identity.
 
+ChatGPT workers additionally persist a task-local `chatgpt_browser_owner.json`. Their supervisor
+uses that exact ownership to finish cleanup after a worker is forcibly terminated, and preserves
+the live target for a planned takeover. Cancellation releases the task; it must not be retried as
+a service crash. Text sessions stop on whole-browser exit; image tasks may restart on the same
+binding after an unexpected browser exit, while explicit task cancellation stops recovery.
+Cleanup never signals the user's ordinary Chrome or another browser binding.
+
 Only a recognized `needs_ops` state retains the owned target and browser for the operator. A later
 run reclaims that retained target instead of opening another page. Successful completion then
 performs the ordinary cleanup.

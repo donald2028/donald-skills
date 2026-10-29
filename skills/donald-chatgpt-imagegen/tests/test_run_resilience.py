@@ -406,7 +406,7 @@ class RunResilienceTests(unittest.TestCase):
                 mock.patch.object(runner, '_prepare_browser_lane'),
                 mock.patch.object(runner, '_validate_profile'),
                 mock.patch.object(runner, '_heartbeat_probe', return_value={'status': 'browser_startup'}),
-                mock.patch.object(runner, 'run_submit', side_effect=runner.OriginalConversationRequired('lost request')),
+                mock.patch.object(runner, 'run_submit', side_effect=runner.OriginalConversationRequired('rebuild inputs unavailable', rebuild_allowed=False)),
                 mock.patch.object(runner, 'run_collect_current', side_effect=runner.OriginalConversationRequired('lost request')),
                 mock.patch.object(runner, '_cleanup_agent_browser'),
                 contextlib.redirect_stdout(output),
@@ -414,7 +414,7 @@ class RunResilienceTests(unittest.TestCase):
                 self.assertEqual(runner.main(), 2)
             report = json.loads(output.getvalue())
             session = json.loads(runner._session_path(job).read_text())
-            self.assertEqual(report['status'], 'needs_ops')
+            self.assertEqual(report['status'], 'recovery_required')
             self.assertEqual(session['status'], report['status'])
             self.assertEqual(session['error_type'], 'original_conversation_required')
             self.assertTrue(session['submission_committed'])

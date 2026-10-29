@@ -65,6 +65,7 @@ class GenerationHealthTests(unittest.TestCase):
                     side_effect=page_health_states,
                 ) as health_check,
                 mock.patch.object(runner, "_image_inventory", return_value=[]),
+                mock.patch.object(runner, "_pending_gallery_state", return_value={}),
                 mock.patch.object(
                     runner,
                     "_generation_button_state",

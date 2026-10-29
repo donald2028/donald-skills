@@ -29,6 +29,55 @@ def _config(root: Path) -> dict[str, object]:
 
 
 class BrowserRuntimeTests(unittest.TestCase):
+    def test_atexit_cleanup_respects_a_planned_takeover_stop_request(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
+            session = self._open_session(temporary)
+            session.owner_path = Path(temporary)/'owner.json'
+            (Path(temporary)/'chatgpt_worker_stop.json').write_text(json.dumps(
+                {'pid':os.getpid(),'preserve_browser':True}))
+            with mock.patch.object(runtime, 'cdp_target', return_value={'id':'open'}), \
+                    mock.patch.object(runtime, 'close_background_page') as close_target, \
+                    mock.patch.object(runtime, 'close_cdp_browser') as close_browser:
+                result = session.close()
+            self.assertEqual(result['status'], 'kept_open_for_human')
+            self.assertNotIn(mock.call(9333,'owned-target'), close_target.call_args_list)
+            close_browser.assert_not_called()
+
+    def test_interrupt_during_open_rolls_back_instead_of_skipping_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
+            session = runtime.BrowserSession(session='interrupt', config=_config(Path(temporary)))
+            with mock.patch.object(session, '_open_locked', side_effect=KeyboardInterrupt), \
+                    mock.patch.object(session, '_cleanup_failed_open') as cleanup, self.assertRaises(KeyboardInterrupt):
+                session.open()
+            cleanup.assert_called_once()
+
+    def test_stopped_worker_cleanup_protects_other_runs_and_releases_only_its_ownership(self):
+        for another_run in (False, True):
+            with self.subTest(another_run=another_run), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
+                session = self._open_session(temporary)
+                session.owner_path = Path(temporary)/'owner.json'
+                session.owner_pid = 424242
+                session._save_owner()
+                state = json.loads(session.state_path.read_text())
+                state['active_runs'][0]['pid'] = 424242
+                if another_run:
+                    state['active_runs'].append({'run_id':'other','pid':os.getpid(),'target_id':'other-target'})
+                session.state_path.write_text(json.dumps(state))
+                with mock.patch.object(runtime, 'process_is_alive', side_effect=lambda pid:pid != 424242), \
+                        mock.patch.object(runtime, 'configured_browser', return_value=session.config), \
+                        mock.patch.object(runtime, 'cdp_target', return_value={'id':'open'}), \
+                        mock.patch.object(runtime, 'close_background_page') as close_target, \
+                        mock.patch.object(runtime, 'close_cdp_browser', return_value={'status':'closed'}) as close_browser:
+                    result = runtime.cleanup_stopped_browser(session.owner_path, 424242, preserve=False)
+                self.assertEqual(result['status'], 'closed')
+                self.assertEqual(close_browser.call_count, 0 if another_run else 1)
+                self.assertEqual({call.args[1] for call in close_target.call_args_list}, {'owned-target','attach-blank'})
+                remaining = json.loads(session.state_path.read_text())['active_runs']
+                self.assertEqual(len(remaining), 1 if another_run else 0)
+                session.opened = False
+                runtime.atexit.unregister(session._atexit_callback)
+
     def test_human_handoff_preserves_background_visibility_without_activation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = runtime.BrowserSession(session='handoff', config=_config(Path(temporary)))

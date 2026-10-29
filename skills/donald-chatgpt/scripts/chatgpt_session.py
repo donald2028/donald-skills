@@ -23,7 +23,7 @@ from urllib.parse import unquote, urlparse
 from browser_runtime import BrowserSession, process_is_alive
 from output_paths import resolve_tool_output_root
 from run_health import RunHeartbeat
-from task_supervisor import add_supervisor_arguments, supervise
+from task_supervisor import WorkerStopped, worker_signals, add_supervisor_arguments, supervise
 from chatgpt_page_health import (
     PAGE_ACCESS_STATE_JS, CURRENT_RESPONSE_ERROR_STATE_JS, CLICK_PAGE_ERROR_RETRY_JS,
     DEFAULT_PAGE_RECOVERY_ATTEMPTS, page_recovery_action, original_turn_script, original_history_script,
@@ -676,6 +676,7 @@ def main() -> int:
             raise ValueError("Resume the saved conversation without replacing its URL")
         config = configured_browser(scope=BINDING_SCOPE)
         browser = ChatBrowserSession(saved=saved, recover_worker=args.recover_worker, config=config, scope=OWNER_SCOPE,
+                                     owner_path=path.parent / 'chatgpt_browser_owner.json',
                                      session="donald-chatgpt", verify_agent_browser=False, url=chatgpt_url(
                                          saved.get('conversation_url') or args.url or 'https://chatgpt.com/'))
         browser.open()
@@ -691,10 +692,13 @@ def main() -> int:
               "session_path": str(args.resume) if args.resume else None})
         return 2
     finally:
+        stopped = sys.exc_info()[1]
         if health is not None:
             health.close(conversation.state['status'])
         if conversation is not None:
-            if conversation.state["status"] not in {"complete", "needs_ops"}:
+            if isinstance(stopped, WorkerStopped) and not stopped.preserve_browser:
+                conversation.state.update(status='interrupted', reason='cancelled')
+            elif conversation.state["status"] not in {"complete", "needs_ops"}:
                 conversation.state.update(status="needs_ops", reason="session_interrupted")
             conversation.state["pid"] = None
             try:
@@ -703,6 +707,8 @@ def main() -> int:
                 emit({"status": "needs_ops", "error": f"Could not save final session state: {error}"})
         if browser is not None:
             preserve = conversation is not None and conversation.state["status"] != "complete"
+            if isinstance(stopped, WorkerStopped):
+                preserve = stopped.preserve_browser
             cleanup = browser.close(preserve=preserve)
             if conversation is not None:
                 conversation.state["cleanup"] = cleanup
@@ -713,7 +719,9 @@ def main() -> int:
 def entrypoint() -> int:
     args = argument_parser().parse_args()
     if args.worker:
-        return main()
+        with worker_signals(new_session_path(args).parent):
+            return main()
+        return 130
     path = new_session_path(args)
     worker_args = [*sys.argv[1:], '--session-path', str(path)]
     return supervise(Path(__file__).resolve(), worker_args, path.parent, path, args, interactive=True)
