@@ -201,6 +201,25 @@ def sync_browser_runtime(*, check: bool) -> int:
     return 0
 
 
+def sync_chatgpt_supervisor(*, check: bool) -> int:
+    source_dir = REPO / 'skills/donald-chatgpt-imagegen/scripts'
+    target_dir = REPO / 'skills/donald-chatgpt/scripts'
+    changed = []
+    for filename in ('chatgpt_page_health.py', 'run_health.py', 'task_supervisor.py'):
+        source, target = source_dir / filename, target_dir / filename
+        if not target.is_file() or target.read_bytes() != source.read_bytes():
+            changed.append(target)
+            if not check:
+                target.write_bytes(source.read_bytes())
+    if check and changed:
+        print('Out of sync ChatGPT supervision (run npm run build):')
+        for path in changed:
+            print(f'  {path.relative_to(REPO)}')
+        return 1
+    print(f'ChatGPT supervision {"in sync" if check else "vendored"} ({len(changed)} file(s) changed).')
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="verify generated files without writing")
@@ -246,7 +265,7 @@ def main() -> int:
     status = sync_browser_runtime(check=args.check)
     if status:
         return status
-    return 0
+    return sync_chatgpt_supervisor(check=args.check)
 
 
 if __name__ == "__main__":

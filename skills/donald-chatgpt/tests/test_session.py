@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
+import io
+import queue
 import sys
 import tempfile
 import time
@@ -15,6 +18,89 @@ import chatgpt_session as session
 
 
 class SessionTests(unittest.TestCase):
+    def test_pending_loading_failure_reopens_original_without_retrying_or_sending(self):
+        self.conversation.state['pending'] = {'prompt': 'Question', 'baseline_ids': [],
+                                              'attachments': [], 'submission_committed': 'unknown'}
+        failure = {'messages': [], 'generating': False,
+                   'gate': {'kind': 'page_error', 'error_type': 'chatgpt_transient_page_error'}}
+        healthy = {**failure, 'gate': None}
+        connection = mock.Mock()
+        with mock.patch.object(self.conversation, 'evaluate', side_effect=[failure, failure, healthy]) as evaluate, \
+                mock.patch.object(self.conversation, 'page', return_value=contextlib.nullcontext(connection)), \
+                mock.patch.object(self.conversation, 'browser_command') as send, \
+                mock.patch.object(session.time, 'sleep'):
+            observed = self.conversation.capture()
+        self.assertIsNone(observed['gate'])
+        connection.call.assert_called_once_with('Page.navigate', {'url': 'https://chatgpt.com/c/example'})
+        self.assertTrue(all(call.args[0] == session.READ_SCRIPT for call in evaluate.call_args_list))
+        self.assertEqual(self.conversation.state['pending']['submission_committed'], 'unknown')
+        send.assert_not_called()
+
+    def test_pending_turn_resumes_after_verification_without_caller_capture_commands(self):
+        self.conversation.state['pending'] = {'prompt': 'Question', 'baseline_ids': [],
+            'attachments': [], 'submission_committed': 'unknown',
+            'recovery': {'settle_waited': True, 'verification_checks': 3, 'verification_started_at': time.time()}}
+        observed = {'messages': [{'id': 'user', 'role': 'user', 'text': 'Question'},
+                                {'id': 'answer', 'role': 'assistant', 'text': 'Done', 'html': '<p>Done</p>'}],
+                    'generating': False, 'continuation_required': False, 'gate': None}
+        requests = mock.Mock()
+        requests.get.side_effect = [queue.Empty, queue.Empty, queue.Empty, '{"op":"complete-turn"}', '{"op":"finish"}']
+        verification = {**observed, 'messages': observed['messages'][:1],
+                        'gate': {'kind': 'verification', 'error_type': 'verification_pending'}}
+        clock = iter(range(0, 100, 5))
+        health = mock.Mock()
+        with mock.patch.object(session.queue, 'Queue', return_value=requests), \
+                mock.patch.object(sys, 'stdin', io.StringIO('')), \
+                mock.patch.object(self.conversation, 'evaluate', side_effect=[verification, observed, observed, observed]) as read, \
+                mock.patch.object(session.time, 'monotonic', side_effect=lambda: next(clock)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(session.run_commands(self.conversation, health), 0)
+        self.assertGreaterEqual(read.call_count, 3)
+        self.assertIn('reply_ready', output.getvalue())
+        health.set_phase.assert_any_call('waiting_for_human')
+        self.assertIsNone(self.conversation.state['pending'])
+        self.assertEqual((self.path.parent / 'turns/0001.txt').read_text(), 'Done\n')
+
+    def test_verification_keeps_polling_and_its_deadline_survives_worker_resume(self):
+        observed = {'messages': [], 'generating': False,
+                    'gate': {'kind': 'verification', 'error_type': 'verification_pending'}}
+        self.conversation.state['recovery'] = {'settle_waited': True, 'verification_checks': 3,
+                                              'verification_started_at': 100}
+        self.conversation.human_wait_timeout = 10
+        with mock.patch.object(self.conversation, 'evaluate', return_value=observed), \
+                mock.patch.object(session.time, 'time', return_value=109):
+            self.conversation.capture()
+        self.assertEqual(self.conversation.state['status'], 'waiting_for_human')
+        resumed = session.Conversation(self.conversation.browser, self.path, json.loads(self.path.read_text()))
+        resumed.human_wait_timeout = 10
+        with mock.patch.object(resumed, 'evaluate', return_value=observed), \
+                mock.patch.object(session.time, 'time', return_value=111):
+            resumed.capture()
+        self.assertEqual(resumed.state['status'], 'needs_ops')
+        self.assertEqual(resumed.state['recovery']['verification_started_at'], 100)
+
+    def test_redirect_home_cannot_erase_pending_conversation_binding(self):
+        self.conversation.state['pending'] = {'submission_committed': 'unknown'}
+        original = self.conversation.state['conversation_url']
+        for url in ('https://chatgpt.com/', 'https://chatgpt.com/c/local-chatgpt%3Atest'):
+            with mock.patch.object(session, 'cdp_target', return_value={'url': url}):
+                self.conversation.persist()
+            self.assertEqual(self.conversation.state['conversation_url'], original)
+
+    def test_takeover_preserves_encoded_temporary_target_and_refuses_to_recreate_it(self):
+        browser = object.__new__(session.ChatBrowserSession)
+        browser.saved = {'target_id': 'original', 'pending': {'submission_committed': 'unknown'}}
+        browser.url = 'https://chatgpt.com/c/local-chatgpt%3Atest'
+        browser.port, browser.owned_target_ids, browser.recover_worker = 9241, set(), True
+        state = {'active_runs': [], 'retained_targets': []}
+        with mock.patch.object(session, 'cdp_target', return_value={'id': 'original'}), \
+                mock.patch.object(browser, '_navigate') as navigate:
+            self.assertEqual(browser._claim_target(state), 'original')
+        navigate.assert_not_called()
+        with mock.patch.object(session, 'cdp_target', return_value=None), \
+                self.assertRaisesRegex(session.ProfileConfigError, 'temporary conversation'):
+            browser._claim_target(state)
+
     def test_human_handoff_retains_the_target_without_activating_chrome(self):
         browser = self.conversation.browser
         browser.retain_target_for_human = mock.Mock()
@@ -23,6 +109,7 @@ class SessionTests(unittest.TestCase):
         browser.retain_target_for_human.assert_called_once_with('owned')
         browser.preserve_for_human.assert_not_called()
         self.assertEqual(self.conversation.state['status'], 'needs_ops')
+        self.assertTrue(self.conversation.state['handoff_requested'])
 
     def test_unexpected_foreground_change_restores_the_working_app_before_stopping(self):
         connection = mock.MagicMock()
@@ -155,6 +242,18 @@ class SessionTests(unittest.TestCase):
         probe.assert_not_called()
         self.assertEqual(self.conversation.state["pending"]["submission_committed"], "unknown")
 
+    def test_cleared_page_error_does_not_skip_original_failed_turn_probe(self):
+        observed = {'messages': [], 'generating': False, 'gate': None}
+        self.conversation.state['pending'] = {'prompt': 'Question', 'baseline_ids': [], 'attachments': [],
+            'user_message_id': 'missing', 'submission_committed': 'unknown',
+            'recovery': {'settle_waited': True, 'retry_started': True}}
+        with mock.patch.object(self.conversation, 'evaluate', return_value=observed), \
+                mock.patch.object(self.conversation, 'probe_conversation', return_value=None) as probe, \
+                mock.patch.object(self.conversation, 'browser_command') as send:
+            self.conversation.capture()
+        probe.assert_called_once()
+        send.assert_not_called()
+
     def test_previous_answer_cannot_complete_a_new_user_turn(self):
         self.conversation.state["pending"] = {"user_message_id": "new-user"}
         observed = {"generating": False, "continuation_required": False, "messages": [
@@ -182,6 +281,29 @@ class SessionTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("DONALD_CHATGPT_BROWSER_TEST") == "1",
                      "Opt in to a background local-page test using the shared Chrome binding")
 class LocalBrowserTests(unittest.TestCase):
+    def test_shared_loading_failure_detection_and_scoped_retry(self):
+        config = session.configured_browser(scope=session.BINDING_SCOPE)
+        with tempfile.TemporaryDirectory() as directory, session.BrowserSession(
+            session='chatgpt-page-health-test', scope='donald-chatgpt-local-test', config=config,
+            verify_agent_browser=False,
+        ) as browser:
+            conversation = session.Conversation(browser, Path(directory) / 'session.json',
+                                                {'conversation_url': 'https://chatgpt.com/c/example'})
+            html = '<main><div>Could not load this ChatGPT conversation<button id="retry">Try again</button></div></main>'
+            conversation.evaluate('document.body.innerHTML = ' + json.dumps(html))
+            observed = conversation.capture(recover=False)
+            self.assertEqual(observed['gate']['kind'], 'page_error')
+            self.assertEqual(observed['access']['crashReason'], 'chatgpt_transient_page_error')
+            conversation.evaluate("document.getElementById('retry').onclick = () => {document.body.dataset.retried = 'yes';"
+                                  "document.body.innerHTML = '<div contenteditable=\"true\" role=\"textbox\"></div>';}")
+            with mock.patch.object(session.time, 'sleep'):
+                self.assertIsNone(conversation.capture()['gate'])
+            self.assertEqual(conversation.evaluate('document.body.dataset.retried'), 'yes')
+            quoted = '<div data-chatgpt-search-unit-key="turn:0:user">Could not load this ChatGPT conversation<button>Try again</button></div>'
+            conversation.evaluate('document.body.innerHTML = ' + json.dumps(quoted))
+            self.assertIsNone(conversation.capture(recover=False)['gate'])
+            self.assertFalse(json.loads(conversation.evaluate(session.CLICK_PAGE_ERROR_RETRY_JS))['clicked'])
+
     def test_hidden_composer_file_transfers_and_grouped_replies(self):
         config = session.configured_browser(scope=session.BINDING_SCOPE)
         with tempfile.TemporaryDirectory() as directory, session.BrowserSession(

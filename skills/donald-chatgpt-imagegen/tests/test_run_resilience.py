@@ -28,6 +28,23 @@ class Clock:
 
 
 class RunResilienceTests(unittest.TestCase):
+    def test_readable_loading_error_interrupts_every_conversation_wait(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stderr(io.StringIO()):
+            health = RunHeartbeat(Path(temporary), lambda: {})
+            health.page = {'crashReason': 'chatgpt_transient_page_error',
+                           'transientPageErrorText': 'Could not load this ChatGPT conversation Try again'}
+            args = argparse.Namespace(_health=health)
+            with mock.patch.object(runner, '_page_text') as text, \
+                    mock.patch.object(runner, '_generation_button_state') as composer, \
+                    mock.patch.object(runner, '_conversation_message_counts') as history:
+                for wait in (runner._wait_until_idle, runner._wait_for_followup_composer, runner._wait_for_conversation_history):
+                    with self.subTest(wait=wait.__name__), self.assertRaises(runner.RecoverablePageError):
+                        wait(args, Path.cwd())
+            self.assertEqual(health.failures, 0)  # Readable DOM errors must not require three failed CDP reads.
+            text.assert_not_called()
+            composer.assert_not_called()
+            history.assert_not_called()
+
     def test_successful_collection_clears_current_failure_but_keeps_history(self):
         with tempfile.TemporaryDirectory() as temporary:
             job = {'job_name': 'recover', 'prompt_card': 'prompt.md', 'download_dir': temporary}

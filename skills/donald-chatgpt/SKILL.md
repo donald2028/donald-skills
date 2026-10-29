@@ -13,10 +13,28 @@ Resolve `SKILL_DIR` to this skill's directory. Examples use `python3`; use `pyth
 Windows. Browser helpers and the output-path resolver are bundled, so this skill does not need the
 image-generation skill installed.
 
+## Automatic Recovery Authorization
+
+Treat authorization to perform the user's ChatGPT task as authorization for its bounded recovery.
+On a recoverable error or timeout, immediately use the recovery path below without asking whether
+to retry, resume, or restart the worker. This includes inspecting saved state, reconnecting the
+saved browser binding, reopening the original durable conversation, collecting its reply/files,
+and retrying confirmed-unsubmitted preparation. Use the normal supervised entrypoint; never pass
+`--worker` directly or disable supervision to recover. Keep the same task, inputs, browser binding,
+and recovery/time budgets. A worker restart does not authorize replaying an uncertain Send.
+
+Keep the persistent process alive and consume its events while recovery runs. A progress update
+may describe recovery but must not end the task with “shall I retry?” or a pending approval question.
+When the budget is exhausted, return the saved failure and concrete obstacle; do not wait for
+permission to reset the budget or create an unbounded caller loop. Ask for user action only when
+the remaining step needs it, such as login, a human challenge, a new Profile choice, or missing input.
+If the host runtime actually blocks a tool call on its permission policy, report that exact action
+and block separately; skill instructions cannot bypass a runtime approval requirement.
+
 ## Shared Browser And Login
 
 - **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` only for first-time setup or browser-binding
-  repair. First confirm its availability in the runtime's skill catalog without invoking it. If it
+  repair. Only when setup/repair is needed, confirm its availability in the runtime's skill catalog. If it
   is missing, ask permission to install it into the same skill scope and agent target; for Skills
   CLI use `npx skills add donald2028/donald-skills --skill donald-config-browser --yes`, adding
   `--global` only for a global install and preserving the agent target. After an approved install,
@@ -43,7 +61,8 @@ image-generation skill installed.
   stops that operation; do not resume a focus-stealing
   route. Let the normal browser verification flow and the bounded recovery below run first.
   Request user help only for a remaining obstacle that actually needs it, such as credentials,
-  MFA, an unsupported interactive challenge, or exhausted recovery. Activate only after the user
+  MFA, or an unsupported interactive challenge. Exhausted recovery by itself is a saved failure,
+  not a reason to ask whether to retry. Activate only after the user
   is ready; a detected error alone never authorizes bringing Chrome forward.
 
 ## Open Or Resume A Conversation
@@ -64,7 +83,8 @@ python3 "$SKILL_DIR/scripts/chatgpt_session.py" --resume "<absolute-path-to-sess
 ```
 
 The first JSON result contains `session_path`, `output_dir`, and `target_id`. Send subsequent JSON
-lines to this same process's stdin. Each command produces one JSON result. Read errors even when
+lines to this same process's stdin. Each command produces one JSON result; asynchronous
+`reply_ready` and `worker_restarting` events may arrive between results. Read errors even when
 the outer execution tool reports a nonzero exit. Never run a second helper against an active session.
 
 ```json
@@ -130,19 +150,52 @@ do not silently truncate the delivered result.
 `complete-turn` archives the current reply and clears the pending turn only when a matching user
 message, a following assistant answer, and two stable non-streaming observations are present. A
 visible error, refusal, interrupted answer, or Continue generating control needs an explicit
-assessment; do not mark it successful just because text exists. Poll at reasonable intervals,
-normally 5–10 seconds, and keep the user informed during longer work. A slow but healthy answer
-should be observed without resubmission; stop with saved partial evidence when the task's wait
-budget expires (default 10 minutes per turn, longer when the user requests a longer-running task).
+assessment; do not mark it successful just because text exists. The helper automatically captures
+pending replies about every five seconds and emits `reply_ready` after two stable observations.
+Read the saved answer and use `complete-turn` to archive it before a follow-up. Keep the user
+informed during longer work. The default active-turn budget is five minutes across worker restarts;
+pass a larger `--task-timeout` when the user requests a longer-running task.
+
+The normal command starts a separate supervisor process. A heartbeat missing for 60 seconds,
+three minutes without observable progress, or an unexpected worker exit triggers takeover, with
+at most two worker restarts and 5/10-second backoffs. `--heartbeat-timeout`, `--stall-timeout`, and
+`--max-worker-restarts` adjust those bounds. The supervisor remains responsive even when worker
+stdin or browser calls block. It preserves `session.json`, reopens only the original durable
+conversation when needed, and never replays an interrupted command. After `worker_restarting`,
+wait for the resumed session state and inspect it before issuing another command. Pending replies
+continue being collected automatically. Idle time waiting for the next instruction or a checked
+reply does not consume the active-turn budget.
+
+`chatgpt_supervisor.json` records takeover actions; `supervisor/<run>/` retains each worker's logs.
+Command and result forwarding cannot block the monitoring loop. A pending reply cannot be treated
+as idle without a checked `reply_ready` event, even if the worker reports `waiting_input`.
+Unclassified worker failures consume the same bounded restart budget; unexpected supervision
+errors stop the worker and return an explicit saved failure. Ordinary runtime errors must converge
+to a checked result or a bounded handoff.
+The independent observer writes `chatgpt_heartbeat.json` and `.jsonl`. Exhausted supervision returns
+`needs_ops` with saved paths. This supervises worker processes while the parent is running; closing
+the host or terminating the supervisor still requires an explicit `--resume`.
 
 ## Recover Before Requesting Help
+
+Text and image workflows use the same bundled `chatgpt_page_health.py` for page, verification,
+and current-response error detection, plus the same heartbeat and process supervisor. The build
+vendors these files from the image skill's canonical source so each skill installs independently.
+Readable errors such as `Could not load this ChatGPT conversation` are page failures even without
+an alert role, composer, or messages. Before Send, page recovery tries the scoped loading-page
+Retry once, then reopens the same URL within the shared three-attempt limit. A pending request
+only reopens its original durable URL; a temporary target is preserved. Page Retry must never be
+confused with a response Retry or a new Send.
 
 An error name alone does not establish that a human is needed. `capture` distinguishes an inline
 service error with a reply-specific Retry control from a verification page or widget. It runs a
 bounded recovery automatically and preserves its actions in the pending turn's `recovery` record:
 
 1. Give the original page a short background settling period. Let the browser's normal verification
-   scripts run; observe an actual verification page for a further 15 seconds before a handoff.
+   scripts run; after the initial 15 seconds, continue observing an actual verification page
+   within `--human-wait-timeout` (default 600 seconds) and the active-turn budget. Resume collection
+   if it clears. An actual human gate that remains at the deadline produces a handoff; restarting
+   a worker does not reset the saved verification deadline.
 2. For a confirmed failed reply, click Retry once only when it follows the matching pending user
    message, that message has no answer, and generation is inactive. Save the failure evidence and
    attempt budget before clicking. A timeout or an old/global Retry control is insufficient.
@@ -156,7 +209,8 @@ bounded recovery automatically and preserves its actions in the pending turn's `
 4. Only after these applicable attempts fail, or a remaining step needs user input, return
    `needs_ops` with the actual obstacle, attempted actions, saved evidence, and concrete next step.
 
-The budget survives `--resume`; do not reset it or start another caller retry loop. Do not create a
+The reply-recovery budget survives `--resume`; the supervisor owns its separate bounded process
+restart budget. Do not reset reply retries or start another caller retry loop. Do not create a
 fresh conversation, change accounts or Profiles, manipulate verification tokens, or activate Chrome
 to retry. An error disappearing alone does not prove the pending answer was recovered: verify its
 user message and reply. For an unsupported attachment reconstruction or ambiguous original turn,

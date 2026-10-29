@@ -28,6 +28,21 @@ from PIL import Image, PngImagePlugin  # noqa: E402
     "requires opt-in and a configured Chrome lane",
 )
 class BrowserDomTests(unittest.TestCase):
+    def test_conversation_loading_failure_without_alert_has_a_scoped_page_retry(self):
+        self.load_html('<main><div>Could not load this ChatGPT conversation<button id="retry">Try again</button></div></main>')
+        runner._eval_js(self.args, self.cwd, "document.getElementById('retry').onclick = () => {"
+                        "document.body.dataset.retried = 'yes'; document.body.innerHTML = '<div contenteditable=\"true\"></div>';}")
+        self.assertEqual(runner._heartbeat_probe(self.args, self.cwd)['crashReason'], 'chatgpt_transient_page_error')
+        self.assertEqual(runner._generation_page_health(self.args, self.cwd, None, '')['status'], 'page_error')
+        self.assertTrue(runner._click_page_error_retry(self.args, self.cwd))
+        self.assertEqual(runner._eval_js(self.args, self.cwd, 'document.body.dataset.retried'), 'yes')
+        self.assertFalse(runner._heartbeat_probe(self.args, self.cwd)['crashReason'])
+        self.load_html('<main><div data-message-author-role="user">Question</div>'
+                       '<aside role="alert">cloudflare_challenge<button>Retry</button></aside>'
+                       '<div contenteditable="true"></div></main>')
+        self.assertEqual(runner._heartbeat_probe(self.args, self.cwd)['responseError']['error_type'],
+                         'chatgpt_response_service_error')
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.browser = runner._FreshImageBrowserSession(

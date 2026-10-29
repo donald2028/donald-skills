@@ -111,8 +111,9 @@ Important terminal or recoverable states include:
   preserving failure attempts. The request remains unconfirmed (`terminal=false`); the result
   recommends `inspect_original_conversation_before_manual_recovery`, with `retryable=false` and
   `should_collect_current_first=false`, rather than asking the caller to repeat collection;
-- `generation_failed`: ChatGPT explicitly reported a generation-tool error; another submission
-  requires authorization. `error_type=chatgpt_submitted_turn_missing` instead means that the
+- `generation_failed`: ChatGPT explicitly reported a generation-tool error; use the original
+  response's bounded automatic Retry path without another approval. After recovery is exhausted,
+  report failure without waiting for permission to repeat it. `error_type=chatgpt_submitted_turn_missing` instead means that the
   submitted prompt could not be identified across two healthy heartbeats. It recommends
   `collect_current_first` and enters the outer collection recovery without clicking Retry or
   sending again; rendered counts do not prove that a request was lost. This status also includes
@@ -150,7 +151,10 @@ session URL; message counts alone must not authorize an unrelated conversation c
 ## Caller Recovery Contract
 
 A nonzero runner exit is not, by itself, a final workflow decision. Read the final JSON and saved
-commit state. The runner owns both the internal retries and one outer recovery cycle:
+commit state. Recovery within the authorized task and its existing budgets needs no additional
+user approval. Keep monitoring the normal supervised command until it returns a checked result
+or an explicit saved failure; do not replace its recovery with an approval question. Each worker
+owns internal retries and one outer recovery cycle:
 
 | Evidence | Automatic action |
 | --- | --- |
@@ -159,10 +163,11 @@ commit state. The runner owns both the internal retries and one outer recovery c
 | Paused account | Wait through one cooldown, then check the recorded owner's health in a separate tab without executing its prompt. |
 | Original target redirected home | Wait for loading, inspect that target's post-dispatch navigation history, and verify a unique candidate's prompt and turn baseline before using its canonical URL. |
 | Fresh login/verification gate | Preserve the request and request human completion; do not click or reload the challenge. |
-| Explicit terminal generation error | Report it; another submission requires authorization and a separate replacement job. |
+| Explicit generation error | Apply the original response's bounded Retry automatically; report a terminal failure when recovery is exhausted. |
 
-`automatic_recovery_actions` records the outer cycle; `automatic_recovery_exhausted=true` means the
-caller must not start another automatic retry loop. Return the remaining obstacle, commit state,
+`automatic_recovery_actions` records the worker's outer cycle. The default supervisor may restart
+a failed or stalled worker within its separate process/time budget, preserving commit state;
+`automatic_recovery_exhausted=true` never authorizes a caller retry loop. Return the remaining obstacle, commit state,
 internal retry history, conversation URL, retained artifact paths, and `recommended_next_action`.
 For submit, follow-up, and collect modes, exit code 0 requires all requested images to be downloaded,
 including every selected variant. Empty, partial, and failed results exit nonzero. An incomplete
@@ -173,8 +178,8 @@ Standalone `health-check` never sends a prompt or modifies the saved request ses
 ambiguous original-conversation identity never authorizes a replacement submission.
 For exhausted unsubmitted preparation, stdout and session both retain the consumed recovery cycle
 and `recommended_next_action=repair_environment_then_resume_unsubmitted_job`, with `retryable=false`.
-After a concrete repair, the original confirmed-unsubmitted manifest may resume through normal
-preparation; this result does not authorize an unchanged immediate retry loop.
+The supervisor may replay confirmed-unsubmitted preparation within its bounded budget. Once
+supervision is exhausted, repair the obstacle before explicitly resuming; do not add a caller loop.
 
 Repeated pre-submit recovery creates a fresh background target on the same binding before closing
 the old owned target. Committed/unknown submissions and dispatch evidence block that reset.
@@ -184,11 +189,45 @@ continue to block submission; the diagnostic fields do not relax upload or order
 
 ## Whole-run health and recovery
 
+The acceptance scope is ordinary runtime failures: network interruption, page loading errors,
+missing/stale controls, stalled generation, failed transfers, worker exceptions, and blocked command
+or result pipes. Each active task must converge to a checked result or an explicit saved failure.
+Unclassified worker failures share the bounded restart budget; an unexpected supervision error
+stops the owned worker and records `unexpected_supervisor_error`. A zero exit code with an invalid
+result is not completion. Login, verification, and account restrictions retain their human handoff.
+
+| Ordinary failure | Fallback |
+| --- | --- |
+| Page error while waiting for a composer/history | Interrupt the wait and run bounded page recovery. |
+| Browser call, upload, download, or generation stops progressing | Apply operation retries and the independent heartbeat/progress deadline; restart the worker within budget. |
+| Worker crashes or returns malformed/unexpected output | Preserve evidence, restart within budget, then return an explicit failure if unresolved. |
+| Command/result pipe blocks | Forward outside the monitoring loop; supervision and its deadlines continue. Full worker output stays in attempt logs. |
+| Pending reply is incorrectly reported as idle | Verify the saved pending state and `reply_ready` event before granting idle time. |
+| Recovery repeats without success | Consume the same restart/time budget, stop the worker, and return `needs_ops` with evidence and a recovery entry point. |
+
+`chatgpt_supervisor.json.result` retains the terminal result even when the caller is not reading
+stdout; the status command can retrieve it after the process exits.
+
+- Text and image workers use the same `chatgpt_page_health.py` classifiers, scoped page Retry,
+  and recovery policy. A readable loading-error page sets `page.crashReason` and interrupts
+  conversation waits even when `consecutive_page_failures=0`; it is not a verification gate.
+  The supervisor consumes this same classification, with a 30-second phase grace before takeover.
 - `chatgpt_heartbeat.json` is the latest atomic snapshot; `chatgpt_heartbeat.jsonl` is the event
   journal. Both cover browser startup, throttle waits, mode selection, upload, prompt insertion,
   submission, generation, download, manual verification, and terminal outcomes.
 - `--mode status` reads the heartbeat and session without controlling Chrome. It reports stopped
-  processes and stale observations separately from completed or paused tasks.
+  processes and stale observations separately from completed or paused tasks, and includes
+  `chatgpt_supervisor.json` as `supervisor`.
+- `chatgpt_supervisor.json` records the parent PID, restart count, log directory, and takeover
+  actions. Final results include `supervisor_path` and `worker_restarts`. Worker logs live under
+  `supervisor/<run>/` and survive later invocations. Defaults are a 60-second heartbeat deadline,
+  180-second progress stall, two restarts, and a 300-second total task budget. Process termination
+  never kills Chrome or replays an uncertain Send. Exhaustion returns `needs_ops`, the reason,
+  session/supervisor paths, and `last_worker_report`. The deadline includes retries and backoff.
+  The five-minute default targets ordinary requests: roughly one minute of preparation, two of
+  generation, and two of recovery as planning allowances under a single deadline. It is an
+  operating policy, not a measured service guarantee. Explicit long/multi-image jobs can increase
+  `--task-timeout` and `--timeout`; a rare slow success may otherwise be cut off by this policy.
 - `--mode health-check` uses a separate tab and returns `health_checked` after two healthy account
   checks five seconds apart, without uploads or submission. It clears only this job's verification
   pause and preserves its session, including unknown submission state. Remaining pause owners or
@@ -204,7 +243,8 @@ continue to block submission; the diagnostic fields do not relax upload or order
   retained target also requires the submitted prompt in a user turn beyond the saved baseline.
   Unfinished submissions without a durable URL retain their tab and browser; fresh jobs and health
   checks open separate targets so they cannot overwrite that recovery evidence.
-- `waiting_for_human` continues observation for at most 600 seconds. Two healthy checks five seconds
+- `waiting_for_human` continues observation within both its 600-second verification limit and the
+  remaining total task budget (300 seconds by default). Two healthy checks five seconds
   apart resume the same task. `needs_ops` means observation ended and human action/recovery remains.
   Resuming a saved verification first enters `checking_verification`; only a fresh challenge or
   login signal requests human attention while Chrome remains in the background. Checks during `readyState=loading`

@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+from chatgpt_page_health import page_failure
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -76,7 +77,7 @@ class RunHeartbeat:
                 'last_progress_at': self.progress_at, 'detail': self.detail,
                 'last_page_check_at': self.page_at, 'page': self.page,
                 'consecutive_page_failures': self.failures,
-                'recovery_required': self.failures >= 3 or bool(self.page.get('crashReason') or self.page.get('responseError')),
+                'recovery_required': bool(page_failure(self.page, self.failures, self.phase) or self.page.get('responseError')),
             }
             atomic_json(self.root / 'chatgpt_heartbeat.json', value)
             with (self.root / 'chatgpt_heartbeat.jsonl').open('a', encoding='utf-8') as handle:

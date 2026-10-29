@@ -9,7 +9,6 @@
     '[data-testid^="conversation-turn-"], [data-turn-key]'
   )]).filter(el => visible(el) && !el.closest('nav,aside,[data-sidebar-item]'));
   const messages = [];
-  let lastUserElement = null;
   for (const el of containers) {
     // Prefer the complete turn wrapper when both wrapper and role node exist.
     if (containers.some(parent => parent !== el && parent.contains(el))) continue;
@@ -23,7 +22,6 @@
         || /^(You said|你说|您说)/i.test(heading) ? 'user'
         : /^(ChatGPT said|ChatGPT 说|ChatGPT说|Assistant)/i.test(heading) ? 'assistant' : '');
     if (!['user', 'assistant'].includes(role)) continue;
-    if (role === 'user') lastUserElement = el;
     const body = role === 'user'
       ? el.querySelector('[data-testid="user-message"],[data-user-message-bubble],.user-message-bubble,.whitespace-pre-wrap') || roleNode || el
       : el.querySelector('[data-markdown-text-style="assistant-message"],.markdown,[data-message-content]') || roleNode || el;
@@ -47,31 +45,22 @@
   const buttons = [...document.querySelectorAll('button')].filter(visible);
   const label = el => [el.getAttribute('aria-label'), el.getAttribute('data-testid'), el.innerText]
     .filter(Boolean).join(' ');
-  const challenge = [...document.querySelectorAll('body *')].find(el =>
-    !el.childElementCount && visible(el)
-    && !el.closest('nav,aside:not([role=alert]),[data-chatgpt-search-unit-key],[data-message-author-role]')
-    && /cloudflare_challenge|verify you are human|checking your browser|验证您是人类|验证你是人类/i.test(el.innerText || '')
-  );
-  const challengeFrame = [...document.querySelectorAll('iframe')].find(el => visible(el)
-    && /challenges\.cloudflare\.com|challenge|turnstile/i.test(el.src + ' ' + el.title));
-  const serviceAlert = [...document.querySelectorAll('[role=alert]')].find(el => visible(el)
-    && /cloudflare_challenge|something went wrong|network error|failed to (?:fetch|load)|try again later|出了点问题|网络错误/i.test(el.innerText));
-  const retry = serviceAlert && [...serviceAlert.querySelectorAll('button')].find(el => visible(el)
-    && !el.disabled && /^(retry|try again|重试)$/i.test((el.innerText || el.getAttribute('aria-label') || '').trim()));
+  const access = JSON.parse(__PAGE_ACCESS_STATE__);
+  const response = (__CURRENT_RESPONSE_ERROR_STATE__)('');
+  const retry = response.retryControls[0];
   const lastUser = [...messages].reverse().find(message => message.role === 'user');
-  const retryForUser = retry && lastUserElement
-    && !!(lastUserElement.compareDocumentPosition(serviceAlert) & Node.DOCUMENT_POSITION_FOLLOWING)
-    ? lastUser?.id : '';
+  const retryForUser = retry ? lastUser?.id : '';
   globalThis.__donaldChatgptRetry = retryForUser ? {element: retry, userId: retryForUser} : null;
   let gate = null;
-  if (challengeFrame) {
-    gate = {kind: 'verification', error_type: 'verification_pending',
-            message: challengeFrame.title || 'Browser verification'};
-  } else if (serviceAlert) {
+  if (access.humanReason) {
+    gate = {kind: 'verification', error_type: access.humanReason === 'login_required' ? 'login_required' : 'verification_pending',
+            message: access.humanReason};
+  } else if (access.crashReason) {
+    gate = {kind: 'page_error', error_type: access.crashReason,
+            message: access.transientPageErrorText || access.crashReason};
+  } else if (response.errorSurfaceTexts.length || retry) {
     gate = {kind: 'service_error', error_type: 'transient_service_error',
-            message: serviceAlert.innerText.trim(), retry_for_user_id: retryForUser || ''};
-  } else if (challenge) {
-    gate = {kind: 'verification', error_type: 'verification_pending', message: challenge.innerText.trim()};
+            message: response.errorSurfaceTexts.join('\n'), retry_for_user_id: retryForUser || ''};
   }
   return {
     url: location.href,
@@ -82,6 +71,7 @@
     generating: buttons.some(el => /stop-(?:button|generating)|stop generating|stop streaming|停止生成|停止回答/i.test(label(el))),
     continuation_required: buttons.some(el => /continue generating|继续生成/i.test(label(el))),
     gate,
+    access,
     messages,
   };
 })()

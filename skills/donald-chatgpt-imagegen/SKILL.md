@@ -11,11 +11,30 @@ enough session evidence to resume or recover downloads without resubmitting the 
 Use `python3` to run the bundled scripts on macOS/Linux. On Windows use `python` (or `py -3`),
 substituting it for `python3` in the command examples below.
 
+## Automatic Recovery Authorization
+
+Treat authorization to generate the user's images as authorization for the same task's bounded
+recovery. On a recoverable error or timeout, immediately use the runner's recovery and supervision
+without asking whether to retry, collect, resume, or restart the worker. This includes inspecting
+saved state, reconnecting the saved browser binding, reopening the original durable conversation,
+retrying confirmed-unsubmitted preparation, the original failed response's bounded Retry action,
+and downloading existing candidates. Use the normal supervised entrypoint; never pass `--worker`
+directly or disable supervision to recover. Keep the same job, inputs, browser binding, and budgets.
+Committed or uncertain submissions recover by collecting the original request, never a duplicate Send.
+
+Keep monitoring the running command through its final result. A progress update may describe
+recovery but must not end the task with “shall I retry?” or a pending approval question. Exhausted
+recovery returns an explicit saved failure; do not ask for permission to reset its budget or start
+an unbounded caller loop. User action is needed only for a concrete remaining requirement, such as
+login, a human challenge, a new Profile choice, or missing input. If the host runtime actually
+blocks a tool call on its permission policy, report that exact action and block separately; skill
+instructions cannot bypass a runtime approval requirement.
+
 ## Prerequisites
 
 - **REQUIRED SUB-SKILL:** Invoke `donald-config-browser` for first-time setup or repair, not as a
   routine per-run gate (`donald-skills:donald-config-browser` when the runtime namespaces plugin
-  skills). First confirm that it exists in the runtime's already available skill catalog; this
+  skills). Only when setup/repair is needed, confirm that it exists in the runtime's skill catalog; this
   discovery must not invoke it or run any configuration command. If it is unavailable, tell the
   user that this workflow requires the setup/repair dependency and ask permission to install it
   into the same skill scope and agent target. After approval, use the runtime's normal installer;
@@ -60,7 +79,8 @@ runtime launches the window in the background without hiding it because macOS st
 screenshots for a fully hidden application. Keep Chrome behind the user's active app during
 startup, attachment, navigation, recovery, and human handoff. When the runner detects login or
 anti-automation verification, it preserves the configured CDP Chrome in the background and observes
-the task page for up to 10 minutes. Tell the user what requires attention; bring Chrome forward
+the task page within `--human-wait-timeout` and the remaining task budget (five minutes total by
+default for ordinary requests). Tell the user what requires attention; bring Chrome forward
 only when the user explicitly requests it. The runner never clicks verification controls or refreshes an
 active challenge. Two healthy checks five seconds apart resume the original task. A timeout returns
 `needs_ops` and leaves the browser open in the background; rerun the same job to recover its original
@@ -152,7 +172,7 @@ Submit a prepared job:
 python3 "$SKILL_DIR/scripts/agent_browser_runner.py" "<job_manifest returned by prepare_job.py>" \
   --mode single-batch-submit \
   --session chatgpt-image-<job-name> \
-  --timeout 1200
+  --timeout 300
 ```
 
 Treat the command's final JSON as the result contract even when the process exits nonzero. Do not
@@ -161,7 +181,7 @@ owns the first recovery tier: it retries confirmed page failures three times by 
 ChatGPT generation failures twice by default (`--max-failure-retries`), and authenticated image
 downloads four times. Keep those bounded defaults enabled for normal runs.
 
-The runner also owns one outer recovery cycle. A confirmed unsubmitted failure retries the same
+Each worker attempt also owns one outer recovery cycle. A confirmed unsubmitted failure retries the same
 job; an unknown or committed submission switches to collection of the original request. It never
 replays Send for either state. It waits through one queue cooldown (up to five minutes), then
 checks the paused task's account health in a separate tab. Recorded verification owners let later
@@ -173,15 +193,18 @@ examines that target's navigation history. It may recover a canonical URL only f
 history and after verifying the submitted prompt and user-turn baseline in a separate tab. It
 preserves ambiguous or unavailable requests for inspection rather than sending again.
 
-Read `automatic_recovery_actions` and `automatic_recovery_exhausted` in the final JSON. When the
-runner has consumed its recovery cycle, report the remaining obstacle and retained evidence; do
-not add another caller retry loop. A real login/verification gate requires the user to complete it.
+Read `automatic_recovery_actions`, `automatic_recovery_exhausted`, and `chatgpt_supervisor.json`.
+The normal invocation also has the bounded process supervision described below. After supervision
+stops, report the remaining obstacle and retained evidence; do not add another caller retry loop.
+A real login/verification gate requires the user to complete it.
 Submit, follow-up, and collection exit successfully only after all requested images are downloaded.
 An empty collection is an unresolved request, and exhausted automatic collection requires inspecting
 the original conversation before a manual recovery decision.
-For an unrecoverable original conversation, preserve the job and its commit state. For an explicit
-terminal generation failure, prepare a separate replacement job only after the user authorizes a
-new submission. `policy_refused` and account restrictions remain terminal for that request.
+For an unrecoverable original conversation, preserve the job and its commit state. An explicit
+generation failure uses the original response's bounded automatic Retry path. If recovery is
+exhausted, report the failure; do not turn it into an approval wait for another submission or reset
+the budget with a replacement job. `policy_refused` and account restrictions remain terminal for
+that request.
 
 The normal invocation handles these transitions without separate recovery commands from the
 caller. `collect-current` and `health-check` remain available for explicit recovery and diagnostics.
@@ -241,9 +264,43 @@ A read-only observer records the entire run in `chatgpt_heartbeat.json` and
 `chatgpt_heartbeat.jsonl`, immediately on phase changes and every 20 seconds during long operations.
 It uses a separate bounded CDP connection, so a busy worker cannot stop status reporting. It never
 clicks or navigates. Heartbeats distinguish process liveness, page-read failures, phase age, last
-observable progress, and submission state. Three consecutive unreadable checks request recovery;
-a slow but healthy generation continues until its normal timeout. Browser calls have absolute
+observable progress, and submission state. Three consecutive unreadable checks request worker
+recovery; the supervisor separately enforces progress and total deadlines. Browser calls have absolute
 response deadlines even when unrelated CDP events keep arriving.
+
+Page/error detection, page Retry selection, and recovery policy are shared with the text skill in
+`scripts/chatgpt_page_health.py`; the build vendors this source alongside the common heartbeat and
+supervisor. A readable `Could not load this ChatGPT conversation` error is an immediate recovery
+signal, not a failed CDP read or a human gate. Conversation-composer, history, and idle waits consume
+that signal so they enter bounded page recovery instead of waiting out their full timeout. A
+worker that does not act on an explicit page error can also be taken over after its phase has
+remained active for 30 seconds.
+
+The normal invocation runs the worker under a separate supervisor process. It takes over after
+60 seconds without a heartbeat, three minutes without observable progress, persistent unreadable
+page checks, or an unexpected worker exit. It terminates only that Python worker, retains Chrome
+and task evidence, and restarts at most twice with 5/10-second backoffs. Confirmed unsubmitted
+preparation starts again; committed or unknown submissions resume the original request without
+replaying Send. A stalled generation may reopen its durable conversation; unresolved downloads
+retain their live asset target. Active verification keeps its bounded observation loop and resumes
+when healthy; an exhausted human gate is handed off rather than restarted in a loop.
+
+`--heartbeat-timeout`, `--stall-timeout`, `--max-worker-restarts`, and `--task-timeout` control
+supervision. The total default budget is 300 seconds for an ordinary request across all worker
+attempts, including preparation, generation, recovery, and backoff. Retries do not extend it.
+This is a responsive operating budget, not a service latency guarantee: approximately one minute
+for preparation, two for ordinary generation, and two for recovery, sharing one deadline rather
+than fixed stage allocations. Deliberately long or multi-image jobs may explicitly increase both
+`--task-timeout` and the generation-stage `--timeout`. `chatgpt_supervisor.json` records the
+parent PID and takeover history; `supervisor/<run>/` retains each attempt's stdout/stderr. The final
+result includes `supervisor_path` and `worker_restarts`; exhaustion returns structured `needs_ops`.
+Command and result forwarding stay outside the monitoring loop, including caller stdout/stderr.
+Unexpected worker output cannot count as success or disable the deadline. Unclassified worker
+failures consume the same restart budget; unexpected supervision errors stop the worker and save
+an explicit failure. Ordinary runtime errors must end in a checked result or a bounded handoff.
+The supervisor stays alive independently of the worker; it is not an OS service. If the host or
+supervisor is terminated, explicitly resume the saved job. `status` and standalone `health-check`
+remain direct diagnostic commands.
 
 Inspect a running or exited job without opening a browser:
 
@@ -278,9 +335,10 @@ Page recovery is state-aware and bounded (three attempts by default):
 - before invoking the submit control, the session records `dispatch_started=true` and
   `submission_committed=unknown`; confirmed submission changes it to `true`. After dispatch,
   recovery may only observe or collect the original conversation, never replay the prompt;
-- a normally slow generation is not a recovery signal. Time-based generation refresh is disabled
-  by default; post-submit recovery begins only after three consecutive page/DOM heartbeat failures
-  or an explicit browser error page;
+- within the worker, time-based generation refresh is disabled by default; post-submit page
+  recovery begins after three consecutive page/DOM heartbeat failures or an explicit browser
+  error page. The separate supervisor can restart a worker that exceeds its progress deadline,
+  preserving the original request;
 - after candidates exist, download recovery operates on the existing conversation and never starts
   generation again;
 - login, CAPTCHA, Turnstile, Cloudflare, or other human verification suspends new submissions and

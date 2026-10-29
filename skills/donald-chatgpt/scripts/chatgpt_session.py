@@ -6,19 +6,28 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
+import queue
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from browser_runtime import BrowserSession, process_is_alive
 from output_paths import resolve_tool_output_root
+from run_health import RunHeartbeat
+from task_supervisor import add_supervisor_arguments, supervise
+from chatgpt_page_health import (
+    PAGE_ACCESS_STATE_JS, CURRENT_RESPONSE_ERROR_STATE_JS, CLICK_PAGE_ERROR_RETRY_JS,
+    DEFAULT_PAGE_RECOVERY_ATTEMPTS, page_recovery_action,
+)
 from profile_config import (
     ProfileConfigError,
     _CDPConnection,
@@ -34,7 +43,9 @@ from profile_config import (
 
 BINDING_SCOPE = "donald-chatgpt-imagegen"
 OWNER_SCOPE = "donald-chatgpt"
-READ_SCRIPT = Path(__file__).with_name("read_messages.js").read_text(encoding="utf-8")
+READ_SCRIPT = (Path(__file__).with_name("read_messages.js").read_text(encoding="utf-8")
+               .replace('__PAGE_ACCESS_STATE__', PAGE_ACCESS_STATE_JS.replace('__EXPECTED_PROMPT__', '""'))
+               .replace('__CURRENT_RESPONSE_ERROR_STATE__', CURRENT_RESPONSE_ERROR_STATE_JS))
 INSPECT_SCRIPT = Path(__file__).with_name("inspect_page.js").read_text(encoding="utf-8")
 
 
@@ -52,9 +63,15 @@ def chatgpt_url(value: str) -> str:
     return value
 
 
+def durable_conversation(value: str) -> bool:
+    match = re.search(r'/c/([^/?#]+)', urlparse(value).path)
+    return bool(match and not unquote(match[1]).startswith(('WEB:', 'local-chatgpt:')))
+
+
 class ChatBrowserSession(BrowserSession):
-    def __init__(self, *, saved: dict[str, Any], **kwargs: Any) -> None:
+    def __init__(self, *, saved: dict[str, Any], recover_worker: bool = False, **kwargs: Any) -> None:
         self.saved = saved
+        self.recover_worker = recover_worker
         super().__init__(**kwargs)
 
     def _claim_target(self, state: dict[str, Any]) -> str:
@@ -65,8 +82,10 @@ class ChatBrowserSession(BrowserSession):
             state["retained_targets"] = [item for item in state["retained_targets"]
                                          if item.get("target_id") != original]
             self.owned_target_ids.add(original)
-            return original  # Do not navigate or reload an unresolved request.
-        if self.saved.get("pending") and not re.search(r"/c/(?!WEB:|local-chatgpt:)[^/?#]+", self.url):
+            if self.recover_worker and durable_conversation(self.url):
+                self._navigate(original, self.url)
+            return original  # Ordinary resume preserves the live target; takeover may reopen its durable URL.
+        if self.saved.get("pending") and not durable_conversation(self.url):
             raise ProfileConfigError("Unresolved temporary conversation lost its target; do not send again")
         # Never reclaim another text task or the image skill's retained target.
         target = create_background_page(self.port, self.url)
@@ -83,10 +102,11 @@ class Conversation:
                       "binding_scope": BINDING_SCOPE, "target_id": browser.target_id,
                       "session_path": str(path), "output_dir": str(self.output)}
         self.state.setdefault("turns", [])
-        for transient in ("gate", "reason", "cleanup"):
+        for transient in ("gate", "reason", "cleanup", "handoff_requested"):
             self.state.pop(transient, None)
         self.observed: dict[str, Any] = {}
         self.observed_at = 0.0
+        self.human_wait_timeout = 600
         self.persist()
 
     def persist(self) -> None:
@@ -96,7 +116,10 @@ class Conversation:
             target = None
             self.state["last_browser_error"] = str(error)
         if target and str(target.get("url", "")).startswith("https://chatgpt.com/"):
-            self.state["conversation_url"] = target["url"]
+            current = str(target['url'])
+            previous = str(self.state.get('conversation_url', ''))
+            if not (self.state.get('pending') and durable_conversation(previous) and not durable_conversation(current)):
+                self.state["conversation_url"] = current
         self.state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         save_json(self.path, self.state)
 
@@ -269,6 +292,29 @@ class Conversation:
             return self.recover(observed)
         return observed
 
+    def heartbeat_probe(self) -> dict[str, Any]:
+        # Independent, bounded, read-only connection; never share the worker's command stream.
+        with connect_cdp_target(self.browser.port, self.browser.target_id, timeout=5) as connection:
+            observed = self.eval_on(connection, READ_SCRIPT).get('value')
+        if not isinstance(observed, dict) or not isinstance(observed.get('messages'), list):
+            raise ValueError('Could not read conversation DOM')
+        messages = observed['messages']
+        last = messages[-1] if messages else {}
+        return {**observed.get('access', {}), 'url': observed.get('url'), 'generating': observed.get('generating'),
+                'gate': observed.get('gate'), 'message_count': len(messages),
+                'last_message_id': last.get('id'),
+                'last_message_hash': hashlib.sha256(last.get('text', '').encode()).hexdigest()}
+
+    def reply_ready(self, previous: dict[str, Any], previous_at: float) -> bool:
+        reply = self.reply(self.observed)
+        return bool(reply and not self.observed.get('gate')
+                    and not self.observed.get('generating', True)
+                    and not self.observed.get('continuation_required', True)
+                    and reply.get('turn_state', '') in {'', 'complete', 'completed', 'finished'}
+                    and not previous.get('generating', True)
+                    and not previous.get('continuation_required', True)
+                    and self.reply(previous) == reply and time.monotonic() - previous_at >= 2)
+
     def recovery_event(self, recovery: dict[str, Any], action: str, **details: Any) -> None:
         recovery.setdefault("actions", []).append({"action": action, "at": time.time(), **details})
         self.persist()
@@ -320,6 +366,23 @@ class Conversation:
             self.recovery_event(recovery, "wait_for_normal_browser_recovery")
             observed = self.wait_and_capture()
         gate = observed.get("gate") or {}
+        while gate.get('kind') == 'page_error' and recovery.get('page_attempts', 0) < DEFAULT_PAGE_RECOVERY_ATTEMPTS:
+            url = str(self.state.get('conversation_url') or '')
+            attempt = recovery.get('page_attempts', 0) + 1
+            action = page_recovery_action(attempt, submitted=bool(pending),
+                                          preserve_target=bool(pending and not durable_conversation(url)))
+            if action == 'preserve':
+                break
+            recovery['page_attempts'] = attempt
+            self.recovery_event(recovery, 'recover_loading_page', attempt=attempt, method=action, url=url)
+            clicked = action == 'retry' and json.loads(self.evaluate(CLICK_PAGE_ERROR_RETRY_JS)).get('clicked')
+            if not clicked:
+                with self.page() as connection:
+                    connection.call('Page.navigate', {'url': chatgpt_url(url)})
+            observed = self.wait_and_capture()
+            gate = observed.get('gate') or {}
+        if not gate and not recovery.get('retry_started'):
+            return observed
         if gate.get("kind") == "verification":
             # Let the browser's normal verification scripts finish without any foreground action.
             while recovery.get("verification_checks", 0) < 3:
@@ -333,8 +396,11 @@ class Conversation:
                 if gate.get("kind") != "verification":
                     break
             if gate.get("kind") == "verification":
-                self.state.update(status="needs_ops", reason="human_verification_required")
-                self.recovery_event(recovery, "verification_still_requires_attention")
+                started = recovery.setdefault('verification_started_at', time.time())
+                expired = time.time() - started >= self.human_wait_timeout
+                self.state.update(status='needs_ops' if expired else 'waiting_for_human',
+                                  reason='login_required' if gate.get('error_type') == 'login_required' else 'human_verification_required')
+                self.persist()
                 return observed
         if (pending and gate.get("kind") == "service_error" and not recovery.get("retry_started")
                 and gate.get("retry_for_user_id") == pending.get("user_message_id")
@@ -473,6 +539,7 @@ class Conversation:
             if op == "finish" and self.state.get("pending"):
                 raise ValueError("Cannot finish an unresolved turn; collect it or hand it off")
             self.state["status"] = "complete" if op == "finish" else "needs_ops"
+            self.state['handoff_requested'] = op == 'handoff'
             self.state["reason"] = request.get("reason", "")
             if op == "handoff" and request.get("human"):
                 self.browser.retain_target_for_human(self.browser.target_id)
@@ -485,54 +552,109 @@ def emit(value: dict[str, Any]) -> None:
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
-def main() -> int:
+def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", default="conversation")
     parser.add_argument("--url", type=chatgpt_url)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--output-root", type=Path)
-    args = parser.parse_args()
+    parser.add_argument('--human-wait-timeout', type=float, default=600)
+    parser.add_argument('--session-path', type=Path, help=argparse.SUPPRESS)
+    add_supervisor_arguments(parser)
+    return parser
+
+
+def new_session_path(args: argparse.Namespace) -> Path:
+    if args.resume or args.session_path:
+        return (args.resume or args.session_path).expanduser().resolve()
+    name = re.sub(r'[^\w-]+', '-', args.name).strip('-')[:70] or 'conversation'
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + uuid.uuid4().hex[:6]
+    return resolve_tool_output_root('chatgpt', args.output_root) / name / stamp / 'session.json'
+
+
+def run_commands(conversation: Conversation, health: RunHeartbeat) -> int:
+    requests: queue.Queue = queue.Queue()
+    def read_requests() -> None:
+        for line in sys.stdin:
+            requests.put(line)
+        requests.put(None)
+    threading.Thread(target=read_requests, daemon=True).start()
+    ready_announced = False
+    while True:
+        active = bool(conversation.state.get('pending') or conversation.state['status'] == 'waiting_for_human')
+        if not active or ready_announced:
+            health.set_phase('waiting_input')
+        elif conversation.state['status'] == 'waiting_for_human':
+            health.set_phase('waiting_for_human')
+        else:
+            health.set_phase('awaiting_reply')
+        try:
+            line = requests.get(timeout=5)
+        except queue.Empty:
+            if not active or ready_announced:
+                continue
+            line = '{"op":"capture"}'
+            automatic = True
+        else:
+            automatic = False
+        if line is None:
+            return 0  # EOF preserves unresolved state in main's cleanup.
+        try:
+            previous, previous_at = conversation.observed, conversation.observed_at
+            request = json.loads(line)
+            if not automatic:
+                health.set_phase('command', str(request.get('op', '')))
+                ready_announced = False
+            result = conversation.handle(request)
+            if not automatic:
+                emit({'ok': True, 'result': result})
+            if conversation.state.get('pending') and conversation.reply_ready(previous, previous_at):
+                ready_announced = True
+                emit({'event': 'reply_ready', 'session_path': str(conversation.path),
+                      'observed_path': str(conversation.output / 'observed.json')})
+            if request.get('op') in {'finish', 'handoff'}:
+                return 0 if conversation.state['status'] == 'complete' else 2
+        except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+            emit({'ok': False, 'error': str(error), 'session_path': str(conversation.path),
+                  'pending': conversation.state.get('pending')})
+        if conversation.state['status'] == 'needs_ops':
+            emit({'status': 'needs_ops', 'reason': conversation.state.get('reason'),
+                  'session_path': str(conversation.path), 'pending': conversation.state.get('pending')})
+            return 2
+
+
+def main() -> int:
+    args = argument_parser().parse_args()
     browser = None
     conversation = None
+    health = None
     try:
-        saved = json.loads(args.resume.read_text(encoding="utf-8")) if args.resume else {}
+        path = new_session_path(args)
+        saved = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+        if args.resume and not path.exists():
+            raise ValueError('The saved session does not exist')
         if saved.get("pid") and process_is_alive(int(saved["pid"])):
             raise ValueError("The saved session still has an active owner")
         if args.resume and args.url and args.url != saved.get("conversation_url"):
             raise ValueError("Resume the saved conversation without replacing its URL")
-        if args.resume:
-            path = args.resume.expanduser().resolve()
-        else:
-            name = re.sub(r"[^\w-]+", "-", args.name).strip("-")[:70] or "conversation"
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
-            path = resolve_tool_output_root("chatgpt", args.output_root) / name / stamp / "session.json"
         config = configured_browser(scope=BINDING_SCOPE)
-        browser = ChatBrowserSession(saved=saved, config=config, scope=OWNER_SCOPE,
+        browser = ChatBrowserSession(saved=saved, recover_worker=args.recover_worker, config=config, scope=OWNER_SCOPE,
                                      session="donald-chatgpt", verify_agent_browser=False, url=chatgpt_url(
-                                         args.url or saved.get("conversation_url") or "https://chatgpt.com/"))
+                                         saved.get('conversation_url') or args.url or 'https://chatgpt.com/'))
         browser.open()
         conversation = Conversation(browser, path, saved)
+        conversation.human_wait_timeout = args.human_wait_timeout
+        health = RunHeartbeat(path.parent, conversation.heartbeat_probe)
+        health.start()
         emit(conversation.state)
-        for line in sys.stdin:
-            try:
-                request = json.loads(line)
-                result = conversation.handle(request)
-                emit({"ok": True, "result": result})
-                if request.get("op") in {"finish", "handoff"}:
-                    break
-            except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-                emit({"ok": False, "error": str(error), "session_path": str(path),
-                      "pending": conversation.state.get("pending")})
-            if conversation.state["status"] == "needs_ops":
-                emit({"status": "needs_ops", "reason": conversation.state.get("reason"),
-                      "session_path": str(path), "pending": conversation.state.get("pending")})
-                break
-        return 0
+        return run_commands(conversation, health)
     except (ValueError, OSError, ProfileConfigError) as error:
         emit({"status": "needs_ops", "error": str(error), "binding_scope": BINDING_SCOPE,
               "session_path": str(args.resume) if args.resume else None})
         return 2
     finally:
+        if health is not None:
+            health.close(conversation.state['status'])
         if conversation is not None:
             if conversation.state["status"] not in {"complete", "needs_ops"}:
                 conversation.state.update(status="needs_ops", reason="session_interrupted")
@@ -550,5 +672,14 @@ def main() -> int:
             emit({"cleanup": cleanup})
 
 
+def entrypoint() -> int:
+    args = argument_parser().parse_args()
+    if args.worker:
+        return main()
+    path = new_session_path(args)
+    worker_args = [*sys.argv[1:], '--session-path', str(path)]
+    return supervise(Path(__file__).resolve(), worker_args, path.parent, path, args, interactive=True)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint())

@@ -25,6 +25,28 @@ def native_png() -> bytes:
 
 
 class AssetRecoveryTests(unittest.TestCase):
+    def test_worker_takeover_reopens_generation_but_preserves_live_download_target(self):
+        url = 'https://chatgpt.com/c/original'
+        for keep_assets in (False, True):
+            with self.subTest(keep_assets=keep_assets), tempfile.TemporaryDirectory() as temporary:
+                job = {'job_name': 'takeover', 'prompt_card': 'fixture.md', 'download_dir': temporary}
+                runner._write_session_patch(job, {'submission_committed': 'unknown', 'conversation_url': url})
+                args = argparse.Namespace(recover_worker=True, _retain_generated_assets=keep_assets)
+                with (
+                    mock.patch.object(runner, '_require_original_conversation', return_value=url),
+                    mock.patch.object(runner, '_current_url', return_value=url),
+                    mock.patch.object(runner, '_validate_session_reference_mapping'),
+                    mock.patch.object(runner, '_open_conversation') as navigate,
+                    mock.patch.object(runner, '_wait_until_idle') as wait,
+                    mock.patch.object(runner, '_ensure_chat_surface', side_effect=RuntimeError('checkpoint')),
+                    mock.patch.object(runner, '_submit_prompt') as send,
+                    self.assertRaisesRegex(RuntimeError, 'checkpoint'),
+                ):
+                    runner._run_one_request(args, job, Path.cwd(), label='batch', message='Draw a fox', resume=True)
+                self.assertEqual(navigate.call_count, 0 if keep_assets else 1)
+                self.assertEqual(wait.call_count, 0 if keep_assets else 1)
+                send.assert_not_called()
+
     def test_claims_saved_live_target_even_without_a_retained_state_entry(self):
         browser = object.__new__(runner._ResumeImageBrowserSession)
         browser.original_target, browser.port = "original", 1
