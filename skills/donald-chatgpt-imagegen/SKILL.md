@@ -23,9 +23,9 @@ directly or disable supervision to recover. Keep the same job, inputs, browser b
 Committed or uncertain submissions recover by collecting the original request, never a duplicate Send.
 
 Keep monitoring the running command through its final result. A progress update may describe
-recovery but must not end the task with “shall I retry?” or a pending approval question. Exhausted
-recovery returns an explicit saved failure; do not ask for permission to reset its budget or start
-an unbounded caller loop. User action is needed only for a concrete remaining requirement, such as
+recovery but must not end the task with “shall I retry?” or a pending approval question. An exhausted
+worker/run is not the end of the business task: consume the saved continuation below automatically,
+without resetting response Retry counts or creating another job. User action is needed only for a concrete remaining requirement, such as
 login, a human challenge, a new Profile choice, or missing input. If the host runtime actually
 blocks a tool call on its permission policy, report that exact action and block separately; skill
 instructions cannot bypass a runtime approval requirement.
@@ -79,7 +79,7 @@ runtime launches the window in the background without hiding it because macOS st
 screenshots for a fully hidden application. Keep Chrome behind the user's active app during
 startup, attachment, navigation, recovery, and human handoff. When the runner detects login or
 anti-automation verification, it preserves the configured CDP Chrome in the background and observes
-the task page within `--human-wait-timeout` and the remaining task budget (five minutes total by
+the task page within `--human-wait-timeout` and the remaining run budget (five minutes per run by
 default for ordinary requests). Tell the user what requires attention; bring Chrome forward
 only when the user explicitly requests it. The runner never clicks verification controls or refreshes an
 active challenge. Two healthy checks five seconds apart resume the original task. A timeout returns
@@ -191,19 +191,23 @@ bounded retries and backoff; a visible human gate stops those automatic clicks a
 If the original target redirects to the home page, the runner waits for page loading to settle and
 examines that target's navigation history. It may recover a canonical URL only from post-dispatch
 history and after verifying the submitted prompt and user-turn baseline in a separate tab. It
-preserves ambiguous or unavailable requests for inspection rather than sending again.
+preserves ambiguous or unavailable requests rather than sending again. On the same owned target,
+it also opens a unique sidebar history control whose full accessible label matches the submitted
+prompt, including `role=button` entries without an href. It then verifies the full prompt, the
+post-dispatch user-turn baseline, and any saved turn key in the main conversation. That verified
+live turn can be collected and its scoped response Retry used even while the URL remains home or
+`local-chatgpt:`; it must not be navigated/reloaded as though its URL were durable.
 
 Read `automatic_recovery_actions`, `automatic_recovery_exhausted`, and `chatgpt_supervisor.json`.
 The normal invocation also has the bounded process supervision described below. After supervision
-stops, report the remaining obstacle and retained evidence; do not add another caller retry loop.
+stops, consume `recovery_pending` as described below; a worker's failure is not a human handoff.
 A real login/verification gate requires the user to complete it.
 Submit, follow-up, and collection exit successfully only after all requested images are downloaded.
-An empty collection is an unresolved request, and exhausted automatic collection requires inspecting
-the original conversation before a manual recovery decision.
+An empty collection remains unresolved and must retain the original request and continuation.
 For an unrecoverable original conversation, preserve the job and its commit state. An explicit
 generation failure uses the original response's bounded automatic Retry path. If recovery is
-exhausted, report the failure; do not turn it into an approval wait for another submission or reset
-the budget with a replacement job. `policy_refused` and account restrictions remain terminal for
+exhausted, continue observation/collection through the saved checkpoint; do not turn it into an
+approval wait or reset its response Retry budget with a replacement job. `policy_refused` and account restrictions remain terminal for
 that request.
 
 The normal invocation handles these transitions without separate recovery commands from the
@@ -286,21 +290,49 @@ retain their live asset target. Active verification keeps its bounded observatio
 when healthy; an exhausted human gate is handed off rather than restarted in a loop.
 
 `--heartbeat-timeout`, `--stall-timeout`, `--max-worker-restarts`, and `--task-timeout` control
-supervision. The total default budget is 300 seconds for an ordinary request across all worker
+supervision. Each supervised run has a 300-second active budget across all its worker
 attempts, including preparation, generation, recovery, and backoff. Retries do not extend it.
 This is a responsive operating budget, not a service latency guarantee: approximately one minute
 for preparation, two for ordinary generation, and two for recovery, sharing one deadline rather
 than fixed stage allocations. Deliberately long or multi-image jobs may explicitly increase both
 `--task-timeout` and the generation-stage `--timeout`. `chatgpt_supervisor.json` records the
 parent PID and takeover history; `supervisor/<run>/` retains each attempt's stdout/stderr. The final
-result includes `supervisor_path` and `worker_restarts`; exhaustion returns structured `needs_ops`.
+result includes `supervisor_path` and `worker_restarts`.
+Before returning an interrupted/failed run, the supervisor checks the same manifest's saved
+`downloaded` session and PNGs. Matching prompt hash, complete expected count, task-owned paths,
+stored hashes when present, and full PNG decoding are required. Valid saved outputs return success
+with `completion_source=verified_saved_artifacts`, even if the deadline interrupted the worker
+before its final stdout. A label alone, missing/corrupt files, or partial outputs cannot complete it.
 Command and result forwarding stay outside the monitoring loop, including caller stdout/stderr.
 Unexpected worker output cannot count as success or disable the deadline. Unclassified worker
 failures consume the same restart budget; unexpected supervision errors stop the worker and save
-an explicit failure. Ordinary runtime errors must end in a checked result or a bounded handoff.
+an explicit failure checkpoint. Ordinary runtime errors must retain an executable continuation;
+`needs_ops` is reserved for a concrete remaining operator requirement.
 The supervisor stays alive independently of the worker; it is not an OS service. If the host or
 supervisor is terminated, explicitly resume the saved job. `status` and standalone `health-check`
 remain direct diagnostic commands.
+
+### Continue After A Run Budget Is Exhausted
+
+`recovery_pending` means the business task is unfinished, with `business_complete=false` and
+`requires_user_action=false`. The supervisor persists `chatgpt_recovery.json`, the exact original
+manifest/session, worker logs, a cooldown deadline, and `continuation.argv`. After `not_before`,
+execute that argv through the normal tool automatically; it adds `--resume-recovery`. Do not ask
+the user, prepare a new manifest, pass `--worker`, or end the caller task merely because this run
+exited nonzero. The command also enforces its own cooldown if invoked early.
+
+At most two additional supervised runs are admitted, each with its own bounded active budget.
+The checkpoint counts these runs before launch; ordinary reinvocation cannot reset the cap. Scoped
+response Retry counts survive every worker/run, including uncertain click timeouts. These are
+separate, observable recovery runs, not a silent extension of the original five-minute deadline.
+
+If those runs still cannot progress, `recovery_blocked` retains the unfinished business task and
+`continuation.reconcile_argv`. Once there is evidence that the service or original output changed,
+execute that command to inspect/collect the same original request with `--reconcile-only`. This
+mode cannot Send or click response Retry, and remains available after retry exhaustion. Do not
+poll it in a tight loop, label it a human gate, or claim the images exist before collection succeeds.
+A persistent upstream failure can still block completion; retained recovery is not proof of a
+completed image or a scheduled background wakeup.
 
 Inspect a running or exited job without opening a browser:
 
@@ -384,6 +416,9 @@ Generated-image downloads use the logged-in browser and retry transient failures
 authenticated ChatGPT URL must not fall back to an unauthenticated HTTP request. If all attempts
 fail, preserve the conversation and candidates and return structured `download_failed` with
 `recommended_next_action=collect_current_first` instead of raising a traceback.
+Reference duplicates are rejected only by identical file hashes or identical full-resolution RGBA
+pixels. A small genuine generated edit must retain its native bytes even if it visually resembles
+an uploaded reference.
 
 Collection reclaims the saved live target without navigating it. A different tab with the same
 conversation URL is only a recovery candidate: verify the submitted prompt and its generated image

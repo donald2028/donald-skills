@@ -28,6 +28,89 @@ from PIL import Image, PngImagePlugin  # noqa: E402
     "requires opt-in and a configured Chrome lane",
 )
 class BrowserDomTests(unittest.TestCase):
+    def test_response_retry_home_history_button_recovers_original_and_downloads_without_send(self):
+        prompt = 'Create one image with the exact four-line alignment correction.'
+        png = io.BytesIO()
+        Image.new('RGB', (300, 420), 'coral').save(png, format='PNG')
+        data_url = 'data:image/png;base64,' + base64.b64encode(png.getvalue()).decode()
+        self.load_html('<aside id="history"></aside><main></main><div contenteditable="true"></div>')
+        # Only the service UI is simulated. Detection, scoped clicks, original-turn guards,
+        # candidate ownership, authenticated collection and byte preservation use production code.
+        runner._eval_js(self.args, self.cwd, '''
+          globalThis.fixtureClicks = {retry: 0, history: 0, send: 1};
+          globalThis.fixturePrompt = PROMPT;
+          globalThis.renderOriginal = () => {
+            document.querySelector('main').innerHTML = '<section data-turn-key="original"><div data-message-author-role="user"></div></section>';
+            document.querySelector('[data-message-author-role=user]').textContent = fixturePrompt;
+            const error = document.createElement('aside'); error.role = 'alert';
+            error.innerHTML = 'cloudflare_challenge<button>Retry</button>';
+            document.querySelector('main').append(error);
+            error.querySelector('button').onclick = () => {
+              fixtureClicks.retry++;
+              if (fixtureClicks.retry === 1) {
+                document.querySelector('main').innerHTML = '';
+                const entry = document.createElement('div'); entry.role = 'button';
+                entry.setAttribute('aria-label', '@Create image ' + fixturePrompt);
+                entry.textContent = 'Original request';
+                entry.onclick = () => {fixtureClicks.history++; renderOriginal();};
+                document.querySelector('#history').append(entry);
+              } else {
+                error.remove();
+                const answer = document.createElement('div'); answer.dataset.messageAuthorRole = 'assistant';
+                answer.innerHTML = '<img width="300" height="420" src="' + IMAGE + '">';
+                document.querySelector('main').append(answer);
+              }
+            };
+          }; renderOriginal();
+        '''.replace('PROMPT', json.dumps(prompt)).replace('IMAGE', json.dumps(data_url)))
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'history-recovery', 'prompt_card': 'fixture.md', 'download_dir': temporary, 'variant_count': 1}
+            args = argparse.Namespace(**vars(self.args))
+            args._submitted_prompt, args._owned_tab_cdp_target_id, args._health_job = prompt, 'fixture-owned', job
+            args.timeout, args.progress_interval = 20, 1
+            temporary_url = 'https://chatgpt.com/c/local-chatgpt%3Aoriginal'
+            runner._write_session_patch(job, {'owned_target_id': 'fixture-owned', 'submission_committed': True,
+                'conversation_url': temporary_url, 'baseline_user_message_count': 0, 'baseline_navigation_entry_ids': []})
+            actual_eval = runner._eval_json
+            def evaluate(args, cwd, script, **kwargs):
+                result = actual_eval(args, cwd, script, **kwargs)
+                if 'verified' in result and 'url' in result:
+                    result['url'] = 'https://chatgpt.com/'  # Local fixture models ChatGPT's home URL.
+                return result
+            with (mock.patch.object(runner, '_current_url', return_value='https://chatgpt.com/'),
+                  mock.patch.object(runner, '_eval_json', side_effect=evaluate),
+                  mock.patch.object(runner, '_conversation_history', return_value=[]),
+                  mock.patch.object(runner, '_wait_ms'), mock.patch.object(runner, '_screenshot'),
+                  mock.patch.object(runner, '_emit_progress'),
+                  mock.patch.object(runner, '_write_timing_sample'),
+                  mock.patch.object(runner, '_submit_prompt') as send,
+                  mock.patch.object(runner, '_open_conversation') as navigate):
+                result = runner._collect_generated_images_with_retries(args, job, self.cwd, Path(temporary),
+                    set(), [], label='batch', mode='single_batch_submit', resumed=True,
+                    expected_conversation_url=temporary_url, baseline_user_message_count=0)
+            self.assertEqual(result['status'], 'downloaded')
+            self.assertEqual(Path(result['images'][0]['path']).read_bytes(), png.getvalue())
+            saved = runner._read_json_if_exists(runner._session_path(job))
+            self.assertEqual(saved['response_retry_count'], 2)
+            self.assertEqual(saved['original_live_turn']['turn_key'], 'original')
+            self.assertEqual(json.loads(runner._eval_js(args, self.cwd, 'JSON.stringify(fixtureClicks)')),
+                             {'retry': 2, 'history': 1, 'send': 1})
+            send.assert_not_called(); navigate.assert_not_called()
+
+    def test_original_identity_rejects_ambiguous_history_and_changed_user_turn(self):
+        from chatgpt_page_health import original_history_script, original_turn_script
+        self.load_html('<aside id="history"><div role="button" aria-label="Exact prompt">first</div>'
+                       '<div role="button" aria-label="Exact prompt">second</div></aside>'
+                       '<main><section data-turn-key="wrong"><div data-message-author-role="user">Exact prompt</div></section></main>')
+        self.assertFalse(runner._eval_json(self.args, self.cwd, original_history_script('Exact prompt', click=True))['found'])
+        self.assertFalse(runner._eval_json(self.args, self.cwd, original_turn_script('Exact prompt', 0, 'original'))['verified'])
+        self.assertFalse(runner._eval_json(self.args, self.cwd, original_turn_script('Exact prompt', 1))['verified'])
+        self.assertTrue(runner._eval_json(self.args, self.cwd, original_turn_script('Exact prompt', 1, 'wrong'))['verified'])
+        self.load_html('<aside id="history"><div role="button" aria-label="Exact prompt">first</div></aside>'
+                       '<main>Verify you are human</main>')
+        self.assertTrue(runner._eval_json(self.args, self.cwd,
+                                         original_history_script('Exact prompt', click=True))['human_required'])
+
     def test_conversation_loading_failure_without_alert_has_a_scoped_page_retry(self):
         self.load_html('<main><div>Could not load this ChatGPT conversation<button id="retry">Try again</button></div></main>')
         runner._eval_js(self.args, self.cwd, "document.getElementById('retry').onclick = () => {"

@@ -21,7 +21,8 @@ class ConversationGuardTests(unittest.TestCase):
         with (
             mock.patch.object(runner, "_page_access_state", return_value={"hasPrompt": True}),
             mock.patch.object(runner, "_current_url", return_value="https://chatgpt.com/"),
-            mock.patch.object(runner, "_eval_json", return_value={"text": "Create a fox", "userCount": 1}),
+            mock.patch.object(runner, "_eval_json", side_effect=lambda args, cwd, script, **kw:
+                {'verified': '"Create a fox"' in script and 'length > 0' in script, 'url': 'https://chatgpt.com/'}),
             mock.patch.object(runner, "_open_conversation") as navigate,
         ):
             self.assertEqual(runner._require_original_conversation(args, Path.cwd(), session), "https://chatgpt.com/")

@@ -25,6 +25,35 @@ def native_png() -> bytes:
 
 
 class AssetRecoveryTests(unittest.TestCase):
+    def test_response_retry_timeout_consumes_persisted_budget_before_click(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = {'job_name': 'retry', 'prompt_card': 'fixture.md', 'download_dir': temporary}
+            runner._write_session_patch(job, {'attempt': {'action': 'retry', 'retry_index': 1}})
+            with mock.patch.object(runner, '_click_try_again', side_effect=TimeoutError('uncertain click')) as retry:
+                with self.assertRaises(TimeoutError):
+                    runner._retry_original_response(argparse.Namespace(), job, Path.cwd(), 'batch', 2)
+                self.assertFalse(runner._retry_original_response(argparse.Namespace(), job, Path.cwd(), 'batch', 2))
+            retry.assert_called_once()
+            self.assertEqual(runner._read_json_if_exists(runner._session_path(job))['response_retry_count'], 2)
+
+    def test_small_native_edit_survives_reference_filter_but_exact_pixels_do_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            reference, edit, copy = [Path(temporary) / name for name in ('reference.png', 'edit.png', 'copy.png')]
+            image = Image.new('RGBA', (1536, 1024), 'white')
+            image.save(reference)
+            info = PngImagePlugin.PngInfo()
+            info.add_text('source', 'different encoding, same pixels')
+            image.save(copy, pnginfo=info)
+            image.putpixel((340, 628), (0, 0, 255, 255))
+            image.save(edit)
+            data = edit.read_bytes()
+            kept, filtered = runner._filter_reference_downloads(
+                [{'path': str(edit)}, {'path': str(copy)}], [str(reference)])
+            self.assertEqual(kept, [{'path': str(edit)}])
+            self.assertEqual(len(filtered), 1)
+            self.assertEqual(edit.read_bytes(), data)
+            self.assertFalse(copy.exists())
+
     def test_worker_takeover_reopens_generation_but_preserves_live_download_target(self):
         url = 'https://chatgpt.com/c/original'
         for keep_assets in (False, True):

@@ -24,9 +24,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
-    from PIL import Image, ImageChops, ImageStat
+    from PIL import Image
 except ImportError as error:  # pragma: no cover - depends on the local Python environment
-    Image = ImageChops = ImageStat = None  # type: ignore[assignment]
+    Image = None  # type: ignore[assignment]
     PIL_IMPORT_ERROR = error
 else:
     PIL_IMPORT_ERROR = None
@@ -35,7 +35,7 @@ from run_health import RunHeartbeat, SubmissionCircuit, atomic_json, heartbeat_s
 from chatgpt_page_health import (
     CONVERSATION_DOM_JS, CURRENT_RESPONSE_ERROR_STATE_JS,
     PAGE_ACCESS_STATE_JS, CLICK_PAGE_ERROR_RETRY_JS, DEFAULT_PAGE_RECOVERY_ATTEMPTS, RecoverablePageError,
-    page_failure, page_recovery_action,
+    page_failure, page_recovery_action, original_turn_script, original_history_script,
 )
 from task_supervisor import DEFAULT_TASK_TIMEOUT, add_supervisor_arguments, read_state, supervise
 from browser_runtime import BrowserSession, process_is_alive
@@ -1995,7 +1995,7 @@ JSON.stringify((() => {
     assistantMessageCount: assistants.length,
     submittedPromptChecked: Boolean(expectedPrompt),
     submittedPromptPresent: Boolean(submittedUser),
-    submittedTurnKey: turnFor(submittedUser)?.getAttribute('data-turn-key') || '',
+    submittedTurnKey: turnFor(submittedUser)?.getAttribute('data-turn-key') || submittedUser?.getAttribute('data-message-id') || '',
     latestAssistantMessage: latest ? (latest.innerText || latest.textContent || "") : "",
     latestAssistantIsCurrent: Boolean(latest && (!latestTurn || latestTurn.contains(latest))),
     latestTurnText: latestTurn ? (latestTurn.innerText || latestTurn.textContent || "") : "",
@@ -2063,6 +2063,15 @@ JSON.stringify((() => {
             or (_temporary_conversation_id(expected_id) and not _temporary_conversation_id(current_id))
         )
     )
+    job = getattr(args, '_health_job', None)
+    if job and not conversation_ok and (not expected_id or _temporary_conversation_id(expected_id)):
+        saved = _read_json_if_exists(_session_path(job, getattr(args, '_active_request_label', 'batch'))) or {}
+        identity = saved.get('original_live_turn') or {}
+        conversation_ok = bool(identity.get('verified') and identity.get('target_id')
+            and identity['target_id'] == getattr(args, '_owned_tab_cdp_target_id', None)
+            and observation.get('submittedPromptPresent')
+            and (identity['turn_key'] == observation.get('submittedTurnKey') if identity.get('turn_key')
+                 else int(observation.get('userMessageCount') or 0) > int(saved.get('baseline_user_message_count') or 0)))
     status = "needs_ops" if human_reason else ("page_error" if observation.get("pageLoadingError") else
              ("generation_error" if generation_error else ("ok" if conversation_ok else "unexpected_page")))
     return {
@@ -2289,6 +2298,15 @@ JSON.stringify((() => {
         _activate_for_human_attention(args, str(access_state["humanReason"]))
         return _ensure_expected_conversation(args, cwd, expected_conversation_url, baseline_user_message_count)
     if _temporary_conversation_id(expected_id):
+        job = getattr(args, '_health_job', None)
+        if job:
+            session = _read_json_if_exists(_session_path(job, getattr(args, '_active_request_label', 'batch'))) or {}
+            current = _require_original_conversation(args, cwd, session)
+            event.update(current_url=current, restored=True,
+                         canonicalized=bool(_conversation_id_from_url(current)
+                                            and not _temporary_conversation_id(_conversation_id_from_url(current))),
+                         restore_reason='verified_original_live_turn')
+            return event
         raise OriginalConversationRequired("ChatGPT conversation changed; the original temporary request cannot be located safely")
     restored_url = _open_conversation(args, cwd, expected_conversation_url)
     restored_id = _conversation_id_from_url(restored_url)
@@ -2418,6 +2436,25 @@ def _click_try_again(args: argparse.Namespace, cwd: Path) -> bool:
         except RuntimeError:
             continue
     return False
+
+
+def _response_retry_count(session: dict[str, Any]) -> int:
+    return max(int(session.get('response_retry_count') or 0),
+               sum(item.get('action') == 'retry' for item in session.get('attempts', [])))
+
+
+def _retry_original_response(args: argparse.Namespace, job: dict[str, Any], cwd: Path,
+                             label: int | str, maximum: int) -> bool:
+    if getattr(args, 'reconcile_only', False):
+        return False
+    session = _read_json_if_exists(_session_path(job, label)) or {}
+    consumed = _response_retry_count(session)
+    if consumed >= maximum:
+        return False
+    _write_session_patch(job, {'label': label, 'response_retry_count': consumed + 1,
+        'attempt': {'action': 'response_retry_started', 'retry_index': consumed + 1,
+                    'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}})
+    return _click_try_again(args, cwd)
 
 
 def _element_ref(line: str) -> str | None:
@@ -3988,6 +4025,27 @@ def _execute_with_automatic_recovery(args: argparse.Namespace, job: dict[str, An
     return recovered
 
 
+def _verify_original_live_turn(args: argparse.Namespace, cwd: Path, session: dict[str, Any]) -> str | None:
+    target = getattr(args, '_owned_tab_cdp_target_id', None)
+    prompt = str(getattr(args, '_submitted_prompt', ''))
+    digest = hashlib.sha256(prompt.encode()).hexdigest()
+    if (not target or target != session.get('owned_target_id') or not prompt
+            or session.get('prompt_sha256', digest) != digest):
+        return None
+    previous = session.get('original_live_turn') or {
+        'turn_key': ((session.get('progress') or {}).get('page_health') or {}).get('submitted_turn_key', '')}
+    observed = _eval_json(args, cwd, original_turn_script(
+        prompt, int(session.get('baseline_user_message_count') or 0), previous.get('turn_key', '')))
+    if not observed.get('verified') or not str(observed.get('url', '')).startswith('https://chatgpt.com/'):
+        return None
+    job = getattr(args, '_health_job', None)
+    if job:
+        _write_session_patch(job, {'label': getattr(args, '_active_request_label', 'batch'),
+            'original_live_turn': {**observed, 'target_id': target, 'prompt_sha256': digest},
+            'conversation_recovery': {'method': 'verified_original_live_turn', 'prompt_verified': True}})
+    return str(observed['url'])
+
+
 def _require_original_conversation(args: argparse.Namespace, cwd: Path, session: dict[str, Any]) -> str:
     """A temporary URL cannot be reopened. Accept only the same verified user turn."""
     saved = str(session.get("canonical_conversation_url") or session.get("conversation_url") or "")
@@ -4011,26 +4069,36 @@ def _require_original_conversation(args: argparse.Namespace, cwd: Path, session:
         return current  # Observe this retained target in place; never reopen its temporary URL.
     same_target = bool(session.get("owned_target_id") and
                        session["owned_target_id"] == getattr(args, "_owned_tab_cdp_target_id", None))
-    if (current_id and not _temporary_conversation_id(current_id)) or same_target:
-        _expand_submitted_prompt(args, cwd)
-        observed = _eval_json(args, cwd, r"""
-JSON.stringify((() => {
- const {users} = __CONVERSATION_DOM__;
- const user = users.at(-1);
- return {text: user?.innerText || '', fullText: user?.textContent || '', userCount: users.length};
-})())
-""".replace("__CONVERSATION_DOM__", CONVERSATION_DOM_JS))
-        expected = " ".join(str(getattr(args, "_submitted_prompt", "")).split())
-        if (expected and any(expected in " ".join(str(observed.get(key) or "").split()) for key in ("text", "fullText"))
-                and int(observed.get("userCount") or 0) > int(session.get("baseline_user_message_count") or 0)):
-            return current
     if same_target:
+        _expand_submitted_prompt(args, cwd)
+        verified = _verify_original_live_turn(args, cwd, session)
+        if verified:
+            return verified
         recovered = _recover_original_from_history(args, cwd, session)
         if recovered:
             return recovered
+        prompt = str(getattr(args, '_submitted_prompt', ''))
+        attempts = int(session.get('original_history_recovery_attempts') or 0)
+        job = getattr(args, '_health_job', None)
+        if (job and prompt and attempts < DEFAULT_PAGE_RECOVERY_ATTEMPTS
+                and _eval_json(args, cwd, original_history_script(prompt)).get('found')):
+            # Save the click budget first: a CDP timeout must not replay this navigation forever.
+            _write_session_patch(job, {'label': getattr(args, '_active_request_label', 'batch'),
+                                      'original_history_recovery_attempts': attempts + 1})
+            if _eval_json(args, cwd, original_history_script(prompt, click=True)).get('clicked'):
+                for _ in range(15):
+                    access = _page_access_state(args, cwd)
+                    if access.get('humanReason'):
+                        _activate_for_human_attention(args, str(access['humanReason']))
+                    _expand_submitted_prompt(args, cwd)
+                    verified = _verify_original_live_turn(args, cwd, session)
+                    if verified:
+                        return verified
+                    time.sleep(1)
     raise OriginalConversationRequired(
-        "The request may already be submitted, but its original canonical conversation cannot "
-        "be verified. Keep the original job; locate its conversation before collecting."
+        "The request may already be submitted, but its original user turn could not be verified "
+        "in the owned target, post-dispatch history, or unique exact-prompt sidebar entry. "
+        "Keep the original job and recovery checkpoint; never duplicate Send."
     )
 
 
@@ -5425,20 +5493,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _image_mae(left_path: Path, right_path: Path) -> float:
-    left = Image.open(left_path).convert("RGB")
-    right = Image.open(right_path).convert("RGB")
-    left_ratio = left.width / left.height
-    right_ratio = right.width / right.height
-    if abs(left_ratio - right_ratio) > 0.02:
-        return 255.0
-    size = (128, 128)
-    left = left.resize(size)
-    right = right.resize(size)
-    diff = ImageChops.difference(left, right)
-    return sum(ImageStat.Stat(diff).mean) / 3
-
-
 def _is_uploaded_reference_download(output_path: Path, reference_paths: list[str]) -> bool:
     try:
         output_hash = _sha256(output_path)
@@ -5446,8 +5500,10 @@ def _is_uploaded_reference_download(output_path: Path, reference_paths: list[str
             reference_path = Path(reference)
             if output_hash == _sha256(reference_path):
                 return True
-            if _image_mae(output_path, reference_path) <= 1.0:
-                return True
+            # Similarity is not duplication: local edits can change only a few native pixels.
+            with Image.open(output_path) as output, Image.open(reference_path) as source:
+                if output.size == source.size and output.convert('RGBA').tobytes() == source.convert('RGBA').tobytes():
+                    return True
     except Exception:
         return False
     return False
@@ -5894,7 +5950,8 @@ def _collect_generated_images_with_retries(
         page_recoveries.extend(recovery_events)
         return result
 
-    for retry_index in range(max_failure_retries + 1):
+    saved_retries = _response_retry_count(_read_json_if_exists(_session_path(job, label)) or {})
+    for retry_index in range(saved_retries, max(saved_retries, max_failure_retries) + 1):
         deadline = time.time() + args.timeout
         generation_wait_started_at = time.time()
         next_progress_at = 0.0
@@ -6439,7 +6496,7 @@ def _collect_generated_images_with_retries(
                 "attempt": {"action": "failure", "label": label, "mode": mode, **failure},
             },
         )
-        if not retry_available or not _click_try_again(args, cwd):
+        if not retry_available or not _retry_original_response(args, job, cwd, label, max_failure_retries):
             result = {
                 "status": "generation_failed",
                 "error_type": detected_generation_error.get(
@@ -6469,7 +6526,9 @@ def _collect_generated_images_with_retries(
             _write_session_patch(job, {**result, "label": label})
             _screenshot(args, cwd, trace_dir / "05_generation_failed.png")
             return result
-        conversation_url = _wait_for_conversation_url(args, cwd)
+        # Retry can leave a local conversation at home. Do not spend a minute waiting only
+        # for a canonical URL; the next guard verifies/reclaims its original live user turn.
+        conversation_url = _current_url(args, cwd)
         active_expected_conversation_url = conversation_url
         _write_session_patch(
             job,
@@ -6936,6 +6995,7 @@ def _run_one_request(
         if (getattr(args, 'recover_worker', False)
                 and not getattr(args, '_retain_generated_assets', False)
                 and existing_session.get('submission_committed') in (True, 'unknown')
+                and _conversation_id_from_url(existing_conversation_url)
                 and not _temporary_conversation_id(_conversation_id_from_url(existing_conversation_url))
                 and not existing_session.get('outputs')
                 and existing_session.get('status') != 'download_failed'):
@@ -7591,6 +7651,9 @@ def run_collect_current(args: argparse.Namespace, job: dict[str, Any], cwd: Path
             )
             next_progress_at = time.time() + progress_interval
             if detected_generation_error and not candidates:
+                if _retry_original_response(args, job, cwd, 'batch', getattr(args, 'max_failure_retries', 2)):
+                    next_progress_at = 0.0
+                    continue
                 break
         if candidates:
             detected_generation_error = None
@@ -7941,6 +8004,7 @@ def main() -> int:
         job = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
         print(json.dumps({"heartbeat": heartbeat_status(Path(job["download_dir"])),
                           "supervisor": read_state(Path(job['download_dir']) / 'chatgpt_supervisor.json'),
+                          "recovery": read_state(Path(job['download_dir']) / 'chatgpt_recovery.json'),
                           "session": _read_json_if_exists(_session_path(job)) or {}}, ensure_ascii=False, indent=2))
         return 0
 
@@ -8207,6 +8271,8 @@ def main() -> int:
 
 def entrypoint() -> int:
     args = argument_parser().parse_args()
+    if args.reconcile_only and args.mode != 'collect-current':
+        raise ValueError('--reconcile-only requires --mode collect-current')
     if args.worker or args.mode in {'status', 'health-check'}:
         return main()
     job = json.loads(Path(args.manifest).read_text(encoding='utf-8'))

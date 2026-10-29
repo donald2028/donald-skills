@@ -26,7 +26,7 @@ from run_health import RunHeartbeat
 from task_supervisor import add_supervisor_arguments, supervise
 from chatgpt_page_health import (
     PAGE_ACCESS_STATE_JS, CURRENT_RESPONSE_ERROR_STATE_JS, CLICK_PAGE_ERROR_RETRY_JS,
-    DEFAULT_PAGE_RECOVERY_ATTEMPTS, page_recovery_action,
+    DEFAULT_PAGE_RECOVERY_ATTEMPTS, page_recovery_action, original_turn_script, original_history_script,
 )
 from profile_config import (
     ProfileConfigError,
@@ -107,6 +107,7 @@ class Conversation:
         self.observed: dict[str, Any] = {}
         self.observed_at = 0.0
         self.human_wait_timeout = 600
+        self.reconcile_only = False
         self.persist()
 
     def persist(self) -> None:
@@ -118,7 +119,7 @@ class Conversation:
         if target and str(target.get("url", "")).startswith("https://chatgpt.com/"):
             current = str(target['url'])
             previous = str(self.state.get('conversation_url', ''))
-            if not (self.state.get('pending') and durable_conversation(previous) and not durable_conversation(current)):
+            if not (self.state.get('pending') and '/c/' in previous and not durable_conversation(current)):
                 self.state["conversation_url"] = current
         self.state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         save_json(self.path, self.state)
@@ -268,6 +269,14 @@ class Conversation:
         if not isinstance(observed, dict) or not isinstance(observed.get("messages"), list):
             raise ValueError("Could not read conversation DOM; inspect the owned page")
         pending = self.state.get("pending")
+        recovery = (pending or {}).get('recovery', {})
+        if pending and recovery.get('history_identity_failed'):
+            identity = json.loads(self.evaluate(original_turn_script(
+                pending['prompt'], pending.get('baseline_user_message_count', 0), recovery.get('original_turn_key', ''))))
+            if identity.get('verified'):
+                recovery.pop('history_identity_failed')
+            elif (observed.get('gate') or {}).get('kind') != 'verification':
+                observed['gate'] = {'kind': 'page_error', 'error_type': 'original_conversation_required'}
         if pending:
             for message in observed["messages"]:
                 if (message["role"] == "user" and message["id"]
@@ -381,6 +390,31 @@ class Conversation:
                     connection.call('Page.navigate', {'url': chatgpt_url(url)})
             observed = self.wait_and_capture()
             gate = observed.get('gate') or {}
+        if pending and not durable_conversation(str(self.state.get('conversation_url') or '')) and gate.get('kind') != 'verification':
+            prompt = pending['prompt']
+            identity = json.loads(self.evaluate(original_turn_script(
+                prompt, pending.get('baseline_user_message_count', 0), recovery.get('original_turn_key', ''))))
+            if identity.get('verified'):
+                recovery['original_turn_key'] = identity.get('turn_key', '')
+                self.persist()
+            elif (recovery.get('history_attempts', 0) < DEFAULT_PAGE_RECOVERY_ATTEMPTS
+                  and json.loads(self.evaluate(original_history_script(prompt))).get('found')):
+                recovery['history_attempts'] = recovery.get('history_attempts', 0) + 1
+                self.recovery_event(recovery, 'reopen_original_history_control')
+                self.evaluate(original_history_script(prompt, click=True))
+                observed = self.wait_and_capture()
+                gate = observed.get('gate') or {}
+                identity = json.loads(self.evaluate(original_turn_script(
+                    prompt, pending.get('baseline_user_message_count', 0), recovery.get('original_turn_key', ''))))
+                if not identity.get('verified') and gate.get('kind') != 'verification':
+                    recovery['history_identity_failed'] = True
+                    observed['gate'] = {'kind': 'page_error', 'error_type': 'original_conversation_required'}
+                    self.state.update(status='needs_ops', reason='original_conversation_required')
+                    self.recovery_event(recovery, 'original_history_turn_unverified')
+                    return observed
+                if identity.get('verified'):
+                    recovery['original_turn_key'] = identity.get('turn_key', '')
+                self.persist()
         if not gate and not recovery.get('retry_started'):
             return observed
         if gate.get("kind") == "verification":
@@ -402,7 +436,7 @@ class Conversation:
                                   reason='login_required' if gate.get('error_type') == 'login_required' else 'human_verification_required')
                 self.persist()
                 return observed
-        if (pending and gate.get("kind") == "service_error" and not recovery.get("retry_started")
+        if (not self.reconcile_only and pending and gate.get("kind") == "service_error" and not recovery.get("retry_started")
                 and gate.get("retry_for_user_id") == pending.get("user_message_id")
                 and not self.reply(observed) and not observed["generating"]):
             recovery["retry_started"] = True
@@ -418,7 +452,7 @@ class Conversation:
             observed = self.wait_and_capture()
         if not observed.get("gate") and (self.reply(observed) or observed["generating"]):
             return observed
-        if pending and recovery.get("retry_started") and not recovery.get("restore_started"):
+        if not self.reconcile_only and pending and recovery.get("retry_started") and not recovery.get("restore_started"):
             probe = self.probe_conversation(recovery)
             if probe:
                 matches = [m for m in probe["messages"] if m["role"] == "user" and m["id"] not in pending["baseline_ids"]
@@ -480,6 +514,8 @@ class Conversation:
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         op = request.get("op")
+        if self.reconcile_only and op not in {'capture', 'complete-turn', 'finish', 'handoff'}:
+            raise ValueError('Reconciliation only permits collecting and finishing the original turn')
         if op == "browser":
             args = list(request["args"])
             if "text_file" in request:
@@ -506,6 +542,7 @@ class Conversation:
             self.state["pending"] = {
                 "prompt": observed["composer_text"], "attachments": attachments,
                 "baseline_ids": [item["id"] for item in observed["messages"]],
+                "baseline_user_message_count": sum(item['role'] == 'user' for item in observed['messages']),
                 "dispatch_started": True, "submission_committed": "unknown",
             }
             self.state["status"] = "awaiting_reply"
@@ -644,6 +681,7 @@ def main() -> int:
         browser.open()
         conversation = Conversation(browser, path, saved)
         conversation.human_wait_timeout = args.human_wait_timeout
+        conversation.reconcile_only = args.reconcile_only
         health = RunHeartbeat(path.parent, conversation.heartbeat_probe)
         health.start()
         emit(conversation.state)

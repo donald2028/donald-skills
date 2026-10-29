@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 import queue
@@ -20,6 +22,7 @@ from chatgpt_page_health import page_failure
 DEFAULT_HEARTBEAT_TIMEOUT = 60
 DEFAULT_STALL_TIMEOUT = 180
 DEFAULT_TASK_TIMEOUT = 300
+MAX_CONTINUATION_RUNS = 2
 
 
 class StreamWriter:
@@ -65,8 +68,12 @@ def add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--heartbeat-timeout', type=float, default=DEFAULT_HEARTBEAT_TIMEOUT,
                         help='Restart a worker whose heartbeat stops updating for this many seconds.')
     parser.add_argument('--task-timeout', type=float, default=DEFAULT_TASK_TIMEOUT,
-                        help='Total active-task budget across worker restarts, in seconds.')
+                        help='Active-run budget across worker restarts, in seconds.')
     parser.add_argument('--max-worker-restarts', type=int, default=2)
+    parser.add_argument('--resume-recovery', action='store_true',
+                        help='Continue this task from its saved recovery checkpoint after cooldown.')
+    parser.add_argument('--reconcile-only', action='store_true',
+                        help='Inspect/collect the original request without Send or response Retry.')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--recover-worker', action='store_true', help=argparse.SUPPRESS)
 
@@ -101,9 +108,8 @@ def terminal_failure(report: Any) -> bool:
     markers = {str(report.get(key, '')) for key in ('status', 'error_type', 'reason')}
     if markers & {
         'policy_refused', 'human_attention_required', 'human_verification_required',
-        'login_required', 'foreground_changed', 'original_conversation_required',
-        'browser_profile_unconfigured', 'pillow_unavailable', 'reference_upload_failed',
-        'chatgpt_chat_surface_unavailable', 'chatgpt_create_image_mode_unavailable',
+        'login_required', 'foreground_changed',
+        'browser_profile_unconfigured', 'pillow_unavailable',
     }:
         return True
     return any(terminal_failure(value) for value in report.values() if isinstance(value, (dict, list)))
@@ -119,6 +125,46 @@ def result_complete(report: dict[str, Any], *, interactive: bool) -> bool:
             and item['downloaded'].get('status') == 'downloaded' for item in variants)
     return report.get('status') == 'downloaded' or (
         report.get('mode') == 'dry_upload' and not report.get('status') and not report.get('error_type'))
+
+
+def reconcile_saved_images(root: Path, session_path: Path, manifest: Path | None) -> dict[str, Any] | None:
+    """A worker may save its PNGs before stalling in final reporting/cleanup."""
+    if not manifest:
+        return None
+    session, job = read_state(session_path), read_state(manifest)
+    prompt = str(job.get('chatgpt_batch_message') or job.get('chatgpt_message') or '')
+    if (session.get('status') != 'downloaded' or not prompt
+            or session.get('prompt_sha256') != hashlib.sha256(prompt.encode()).hexdigest()
+            or Path(job.get('download_dir', '')).resolve() != root.resolve()):
+        return None
+    try:
+        expected = max(1, int(job.get('variant_count') or 1))
+        if int(session.get('expected_image_count') or 0) != expected:
+            return None
+        paths = [Path(value).resolve() for value in session.get('outputs', [])]
+        if len(set(paths)) < expected or len(set(paths)) != len(paths) or any(root.resolve() not in path.parents for path in paths):
+            return None
+        from PIL import Image  # Image jobs already require Pillow; text sessions do not.
+        records = {str(Path(item['path']).resolve()): item for item in session.get('images', []) if item.get('path')}
+        images = []
+        for path in paths:
+            data = path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            if records.get(str(path), {}).get('sha256', digest) != digest:
+                return None
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format != 'PNG':
+                    return None
+                image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                image.load()
+                images.append({**records.get(str(path), {}), 'path': str(path), 'sha256': digest,
+                               'width': image.width, 'height': image.height})
+    except (ImportError, OSError, ValueError, TypeError, KeyError, SyntaxError):
+        return None
+    return {**session, 'status': 'downloaded', 'image_count': len(images), 'images': images,
+            'completion_source': 'verified_saved_artifacts', 'business_complete': True,
+            'requires_user_action': False}
 
 
 def takeover_reason(heartbeat: dict[str, Any], *, now: float, started: float,
@@ -151,11 +197,45 @@ def supervise(script: Path, worker_args: list[str], root: Path, session_path: Pa
     root.mkdir(parents=True, exist_ok=True)
     # Prevent two parents from restarting workers against the same task.
     with _file_lock(root / 'chatgpt_supervisor.lock', timeout=0):
-        return _supervise(script, worker_args, root, session_path, limits, interactive=interactive)
+        recovery_path = root / 'chatgpt_recovery.json'
+        recovery = read_state(recovery_path)
+        manifest_value = getattr(limits, 'manifest', None)
+        manifest = Path(manifest_value) if manifest_value else (
+            Path(worker_args[0]) if worker_args and not worker_args[0].startswith('-') else None)
+        if manifest and manifest.is_file():
+            manifest = manifest.resolve()
+            worker_args = [str(manifest) if not value.startswith('-')
+                           and Path(value).expanduser().resolve() == manifest else value for value in worker_args]
+        task_key = hashlib.sha256((script.name + str(session_path.resolve())
+            + (hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest and manifest.is_file() else '')).encode()).hexdigest()
+        if recovery:
+            if recovery.get('task_key') != task_key:
+                raise ValueError('Recovery inputs changed; preserve the original manifest and session')
+            if recovery.get('status') in {'recovery_pending', 'recovery_blocked'}:
+                reconcile = getattr(limits, 'reconcile_only', False)
+                if not reconcile and (not getattr(limits, 'resume_recovery', False) or recovery['round'] >= MAX_CONTINUATION_RUNS):
+                    writer = StreamWriter(sys.stdout)
+                    writer.json(recovery['result'])
+                    writer.close()
+                    return 2
+                # A new bounded run is explicit, checkpointed, and delayed; repeated normal
+                # invocations cannot silently reset either the budget or the continuation cap.
+                time.sleep(max(0, recovery['not_before'] - time.time()))
+                recovery.update(round=recovery['round'] + (0 if reconcile else 1), status='running')
+                atomic_json(recovery_path, recovery)
+                if '--recover-worker' not in worker_args:
+                    worker_args = [*worker_args, '--recover-worker']
+        else:
+            if getattr(limits, 'resume_recovery', False):
+                raise ValueError('There is no recovery checkpoint for this task')
+            recovery = {'task_key': task_key, 'round': 0, 'status': 'running'}
+            atomic_json(recovery_path, recovery)
+        return _supervise(script, worker_args, root, session_path, limits,
+                          interactive=interactive, recovery=recovery)
 
 
 def _supervise(script: Path, worker_args: list[str], root: Path, session_path: Path,
-               limits: argparse.Namespace, *, interactive: bool) -> int:
+               limits: argparse.Namespace, *, interactive: bool, recovery: dict[str, Any]) -> int:
     events: queue.Queue = queue.Queue()
     if interactive:
         def input_lines() -> None:
@@ -169,6 +249,7 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
     state: dict[str, Any] = {'status': 'running', 'restarts': 0, 'actions': [],
                              'pid': os.getpid(), 'log_dir': str(log_root),
                              'session_path': str(session_path), 'started_at': time.time()}
+    state['retain_live_target'] = read_state(state_path).get('retain_live_target', False)
     active_started = time.monotonic()
     child = None
     last_report: dict[str, Any] = {}
@@ -183,11 +264,50 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
         diagnostics.json({'event': 'task_supervisor', **state['actions'][-1]})
 
     def exhausted(reason: str, report: dict[str, Any]) -> int:
-        result = {'status': 'needs_ops', 'error_type': reason,
+        manifest_value = getattr(limits, 'manifest', None)
+        completed = None if interactive else reconcile_saved_images(
+            root, session_path, Path(manifest_value) if manifest_value else None)
+        if completed:
+            completed.update(supervisor_path=str(state_path), worker_restarts=state['restarts'])
+            state.update(status='complete', result=completed)
+            recovery.update(status='complete', result=completed)
+            atomic_json(root / 'chatgpt_recovery.json', recovery)
+            record('artifacts_reconciled', preceding_reason=reason)
+            output.json(completed)
+            return 0
+        page = read_state(root / 'chatgpt_heartbeat.json').get('page') or {}
+        if terminal_failure(report) or page.get('humanReason') or (page.get('gate') or {}).get('kind') == 'verification':
+            result = {'status': 'needs_ops', 'error_type': 'human_attention_required' if page.get('humanReason')
+                      or (page.get('gate') or {}).get('kind') == 'verification' else reason,
+                      'last_worker_report': report, 'session_path': str(session_path),
+                      'supervisor_path': str(state_path), 'requires_user_action': True, 'business_complete': False}
+            recovery.update(status='needs_ops', result=result)
+            atomic_json(root / 'chatgpt_recovery.json', recovery)
+            state.update(status='needs_ops', reason=reason, result=result)
+            record('supervision_handoff')
+            output.json(result)
+            return 2
+        pending = recovery['round'] < MAX_CONTINUATION_RUNS
+        command_args = [value for value in worker_args if value not in {'--resume-recovery', '--recover-worker', '--reconcile-only'}]
+        reconcile_args = list(command_args)
+        if not interactive:
+            if '--mode' in reconcile_args:
+                reconcile_args[reconcile_args.index('--mode') + 1] = 'collect-current'
+            else:
+                reconcile_args.extend(['--mode', 'collect-current'])
+        result = {'status': 'recovery_pending' if pending else 'recovery_blocked', 'error_type': reason,
                   'session_path': str(session_path), 'supervisor_path': str(state_path),
                   'worker_restarts': state['restarts'], 'last_worker_report': report,
-                  'recommended_next_action': 'inspect_saved_session_before_resume'}
-        state.update(status='needs_ops', reason=reason, result=result)
+                  'requires_user_action': False, 'business_complete': False,
+                  'recovery_path': str(root / 'chatgpt_recovery.json'),
+                  'recommended_next_action': 'resume_recovery_after_cooldown' if pending else 'repair_service_then_collect_original',
+                  'continuation': {'round': recovery['round'], 'remaining_rounds': max(0, MAX_CONTINUATION_RUNS - recovery['round']),
+                     'not_before': time.time() + 30,
+                     'argv': [sys.executable, str(script), *command_args, '--resume-recovery'],
+                     'reconcile_argv': [sys.executable, str(script), *reconcile_args, '--reconcile-only']}}
+        recovery.update(status=result['status'], result=result, not_before=result['continuation']['not_before'])
+        atomic_json(root / 'chatgpt_recovery.json', recovery)
+        state.update(status=result['status'], reason=reason, result=result)
         record('supervision_exhausted', exit_code=child.returncode if child else None)
         output.json(result)
         return 2
@@ -281,6 +401,8 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                         eof_at = time.monotonic()
                         worker_input.put(None)
                     heartbeat = read_state(root / 'chatgpt_heartbeat.json')
+                    if heartbeat.get('phase') == 'download':
+                        state['retain_live_target'] = True
                     if heartbeat.get('phase') == 'waiting_input' and (not interactive or not reply_ready):
                         saved = read_state(session_path) if interactive else {}
                         if not interactive or saved.get('pending') or saved.get('status') not in {'ready', 'complete'}:
@@ -327,7 +449,14 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                         break
             report = read_state(output_path) if not interactive else read_state(session_path)
             last_report = report
-            succeeded = child.returncode == 0 and reason is None and result_complete(report, interactive=interactive)
+            recovered = None
+            if not interactive and (reason or child.returncode != 0 or not result_complete(report, interactive=False)):
+                manifest_value = getattr(limits, 'manifest', None)
+                recovered = reconcile_saved_images(root, session_path, Path(manifest_value) if manifest_value else None)
+                if recovered:
+                    report = recovered
+                    record('artifacts_reconciled', preceding_reason=reason, worker_exit_code=child.returncode)
+            succeeded = bool(recovered) or (child.returncode == 0 and reason is None and result_complete(report, interactive=interactive))
             if succeeded or eof or (reason is None and terminal_failure(report)):
                 state.update(status='complete' if succeeded else 'needs_ops')
                 if not interactive:
@@ -337,6 +466,8 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
                     result = {'status': state['status'], 'reason': reason or report.get('reason'),
                               'session_path': str(session_path), 'supervisor_path': str(state_path)}
                 state['result'] = result
+                recovery.update(status=state['status'], result=result)
+                atomic_json(root / 'chatgpt_recovery.json', recovery)
                 record('worker_finished', exit_code=child.returncode)
                 if not interactive or (not succeeded and not eof):
                     output.json(result)

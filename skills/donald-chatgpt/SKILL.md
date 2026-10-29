@@ -25,8 +25,8 @@ and recovery/time budgets. A worker restart does not authorize replaying an unce
 
 Keep the persistent process alive and consume its events while recovery runs. A progress update
 may describe recovery but must not end the task with “shall I retry?” or a pending approval question.
-When the budget is exhausted, return the saved failure and concrete obstacle; do not wait for
-permission to reset the budget or create an unbounded caller loop. Ask for user action only when
+When a run budget is exhausted, automatically consume its saved continuation below; do not wait
+for permission, reset reply Retry counts, or create another conversation. Ask for user action only when
 the remaining step needs it, such as login, a human challenge, a new Profile choice, or missing input.
 If the host runtime actually blocks a tool call on its permission policy, report that exact action
 and block separately; skill instructions cannot bypass a runtime approval requirement.
@@ -171,9 +171,21 @@ Command and result forwarding cannot block the monitoring loop. A pending reply 
 as idle without a checked `reply_ready` event, even if the worker reports `waiting_input`.
 Unclassified worker failures consume the same bounded restart budget; unexpected supervision
 errors stop the worker and return an explicit saved failure. Ordinary runtime errors must converge
-to a checked result or a bounded handoff.
-The independent observer writes `chatgpt_heartbeat.json` and `.jsonl`. Exhausted supervision returns
-`needs_ops` with saved paths. This supervises worker processes while the parent is running; closing
+to a checked result or a saved business continuation.
+The independent observer writes `chatgpt_heartbeat.json` and `.jsonl`. Ordinary exhausted supervision
+returns `recovery_pending`, with `business_complete=false`, `requires_user_action=false`, and a
+durable `chatgpt_recovery.json`. After its cooldown, automatically execute `continuation.argv`
+(`--resume-recovery`) with stdin kept open, then inspect the resumed pending turn. Never replay
+an interrupted Send or treat one run's failure as a completed business task. At most two additional
+runs are admitted; each has the same bounded active budget, with reply/page Retry counts retained.
+An ordinary reinvocation cannot reset that checkpoint or cap.
+
+After that cap, `recovery_blocked` still retains `continuation.reconcile_argv`. When new service or
+reply evidence warrants collection, this `--reconcile-only` session permits capture, complete-turn,
+finish, and handoff; it cannot Send, click response Retry, or restore a follow-up. Do not poll
+unchanged failures indefinitely. A pending checkpoint is not a scheduled background wakeup or proof
+that ChatGPT has replied. Actual human gates retain `needs_ops` and their concrete required action.
+This supervises worker processes while the parent is running; closing
 the host or terminating the supervisor still requires an explicit `--resume`.
 
 ## Recover Before Requesting Help
@@ -186,6 +198,10 @@ an alert role, composer, or messages. Before Send, page recovery tries the scope
 Retry once, then reopens the same URL within the shared three-attempt limit. A pending request
 only reopens its original durable URL; a temporary target is preserved. Page Retry must never be
 confused with a response Retry or a new Send.
+For a temporary conversation lost at home, the same owned target can reopen a unique sidebar
+history button matching the full submitted prompt, then recheck its post-dispatch user turn and
+saved turn key. The shared matcher does not require an anchor or canonical URL. Keep that live
+target in place and never turn a missing URL into permission for a duplicate Send.
 
 An error name alone does not establish that a human is needed. `capture` distinguishes an inline
 service error with a reply-specific Retry control from a verification page or widget. It runs a
@@ -210,7 +226,7 @@ bounded recovery automatically and preserves its actions in the pending turn's `
    `needs_ops` with the actual obstacle, attempted actions, saved evidence, and concrete next step.
 
 The reply-recovery budget survives `--resume`; the supervisor owns its separate bounded process
-restart budget. Do not reset reply retries or start another caller retry loop. Do not create a
+restart budget. Do not reset reply retries; follow only the checkpoint's bounded continuation. Do not create a
 fresh conversation, change accounts or Profiles, manipulate verification tokens, or activate Chrome
 to retry. An error disappearing alone does not prove the pending answer was recovered: verify its
 user message and reply. For an unsupported attachment reconstruction or ambiguous original turn,

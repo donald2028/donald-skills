@@ -18,6 +18,29 @@ import chatgpt_session as session
 
 
 class SessionTests(unittest.TestCase):
+    def test_reconciliation_cannot_send_through_browser_or_eval_commands(self):
+        self.conversation.reconcile_only = True
+        with mock.patch.object(self.conversation, 'browser_command') as browser, \
+                mock.patch.object(self.conversation, 'evaluate') as evaluate:
+            for request in ({'op': 'send', 'selector': '#send'},
+                            {'op': 'browser', 'args': ['click', '#send']},
+                            {'op': 'eval', 'script': 'document.querySelector("#send").click()'}):
+                with self.subTest(request=request), self.assertRaisesRegex(ValueError, 'Reconciliation'):
+                    self.conversation.handle(request)
+            browser.assert_not_called()
+            evaluate.assert_not_called()
+
+    def test_unverified_history_turn_cannot_become_a_completed_reply_after_resume(self):
+        self.conversation.state['pending'] = {'prompt': 'Question', 'baseline_ids': [], 'user_message_id': 'original',
+            'recovery': {'history_identity_failed': True, 'original_turn_key': 'original'}}
+        observed = {'messages': [{'role': 'user', 'id': 'different', 'text': 'Question'},
+                                {'role': 'assistant', 'id': 'answer', 'text': 'Other reply'}],
+                    'gate': None, 'generating': False, 'continuation_required': False}
+        with mock.patch.object(self.conversation, 'evaluate', side_effect=[observed, json.dumps({'verified': False})]):
+            self.conversation.capture(recover=False)
+        self.assertEqual(self.conversation.observed['gate']['error_type'], 'original_conversation_required')
+        self.assertFalse(self.conversation.reply_ready(observed, 0))
+
     def test_pending_loading_failure_reopens_original_without_retrying_or_sending(self):
         self.conversation.state['pending'] = {'prompt': 'Question', 'baseline_ids': [],
                                               'attachments': [], 'submission_committed': 'unknown'}

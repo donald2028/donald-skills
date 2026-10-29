@@ -1,6 +1,7 @@
 """Shared ChatGPT page detection and bounded page-recovery policy for text and image jobs."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 DEFAULT_PAGE_RECOVERY_ATTEMPTS = 3
@@ -64,6 +65,49 @@ CONVERSATION_DOM_JS = r"""
   return {users, assistants, turns, turnFor, userFor, submittedUserFor};
 })()
 """.strip()
+
+
+def original_turn_script(prompt: str, baseline: int = 0, turn_key: str = '') -> str:
+    """Identify one post-dispatch user turn; URLs alone cannot identify local conversations."""
+    return r"""
+JSON.stringify((() => {
+  const {users, turnFor} = __CONVERSATION_DOM__;
+  const normalize = text => (text || '').replace(/\s+/g, ' ').trim();
+  const expected = normalize(__PROMPT__);
+  const currentUsers = users.filter(user => !user.closest('nav,aside,[role=navigation],[data-sidebar-item],#history'));
+  const matches = currentUsers.filter(user => expected && [user.innerText, user.textContent]
+    .some(text => normalize(text).includes(expected)));
+  const user = matches.length === 1 ? matches[0] : null;
+  const root = user && (turnFor(user) || user);
+  const key = root?.getAttribute('data-turn-key') || user?.getAttribute('data-message-id') || '';
+  return {verified: Boolean(user && user === currentUsers.at(-1)
+    && (__TURN_KEY__ ? key === __TURN_KEY__ : currentUsers.length > __BASELINE__)), turn_key: key, user_count: currentUsers.length,
+    url: location.href};
+})())
+""".replace('__CONVERSATION_DOM__', CONVERSATION_DOM_JS).replace('__PROMPT__', json.dumps(prompt)).replace(
+        '__BASELINE__', str(int(baseline))).replace('__TURN_KEY__', json.dumps(turn_key))
+
+
+def original_history_script(prompt: str, *, click: bool = False) -> str:
+    """Select one exact-prompt history control, including role=button entries without href."""
+    return r"""
+JSON.stringify((() => {
+  const access = JSON.parse(__PAGE_ACCESS__);
+  if (access.humanReason) return {found: false, human_required: true};
+  const normalize = text => (text || '').replace(/\s+/g, ' ').trim();
+  const expected = normalize(__PROMPT__);
+  const scope = 'nav,aside,[role=navigation],[data-sidebar-item],#history,[aria-label="Chat history"]';
+  const matches = [...document.querySelectorAll('a,button,[role=button]')].filter(el =>
+    el.closest(scope) && el.getClientRects().length && !el.matches('[disabled],[aria-disabled=true]')
+    && expected && [el.getAttribute('aria-label'), el.innerText, el.textContent]
+      .some(text => normalize(text).includes(expected)));
+  const unique = matches.filter(el => !matches.some(other => other !== el && el.contains(other)));
+  if (unique.length !== 1) return {found: false, matches: unique.length};
+  if (__CLICK__) unique[0].click();
+  return {found: true, clicked: __CLICK__, matches: 1};
+})())
+""".replace('__PAGE_ACCESS__', PAGE_ACCESS_STATE_JS.replace('__EXPECTED_PROMPT__', json.dumps(prompt))).replace(
+        '__PROMPT__', json.dumps(prompt)).replace('__CLICK__', 'true' if click else 'false')
 
 
 HUMAN_VERIFICATION_STATE_JS = r"""

@@ -161,25 +161,44 @@ owns internal retries and one outer recovery cycle:
 | Confirmed unsubmitted page failure | Retry the same job once after internal recovery. |
 | Unknown/committed submit or pending download | Collect the original request once; never replay Send. |
 | Paused account | Wait through one cooldown, then check the recorded owner's health in a separate tab without executing its prompt. |
-| Original target redirected home | Wait for loading, inspect that target's post-dispatch navigation history, and verify a unique candidate's prompt and turn baseline before using its canonical URL. |
+| Original target redirected home | Inspect post-dispatch history, then a unique exact-prompt sidebar control including role=button without href. Verify the original main user turn, baseline, saved turn key, and owned target before collecting or scoped Retry, even without a canonical URL. |
 | Fresh login/verification gate | Preserve the request and request human completion; do not click or reload the challenge. |
 | Explicit generation error | Apply the original response's bounded Retry automatically; report a terminal failure when recovery is exhausted. |
 
 `automatic_recovery_actions` records the worker's outer cycle. The default supervisor may restart
 a failed or stalled worker within its separate process/time budget, preserving commit state;
-`automatic_recovery_exhausted=true` never authorizes a caller retry loop. Return the remaining obstacle, commit state,
-internal retry history, conversation URL, retained artifact paths, and `recommended_next_action`.
+`automatic_recovery_exhausted=true` describes this worker's cycle, not business completion or a
+human gate. The supervisor owns bounded worker restarts and the persistent continuation below;
+follow its final result rather than treating a worker's manual recommendation as the caller's task end.
 For submit, follow-up, and collect modes, exit code 0 requires all requested images to be downloaded,
 including every selected variant. Empty, partial, and failed results exit nonzero. An incomplete
 result after the outer recovery sets `automatic_recovery_exhausted=true`; stdout and session both
-disable another caller collection loop and retain the manual recovery recommendation. Health checks
+disable blind caller resubmission while preserving the supervisor's continuation. Health checks
 and upload-only preparation have their own success criteria and do not require generated images.
 Standalone `health-check` never sends a prompt or modifies the saved request session. Unavailable or
 ambiguous original-conversation identity never authorizes a replacement submission.
 For exhausted unsubmitted preparation, stdout and session both retain the consumed recovery cycle
 and `recommended_next_action=repair_environment_then_resume_unsubmitted_job`, with `retryable=false`.
 The supervisor may replay confirmed-unsubmitted preparation within its bounded budget. Once
-supervision is exhausted, repair the obstacle before explicitly resuming; do not add a caller loop.
+supervision is exhausted, use its checkpoint rather than a new job or reset retry loop.
+
+The independent supervisor writes `chatgpt_recovery.json` when ordinary failures exhaust one run:
+
+- `recovery_pending`: unfinished business (`business_complete=false`, `requires_user_action=false`).
+  `continuation.argv` is the exact same task's `--resume-recovery` invocation and `not_before` is
+  its cooldown deadline. The caller executes it automatically without another approval. Each run
+  keeps its own 300-second active budget; at most two continuation runs are admitted. Run counters
+  are saved before launch and ordinary reinvocation cannot reset them. Response Retry counts are
+  separately persisted before clicking and never reset by a worker/run restart.
+- `recovery_blocked`: the retry cap is spent, not a human-verification classification. Keep the
+  task, original target, and logs. `continuation.reconcile_argv` is a bounded `collect-current
+  --reconcile-only` invocation that cannot Send or click response Retry. Use it when new service
+  or original-output evidence justifies collection, rather than looping on unchanged failure.
+- `needs_ops`: a real human/input/runtime permission obstacle. A visible verification gate at the
+  run deadline also retains this handoff instead of scheduling another automatic retry.
+
+A checkpoint does not itself schedule a wakeup or guarantee that the upstream service will recover.
+Do not claim business completion until the requested original outputs are downloaded and checked.
 
 Repeated pre-submit recovery creates a fresh background target on the same binding before closing
 the old owned target. Committed/unknown submissions and dispatch evidence block that reset.
@@ -203,10 +222,16 @@ result is not completion. Login, verification, and account restrictions retain t
 | Worker crashes or returns malformed/unexpected output | Preserve evidence, restart within budget, then return an explicit failure if unresolved. |
 | Command/result pipe blocks | Forward outside the monitoring loop; supervision and its deadlines continue. Full worker output stays in attempt logs. |
 | Pending reply is incorrectly reported as idle | Verify the saved pending state and `reply_ready` event before granting idle time. |
-| Recovery repeats without success | Consume the same restart/time budget, stop the worker, and return `needs_ops` with evidence and a recovery entry point. |
+| Recovery repeats without success | Stop that bounded run; persist `recovery_pending` with executable continuation, or `recovery_blocked` with an original-result reconciliation path after the cap. |
 
 `chatgpt_supervisor.json.result` retains the terminal result even when the caller is not reading
 stdout; the status command can retrieve it after the process exits.
+When a deadline/worker error races with artifact commit, reconcile the original manifest, prompt
+hash, expected image count, task-owned output paths, stored hashes when present, and decoded PNGs
+before reporting failure. A fully verified set returns exit 0 and `status=downloaded` with
+`completion_source=verified_saved_artifacts`; takeover logs retain the preceding timeout and worker
+exit code. `downloaded` text without valid files is insufficient. Partial/corrupt/mismatched files
+remain unfinished and use the recovery checkpoint.
 
 - Text and image workers use the same `chatgpt_page_health.py` classifiers, scoped page Retry,
   and recovery policy. A readable loading-error page sets `page.crashReason` and interrupts
@@ -221,9 +246,10 @@ stdout; the status command can retrieve it after the process exits.
 - `chatgpt_supervisor.json` records the parent PID, restart count, log directory, and takeover
   actions. Final results include `supervisor_path` and `worker_restarts`. Worker logs live under
   `supervisor/<run>/` and survive later invocations. Defaults are a 60-second heartbeat deadline,
-  180-second progress stall, two restarts, and a 300-second total task budget. Process termination
-  never kills Chrome or replays an uncertain Send. Exhaustion returns `needs_ops`, the reason,
-  session/supervisor paths, and `last_worker_report`. The deadline includes retries and backoff.
+  180-second progress stall, two restarts, and a 300-second active run budget. Process termination
+  never kills Chrome or replays an uncertain Send. Ordinary exhaustion returns `recovery_pending`
+  or `recovery_blocked`, the reason, session/supervisor paths, and `last_worker_report`;
+  concrete human/input gates retain `needs_ops`. The deadline includes retries and backoff.
   The five-minute default targets ordinary requests: roughly one minute of preparation, two of
   generation, and two of recovery as planning allowances under a single deadline. It is an
   operating policy, not a measured service guarantee. Explicit long/multi-image jobs can increase
