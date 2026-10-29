@@ -606,6 +606,7 @@ def _remember_owned_cdp_target(args: argparse.Namespace, target: dict[str, Any])
         browser_session.owned_target_ids.add(args._owned_tab_cdp_target_id)
         browser_session.target_id = args._owned_tab_cdp_target_id
         browser_session.target_url = cdp_url
+        browser_session._save_owner()
     return True
 
 
@@ -622,6 +623,7 @@ def _open_background_cdp_tab(args: argparse.Namespace, url: str) -> bool:
         browser_session = getattr(args, "_browser_session", None)
         if browser_session is not None:
             browser_session.owned_target_ids.add(target_id)
+            browser_session._save_owner()
         deadline = time.time() + 10
         while time.time() < deadline:
             for target in _cdp_page_targets(args):
@@ -928,6 +930,8 @@ def _cleanup_agent_browser(args: argparse.Namespace, cwd: Path) -> None:
     if browser_session is not None:
         if getattr(args, "_retain_generated_assets", False):
             args.keep_browser_open = True
+        if getattr(args, 'mode', '') == 'health-check' and not getattr(args, 'worker', False):
+            args.keep_browser_open = bool(getattr(args, '_original_keep_browser_open', False))
         args._browser_cleanup = browser_session.close(preserve=bool(args.keep_browser_open))
         return
 

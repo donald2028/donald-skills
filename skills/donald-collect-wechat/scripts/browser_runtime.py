@@ -254,6 +254,17 @@ class BrowserSession:
     def _save_owner(self, status: str = 'open') -> None:
         if getattr(self, 'owner_path', None) is None:
             return
+        # A new worker must not overwrite the previous worker's task-owned tabs before
+        # reclaiming its original page. Keep that same-task ownership across takeovers.
+        try:
+            previous = json.loads(self.owner_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            previous = {}
+        if (previous.get('pid') and previous['pid'] != self.owner_pid
+                and previous.get('browser_pid') == self.browser_pid and self.browser_pid
+                and previous.get('state_path') == str(self.state_path)
+                and not process_is_alive(int(previous['pid']))):
+            self.owned_target_ids.update(previous.get('owned_target_ids') or [])
         _write_state(self.owner_path, {
             'status': status, 'pid': self.owner_pid, 'run_id': self.run_id,
             'binding_scope': self.config.get('scope', self.scope), 'scope': self.scope,
@@ -307,6 +318,7 @@ class BrowserSession:
             return reusable
         target_id = create_background_page(self.port, self.url)
         self.owned_target_ids.add(target_id)
+        self._save_owner()
         wait_for_background_page_url(
             self.port,
             target_id,
@@ -338,11 +350,14 @@ class BrowserSession:
                 if target.get("type") == "page" and target.get("id")
             }
             if own_new_blank_targets:
-                self.owned_target_ids.update(
+                newly_owned = {
                     target_id
                     for target_id, target in after_targets.items()
                     if target_id not in before and target.get("url") == "about:blank"
-                )
+                } - self.owned_target_ids
+                if newly_owned:
+                    self.owned_target_ids.update(newly_owned)
+                    self._save_owner()
             if poll_index + 1 < poll_count:
                 time.sleep(0.1)
         if result.returncode != 0:
@@ -390,6 +405,7 @@ class BrowserSession:
         _target_ids(self.port)
         self.target_id = self._claim_target(state)
         self.owned_target_ids.add(self.target_id)
+        self._save_owner()
         target = cdp_target(self.port, self.target_id) or {}
         self.target_url = str(target.get("webSocketDebuggerUrl") or "")
         if self.verify_agent_browser:

@@ -22,6 +22,23 @@ from browser_runtime import process_is_alive
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_every_terminal_run_releases_tabs_even_after_handoff_or_exhaustion(self):
+        for outcome in ('downloaded', 'needs_ops', 'crash', 'deadline'):
+            with self.subTest(outcome=outcome):
+                self.limits.max_worker_restarts = 0
+                self.limits.task_timeout = 1 if outcome == 'deadline' else 5
+                self.worker({
+                    'downloaded': "print(json.dumps({'status':'downloaded','image_count':1}))",
+                    'needs_ops': "print(json.dumps({'status':'needs_ops','error_type':'human_attention_required'})); sys.exit(2)",
+                    'crash': 'sys.exit(3)',
+                    'deadline': 'while True:\n    beat(progress=time.time())\n    time.sleep(.03)',
+                }[outcome])
+                with mock.patch.object(supervisor, 'cleanup_stopped_browser', return_value={'status': 'closed'}) as cleanup:
+                    _, _, state = self.run_worker()
+                self.assertFalse(cleanup.call_args.kwargs['preserve'])
+                self.assertFalse(state['retain_live_target'])
+                (self.root / 'chatgpt_recovery.json').unlink()
+
     def supervisor_process(self):
         script = self.root / 'parent.py'
         script.write_text(textwrap.dedent(f'''\

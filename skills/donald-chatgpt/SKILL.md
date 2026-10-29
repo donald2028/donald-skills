@@ -250,11 +250,11 @@ Finish or hand off explicitly:
 {"op":"handoff","reason":"login_required","human":true}
 ```
 
-Use only the applicable command. `finish` refuses unresolved submissions. `handoff` preserves the
-owned target and marks `needs_ops`; `human:true` retains that target for manual attention while
-Chrome stays in the background. Activate it only after an explicit user request. EOF or interruption
-preserves unresolved work. Ordinary completion closes only this
-task's tabs, disconnects its transport, and lets the shared lifecycle close Donald's Chrome only
+Use only the applicable command. `finish` refuses unresolved submissions. `handoff` saves the
+session and marks `needs_ops`. Human verification keeps the page available during the active
+observation window; handoff, EOF, interruption, timeout, and completion release the task's tabs
+when supervision exits. Saved evidence supports a later resume. Mid-run worker takeovers retain
+the original page for recovery. Cleanup disconnects the transport and closes Donald's Chrome only
 when no other run needs it.
 
 ## Output And Handoff

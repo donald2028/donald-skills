@@ -29,6 +29,24 @@ def _config(root: Path) -> dict[str, object]:
 
 
 class BrowserRuntimeTests(unittest.TestCase):
+    def test_restarted_worker_keeps_same_task_tab_ownership_until_terminal_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
+            session = self._open_session(temporary)
+            session.owner_path = Path(temporary)/'owner.json'
+            session._save_owner('preserved')
+            previous = json.loads(session.owner_path.read_text())
+            previous.update(pid=424242, owned_target_ids=['previous-request-tab'])
+            session.owner_path.write_text(json.dumps(previous))
+            with mock.patch.object(runtime, 'process_is_alive', side_effect=lambda pid: pid != 424242):
+                session._save_owner('starting')
+            self.assertIn('previous-request-tab', json.loads(session.owner_path.read_text())['owned_target_ids'])
+            with (mock.patch.object(runtime, 'cdp_target', return_value={'id': 'open'}),
+                  mock.patch.object(runtime, 'close_background_page') as close_tab,
+                  mock.patch.object(runtime, 'close_cdp_browser', return_value={'status': 'closed'})):
+                session.close(preserve=False)
+            self.assertEqual({call.args[1] for call in close_tab.call_args_list},
+                             {'previous-request-tab', 'owned-target', 'attach-blank'})
+
     def test_atexit_cleanup_respects_a_planned_takeover_stop_request(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {runtime.STATE_ROOT_ENV: temporary}):
             session = self._open_session(temporary)

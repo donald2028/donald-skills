@@ -86,12 +86,16 @@ the task page within `--human-wait-timeout` and the remaining run budget (five m
 default for ordinary requests). Tell the user what requires attention; bring Chrome forward
 only when the user explicitly requests it. The runner never clicks verification controls or refreshes an
 active challenge. Two healthy checks five seconds apart resume the original task. A timeout returns
-`needs_ops` and leaves the browser open in the background; rerun the same job to recover its original
-request. After an
-ordinary terminal result, the runner closes its tab and exits the Donald Chrome when no other run
-is active. Cleanup releases the run's agent-browser connection and confirms the macOS Chrome process
+`needs_ops`; the supervisor closes this run's owned tabs when it exits. Rerun the saved job to
+reopen the durable conversation or use linked recovery for an unreachable temporary request.
+Success, failure, timeout, and cancellation all release the task's tabs. Mid-run worker takeovers
+retain the original page only until recovery continues or the supervisor exits. Donald Chrome
+exits when no other run or intentionally retained page needs it. Cleanup releases the run's
+agent-browser connection and confirms the macOS Chrome process
 has exited, with bounded termination of only the verified Donald process if normal shutdown stalls.
-`needs_ops` and explicit `--keep-browser-open` runs keep Chrome open while releasing that connection.
+Only explicit `--keep-browser-open` retains tabs after a non-cancelled supervised exit. Login and
+verification pages remain available during the active observation window; `needs_ops` alone does
+not request indefinite browser retention.
 
 ## Prepare A Job
 

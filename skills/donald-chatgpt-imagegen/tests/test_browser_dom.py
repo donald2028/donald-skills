@@ -9,11 +9,13 @@ import json
 import os
 import sys
 import tempfile
+import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -28,6 +30,49 @@ from PIL import Image, PngImagePlugin  # noqa: E402
     "requires opt-in and a configured Chrome lane",
 )
 class BrowserDomTests(unittest.TestCase):
+    def test_supervisor_terminal_cleanup_closes_real_owned_tabs_and_keeps_other_runs(self):
+        # Keep the class fixture and a separate unrelated page alive while a worker exits.
+        protected = runner.create_background_page(self.browser.port, 'about:blank')
+        self.browser.owned_target_ids.add(protected)
+        for outcome in ('downloaded', 'needs_ops', 'cancelled', 'deadline'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                script = root / 'worker.py'
+                script.write_text(textwrap.dedent(f'''\
+                    import argparse, json, sys, time
+                    from pathlib import Path
+                    sys.path.insert(0, {str(SCRIPT_DIR)!r})
+                    import agent_browser_runner as runner
+                    root = Path(__file__).parent
+                    browser = runner._FreshImageBrowserSession(scope='donald-chatgpt-imagegen', session='tab-cleanup-test',
+                        verify_agent_browser=False, owner_path=root/'chatgpt_browser_owner.json').open()
+                    args = argparse.Namespace(_browser_session=browser, cdp=str(browser.port), cdp_port=browser.port)
+                    assert runner._open_background_cdp_tab(args, 'about:blank')
+                    (root/'targets.json').write_text(json.dumps(sorted(browser.owned_target_ids)))
+                    if {outcome!r} == 'deadline':
+                        while True:
+                            time.sleep(.05)
+                    # Even a worker that retains its page must be released by the terminal parent.
+                    browser.close(preserve=True)
+                    if {outcome!r} == 'cancelled':
+                        sys.exit(130)
+                    print(json.dumps({{'status':{outcome!r},'image_count':1,'error_type':
+                        'human_attention_required' if {outcome!r} == 'needs_ops' else ''}}))
+                    sys.exit(0 if {outcome!r} == 'downloaded' else 2)
+                '''))
+                import contextlib
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = runner.supervise(script, [], root, root/'session.json', SimpleNamespace(
+                        task_timeout=8, stall_timeout=20, heartbeat_timeout=20, max_worker_restarts=0))
+                self.assertEqual(code, 0 if outcome == 'downloaded' else (130 if outcome == 'cancelled' else 2))
+                targets = json.loads((root/'targets.json').read_text())
+                self.assertEqual(len(targets), 2)
+                self.assertTrue(all(runner.cdp_target(self.browser.port, target) is None for target in targets))
+                self.assertIsNotNone(runner.cdp_target(self.browser.port, self.browser.target_id))
+                self.assertIsNotNone(runner.cdp_target(self.browser.port, protected))
+                cleanup = json.loads((root/'chatgpt_browser_cleanup.json').read_text())
+                self.assertEqual(cleanup['status'], 'closed')
+
     def test_unreachable_ghost_history_rebuilds_linked_request_and_downloads(self):
         prompt = 'Create the requested image.'
         self.load_html('<aside id="history"><div role="button" aria-label="@Create image ' + prompt + '">Original request</div></aside>'

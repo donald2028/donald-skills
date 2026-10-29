@@ -129,9 +129,9 @@ Important terminal or recoverable states include:
   safely decide whether resubmission would duplicate the request. Inspect or use `collect-current`
   before sending anything again;
 - `download_failed`: ChatGPT produced candidates but the authenticated download stayed unavailable
-  after bounded retries; preserve the conversation and retry with `collect-current`;
+  after bounded retries; retain the session evidence and retry with `collect-current`;
 - `needs_ops` with `error_type=human_attention_required`: login or human verification requires an
-  operator in the preserved background browser. The runner requests attention without activating
+  operator during the active background-browser observation window. The runner requests attention without activating
   Chrome; foreground activation requires an explicit user request. It never refreshes or
   attempts the verification itself. A visible verification frame or page-level verification
   instruction establishes this gate and takes priority over response-level Retry. The result is
@@ -224,6 +224,10 @@ condition on the same binding. `chatgpt_worker_stop.json` distinguishes planned 
 `chatgpt_browser_owner.json` pins worker/run, browser PID, binding, and owned targets, while
 `chatgpt_browser_cleanup.json` records parent cleanup after the worker exits. Cleanup preserves
 other active/retained jobs and never closes an unverified Chrome process.
+Every supervised exit, including `needs_ops`, timeout, and `recovery_pending`/`recovery_blocked`,
+closes that task's owned tabs by default. Preservation is scoped to mid-run takeovers or explicit
+`--keep-browser-open`; cancellation always releases the tabs. New/replacement target IDs are
+persisted before further browser calls, so killed-worker cleanup includes recovery tabs.
 
 Repeated pre-submit recovery creates a fresh background target on the same binding before closing
 the old owned target. Committed/unknown submissions require original lookup and archival before
@@ -293,8 +297,9 @@ remain unfinished and use the recovery checkpoint.
   outcomes require original-conversation inspection. A retained temporary target can be observed
   in place, but a temporary URL alone is never reopened for recovery. With no saved URL, the
   retained target also requires the submitted prompt in a user turn beyond the saved baseline.
-  Unfinished submissions without a durable URL retain their tab and browser; fresh jobs and health
-  checks open separate targets so they cannot overwrite that recovery evidence.
+  Unfinished submissions without a durable URL retain their tab during active recovery. A terminal
+  supervisor exit releases it; subsequent recovery uses saved evidence and may create a linked
+  replacement. Fresh jobs and health checks use separate targets.
 - `waiting_for_human` continues observation within both its 600-second verification limit and the
   remaining total task budget (300 seconds by default). Two healthy checks five seconds
   apart resume the same task. `needs_ops` means observation ended and human action/recovery remains.

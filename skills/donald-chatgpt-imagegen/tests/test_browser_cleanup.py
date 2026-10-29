@@ -16,6 +16,18 @@ import agent_browser_runner as runner  # noqa: E402
 
 
 class BrowserCleanupTests(unittest.TestCase):
+    def test_new_recovery_target_is_persisted_before_target_discovery_can_fail(self):
+        browser = mock.Mock(owned_target_ids=set())
+        args = argparse.Namespace(_browser_session=browser)
+        def discover(_args):
+            raise RuntimeError('worker loses connection after creating a tab')
+        with (mock.patch.object(runner, '_cdp_launch_port', return_value=9333),
+              mock.patch.object(runner, 'create_background_page', return_value='recovery-target'),
+              mock.patch.object(runner, '_cdp_page_targets', side_effect=discover)):
+            self.assertFalse(runner._open_background_cdp_tab(args, 'about:blank'))
+        self.assertIn('recovery-target', browser.owned_target_ids)
+        browser._save_owner.assert_called()
+
     def test_runner_and_legacy_helpers_cannot_fall_back_to_cli_tab_interaction(self) -> None:
         for args in (argparse.Namespace(_browser_session=object()), argparse.Namespace()):
             with self.subTest(registered=hasattr(args, '_browser_session')):
@@ -53,7 +65,7 @@ class BrowserCleanupTests(unittest.TestCase):
         self.assertNotIn("about:blank", command)
 
     def test_replacement_claims_only_the_target_created_by_this_run(self) -> None:
-        session = argparse.Namespace(owned_target_ids=set())
+        session = argparse.Namespace(owned_target_ids=set(), _save_owner=mock.Mock())
         args = argparse.Namespace(_browser_session=session, cdp='9333')
         targets = [
             {"id": "other-blank", "url": "about:blank", "webSocketDebuggerUrl": "ws://other-blank"},

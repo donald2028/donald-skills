@@ -165,7 +165,8 @@ runner 返回配置类故障时，才再次调用 `donald-config-browser`。
 对话、出图、X 采集和微信采集 skill，使选择性安装仍然自包含，同时避免手工复制产生行为漂移。业务
 runner 通过统一的 `BrowserSession` 启动 Chrome、认领本次 target、验证 agent-browser attach，
 并在 `finally` 中释放。普通结果关闭本次 target，最后一个活跃任务只关闭由 Donald 启动的
-Chrome；所有浏览器 skill 在 `needs_ops` 时保留后台页面并提示用户，只有用户明确要求时才激活
+Chrome；采集 skill 在 `needs_ops` 时保留后台页面，ChatGPT 在运行中的人工等待期间保留页面，
+监督运行退出时回收本任务 Tab。只有用户明确要求时才激活
 浏览器。启动、新建标签页、导航、恢复和清理都保护用户当前应用的焦点；attach 过程中新增的空白 target 也属于
 本次任务并会被清理，预先存在的用户页面不会被批量扫描或关闭。
 
@@ -205,6 +206,8 @@ SHA 或全分辨率 RGBA 完全相等判定，保留真实的细微生成修改�
 不可达时，保存旧 session、提交和 Retry 记录，再创建关联新请求，产物与轨迹使用独立路径。
 上游可用 `--restart-task` 接管运行中的 worker 或开启新恢复周期；`--rebuild-request` 先收原结果，
 必要时允许额外一次关联重建。短运行预算耗尽不等于业务终止；明确取消仍停止自动恢复。
+ChatGPT 监督运行退出时会回收本任务的 Tab，包括失败交接、超时和取消。原页面只在运行中的
+自动接管期间暂留；出图可显式使用 `--keep-browser-open` 保留非取消任务的页面。
 
 GitHub、X、微信、ChatGPT 对话和出图 skill 各自携带自包含的 `scripts/output_paths.py`，不依赖额外
 配置 skill，因此可以独立安装。这些 workflow 使用相同的“单次覆盖 → 兼容环境变量 → 持久配置

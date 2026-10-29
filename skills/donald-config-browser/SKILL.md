@@ -99,9 +99,11 @@ a service crash. Text sessions stop on whole-browser exit; image tasks may resta
 binding after an unexpected browser exit, while explicit task cancellation stops recovery.
 Cleanup never signals the user's ordinary Chrome or another browser binding.
 
-Only a recognized `needs_ops` state retains the owned target and browser for the operator. A later
-run reclaims that retained target instead of opening another page. Successful completion then
-performs the ordinary cleanup.
+Unsupervised collectors may retain a recognized `needs_ops` page for an operator. ChatGPT tasks
+retain pages only while their supervisor is actively recovering or waiting for human input.
+Every terminal supervisor exit releases its owned tabs by default, including failure, timeout,
+and cancellation; image tasks may explicitly request `--keep-browser-open`. Ownership snapshots
+include newly created recovery tabs before subsequent browser calls can fail.
 Every browser caller retains human-verification targets in the background and notifies the user.
 `preserve_for_human()` preserves the task without activating Chrome. Bringing Chrome to the
 foreground requires an explicit user request through `activate`.

@@ -1,4 +1,4 @@
-"""Bounded process supervision for the ChatGPT workers; never operate the browser here."""
+"""Bounded ChatGPT worker supervision and cleanup of their recorded browser ownership."""
 from __future__ import annotations
 
 import argparse
@@ -623,6 +623,12 @@ def _supervise(script: Path, worker_args: list[str], root: Path, session_path: P
         return exhausted('unexpected_supervisor_error', {'error_type': type(error).__name__, 'reason': str(error)})
     finally:
         if child is not None:
-            stop_worker(child, root, preserve_browser=state['status'] not in {'interrupted', 'complete'})
+            # A retained page belongs to the active supervision cycle, not to an exited
+            # worker/task. Mid-cycle takeovers above preserve it; every terminal path releases it.
+            preserve = bool(getattr(limits, 'keep_browser_open', False) and state['status'] != 'interrupted')
+            stop_worker(child, root, preserve_browser=preserve)
+            if not preserve:
+                state['retain_live_target'] = False
+                atomic_json(state_path, state)
         output.close()
         diagnostics.close()
